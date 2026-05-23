@@ -113,6 +113,7 @@ members = [
     "codex-experimental-api-macros",
     "plugin",
     "model-provider",
+    "wormhole-agentd",
 ]
 resolver = "2"
 
