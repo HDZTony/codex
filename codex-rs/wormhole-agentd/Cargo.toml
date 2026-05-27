@@ -12,10 +12,13 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+agent-core = { path = "../../../../crates/agent-core" }
+compute-core = { path = "../../../../crates/compute-core" }
 anyhow = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
     "http1",
     "json",
+    "query",
     "tokio",
 ] }
 clap = { workspace = true, features = ["derive"] }

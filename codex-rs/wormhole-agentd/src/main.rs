@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,6 +20,17 @@ use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+use agent_core::{
+    GuiAutomationError, GuiAutomationPlan, GuiControlMode, GuiEngine, RecipeCatalog,
+    RemoteAgentCapabilities, RemoteAgentTaskRequest, RemoteAgentTaskResult, TaskArtifact,
+    TaskArtifactKind, TaskFailureReason, TaskKind, TaskStatus, batch_request_from_remote_task,
+    bundled_recipes_dir, classify_gui_failure, expand_gui_automation,
+    remote_task_result_from_batch, summarize_stderr, tail_task_audit_ndjson,
+};
+use compute_core::BatchAdapterRegistry;
+
+mod service_control;
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -43,6 +54,9 @@ struct Cli {
 
     #[arg(long)]
     codex_bin: Option<PathBuf>,
+
+    #[arg(long)]
+    recipes_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -52,12 +66,22 @@ struct AppState {
     profile: String,
     full_auto: bool,
     codex_bin: PathBuf,
+    recipes_dir: PathBuf,
+    recipe_catalog: Arc<RecipeCatalog>,
     sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
+    tasks: Arc<Mutex<HashMap<String, TaskHandle>>>,
 }
 
 struct SessionHandle {
     session: AgentSession,
     child: Child,
+}
+
+struct TaskHandle {
+    result: RemoteAgentTaskResult,
+    child: Option<Child>,
+    gui_plan: Option<GuiAutomationPlan>,
+    stderr_summary: Arc<Mutex<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +90,41 @@ struct StartSessionRequest {
     cwd: Option<String>,
     profile: Option<String>,
     full_auto: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskStartedPayload<'a> {
+    status: &'a str,
+    kind: &'a str,
+    prompt: Option<&'a str>,
+    cwd: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskMessagePayload<'a> {
+    level: &'a str,
+    message: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct GuiAutomationStartedPayload<'a> {
+    action: &'a str,
+    platform: &'a str,
+    engine: &'a str,
+    mode: &'a str,
+    recipe_id: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct GuiAutomationActionPayload {
+    action: String,
+    platform: String,
+    engine: String,
+    mode: String,
+    recipe_id: Option<String>,
+    exit_code: Option<i32>,
+    stderr_summary: String,
+    failure_reason: Option<TaskFailureReason>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +142,11 @@ struct AgentSession {
 struct SessionFile<'a> {
     endpoint: &'a str,
     token: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    since: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,21 +199,40 @@ async fn main() -> Result<()> {
     let endpoint = format!("http://{}", listener.local_addr()?);
     write_session_file(&cli.session_file, &endpoint, &cli.token).await?;
 
+    let recipes_dir = cli
+        .recipes_dir
+        .unwrap_or_else(bundled_recipes_dir);
+    let recipe_catalog = RecipeCatalog::load_dir(&recipes_dir).unwrap_or_else(|err| {
+        eprintln!(
+            "warning: failed to load GUI recipes from {}: {err}; using bundled recipes only",
+            recipes_dir.display()
+        );
+        RecipeCatalog::bundled()
+    });
+
     let state = AppState {
         token: cli.token,
         log_dir: cli.log_dir,
         profile: cli.profile,
         full_auto: cli.full_auto,
         codex_bin,
+        recipes_dir,
+        recipe_catalog: Arc::new(recipe_catalog),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        tasks: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/capabilities", get(capabilities))
         .route("/sessions", post(start_session).get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/events", get(read_session_events))
         .route("/sessions/{session_id}/stop", post(stop_session))
+        .route("/tasks", post(start_task).get(list_tasks))
+        .route("/tasks/{task_id}", get(get_task))
+        .route("/tasks/{task_id}/events", get(read_task_events))
+        .route("/tasks/{task_id}/cancel", post(cancel_task))
         .with_state(state);
 
     axum::serve(listener, app).await?;
@@ -161,6 +244,32 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(response) => response,
     }
+}
+
+async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return response;
+    }
+    Json(RemoteAgentCapabilities {
+        codex: state.codex_bin.is_file(),
+        batch: !BatchAdapterRegistry::with_builtin_adapters()
+            .capabilities()
+            .is_empty(),
+        program: true,
+        rdp: false,
+        gui_automation: true,
+        service_control: true,
+        platform: std::env::consts::OS.to_string(),
+        permission_notes: vec![
+            "trusted_full_auto accepts tasks from trusted Wormhole peers".into(),
+            "service install/uninstall is explicit and requires OS administrator or user approval".into(),
+            "service control status returns JSON; install/start may fail without elevation".into(),
+            "GUI automation may require Accessibility/UI Automation permissions".into(),
+            "rdp_session tasks are executed by Wormhole Desktop RDP iroh node, not wormhole-agentd"
+                .into(),
+        ],
+    })
+    .into_response()
 }
 
 async fn start_session(
@@ -248,7 +357,104 @@ async fn read_session_events(
             .status(StatusCode::OK)
             .header("content-type", "application/x-ndjson")
             .body(Body::from(log))
-            .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "response error")),
+            .unwrap_or_else(|_| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "response error")
+            }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            error_response(StatusCode::NOT_FOUND, "log not found")
+        }
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn start_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RemoteAgentTaskRequest>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return response;
+    }
+    match spawn_task(state.clone(), req).await {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn list_tasks(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return response;
+    }
+    reap_finished_tasks(&state).await;
+    let tasks = state
+        .tasks
+        .lock()
+        .await
+        .values()
+        .map(|handle| handle.result.clone())
+        .collect::<Vec<_>>();
+    Json(tasks).into_response()
+}
+
+async fn get_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return response;
+    }
+    reap_finished_tasks(&state).await;
+    let tasks = state.tasks.lock().await;
+    match tasks.get(&task_id) {
+        Some(handle) => Json(handle.result.clone()).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "task not found"),
+    }
+}
+
+async fn cancel_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let mut tasks = state.tasks.lock().await;
+    let Some(handle) = tasks.get_mut(&task_id) else {
+        return error_response(StatusCode::NOT_FOUND, "task not found");
+    };
+    if let Some(child) = handle.child.as_mut() {
+        let _ = child.kill().await;
+    }
+    handle.result.status = TaskStatus::Cancelled;
+    Json(handle.result.clone()).into_response()
+}
+
+async fn read_task_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return response;
+    }
+    if !is_safe_session_id(&task_id) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid task id");
+    }
+    let path = state.log_dir.join(format!("{task_id}.jsonl"));
+    match fs::read_to_string(path).await {
+        Ok(log) => {
+            let body = tail_task_audit_ndjson(&log, query.since);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "response error")
+                })
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             error_response(StatusCode::NOT_FOUND, "log not found")
         }
@@ -342,6 +548,708 @@ async fn spawn_codex_session(
     Ok(session)
 }
 
+async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<RemoteAgentTaskResult> {
+    if matches!(req.kind, TaskKind::BatchTask { .. }) {
+        return spawn_batch_task(state, req).await;
+    }
+
+    if matches!(req.kind, TaskKind::RdpSession { .. }) {
+        let task_id = if req.task_id.trim().is_empty() {
+            Uuid::now_v7().to_string()
+        } else {
+            req.task_id.clone()
+        };
+        let log_path = state.log_dir.join(format!("{task_id}.jsonl"));
+        let cwd = req
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|v| !v.trim().is_empty());
+        write_audit(
+            &log_path,
+            &AuditEvent {
+                timestamp: unix_secs(),
+                session_id: &task_id,
+                event: "task_started",
+                payload: TaskStartedPayload {
+                    status: "delegated",
+                    kind: task_kind_label(&req.kind),
+                    prompt: req.prompt.as_deref(),
+                    cwd: cwd.as_deref(),
+                },
+            },
+        )
+        .await?;
+        let result = rdp_session_delegation_result(&task_id, &log_path);
+        write_task_message(
+            &log_path,
+            &task_id,
+            "info",
+            "rdp_session delegated to Wormhole Desktop RDP node",
+        )
+        .await?;
+        state.tasks.lock().await.insert(
+            task_id.clone(),
+            TaskHandle {
+                result: result.clone(),
+                child: None,
+                gui_plan: None,
+                stderr_summary: Arc::new(Mutex::new(String::new())),
+            },
+        );
+        return Ok(result);
+    }
+
+    let task_id = if req.task_id.trim().is_empty() {
+        Uuid::now_v7().to_string()
+    } else {
+        req.task_id.clone()
+    };
+    let log_path = state.log_dir.join(format!("{task_id}.jsonl"));
+    let cwd = req
+        .cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|v| !v.trim().is_empty());
+
+    write_audit(
+        &log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: &task_id,
+            event: "task_started",
+            payload: TaskStartedPayload {
+                status: "running",
+                kind: task_kind_label(&req.kind),
+                prompt: req.prompt.as_deref(),
+                cwd: cwd.as_deref(),
+            },
+        },
+    )
+    .await?;
+
+    let gui_plan = if matches!(req.kind, TaskKind::GuiAutomation { .. }) {
+        match expand_gui_automation(
+            &req.kind,
+            state.recipe_catalog.as_ref(),
+            Some(state.recipes_dir.as_path()),
+        ) {
+            Ok(plan) => {
+                write_gui_automation_started(&log_path, &task_id, &plan).await?;
+                if matches!(plan.mode, GuiControlMode::RdpVisible) {
+                    write_task_message(
+                        &log_path,
+                        &task_id,
+                        "warning",
+                        "rdp_visible mode selected; session binding is not yet enforced",
+                    )
+                    .await?;
+                }
+                Some(plan)
+            }
+            Err(err) => {
+                let failure_reason = gui_error_to_failure_reason(&err);
+                let result = failed_task_result(
+                    &task_id,
+                    &log_path,
+                    &err.to_string(),
+                    failure_reason,
+                );
+                write_task_message(&log_path, &task_id, "error", &err.to_string()).await?;
+                state.tasks.lock().await.insert(
+                    task_id.clone(),
+                    TaskHandle {
+                        result: result.clone(),
+                        child: None,
+                        gui_plan: None,
+                        stderr_summary: Arc::new(Mutex::new(String::new())),
+                    },
+                );
+                return Ok(result);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut command = match build_task_command(&state, &req, gui_plan.as_ref())? {
+        Some(command) => command,
+        None => {
+            let result = unsupported_task_result(
+                &task_id,
+                &log_path,
+                "task kind is not supported by wormhole-agentd",
+            );
+            write_task_message(&log_path, &task_id, "warning", "task kind is not supported")
+                .await?;
+            state.tasks.lock().await.insert(
+                task_id.clone(),
+                TaskHandle {
+                    result: result.clone(),
+                    child: None,
+                    gui_plan: None,
+                    stderr_summary: Arc::new(Mutex::new(String::new())),
+                },
+            );
+            return Ok(result);
+        }
+    };
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(cwd) = cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn task {}", task_id))?;
+
+    let stderr_summary = Arc::new(Mutex::new(String::new()));
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(copy_lines_to_audit(
+            log_path.clone(),
+            task_id.clone(),
+            "stdout",
+            stdout,
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        if gui_plan.is_some() {
+            tokio::spawn(copy_lines_to_audit_with_summary(
+                log_path.clone(),
+                task_id.clone(),
+                "stderr",
+                stderr,
+                stderr_summary.clone(),
+            ));
+        } else {
+            tokio::spawn(copy_lines_to_audit(
+                log_path.clone(),
+                task_id.clone(),
+                "stderr",
+                stderr,
+            ));
+        }
+    }
+
+    let result = RemoteAgentTaskResult {
+        task_id: task_id.clone(),
+        status: TaskStatus::Running,
+        exit_code: None,
+        artifacts: vec![TaskArtifact {
+            path: Some(log_path.clone()),
+            kind: TaskArtifactKind::Log,
+            label: "audit log".into(),
+        }],
+        changed_files: req
+            .files
+            .iter()
+            .filter(|file| {
+                matches!(
+                    file.role,
+                    agent_core::TaskFileRole::Output | agent_core::TaskFileRole::InOut
+                )
+            })
+            .map(|file| file.path.clone())
+            .collect(),
+        message: Some("task accepted".into()),
+        log_path: Some(log_path),
+        failure_reason: None,
+    };
+    state.tasks.lock().await.insert(
+        task_id,
+        TaskHandle {
+            result: result.clone(),
+            child: Some(child),
+            gui_plan,
+            stderr_summary,
+        },
+    );
+    Ok(result)
+}
+
+async fn spawn_batch_task(
+    state: AppState,
+    req: RemoteAgentTaskRequest,
+) -> Result<RemoteAgentTaskResult> {
+    let task_id = if req.task_id.trim().is_empty() {
+        Uuid::now_v7().to_string()
+    } else {
+        req.task_id.clone()
+    };
+    let log_path = state.log_dir.join(format!("{task_id}.jsonl"));
+    let cwd = req
+        .cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|v| !v.trim().is_empty());
+
+    write_audit(
+        &log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: &task_id,
+            event: "task_started",
+            payload: TaskStartedPayload {
+                status: "running",
+                kind: "batch_task",
+                prompt: req.prompt.as_deref(),
+                cwd: cwd.as_deref(),
+            },
+        },
+    )
+    .await?;
+
+    let batch_request = match batch_request_from_remote_task(&req, None) {
+        Ok(request) => request,
+        Err(message) => {
+            let result = unsupported_task_result(&task_id, &log_path, &message);
+            write_task_message(&log_path, &task_id, "error", &message).await?;
+            state.tasks.lock().await.insert(
+                task_id.clone(),
+                TaskHandle {
+                    result: result.clone(),
+                    child: None,
+                    gui_plan: None,
+                    stderr_summary: Arc::new(Mutex::new(String::new())),
+                },
+            );
+            return Ok(result);
+        }
+    };
+
+    let running = RemoteAgentTaskResult {
+        task_id: task_id.clone(),
+        status: TaskStatus::Running,
+        exit_code: None,
+        artifacts: vec![TaskArtifact {
+            path: Some(log_path.clone()),
+            kind: TaskArtifactKind::Log,
+            label: "audit log".into(),
+        }],
+        changed_files: req
+            .files
+            .iter()
+            .filter(|file| {
+                matches!(
+                    file.role,
+                    agent_core::TaskFileRole::Output | agent_core::TaskFileRole::InOut
+                )
+            })
+            .map(|file| file.path.clone())
+            .collect(),
+        message: Some("batch task accepted".into()),
+        log_path: Some(log_path.clone()),
+        failure_reason: None,
+    };
+    state.tasks.lock().await.insert(
+        task_id.clone(),
+        TaskHandle {
+            result: running.clone(),
+            child: None,
+            gui_plan: None,
+            stderr_summary: Arc::new(Mutex::new(String::new())),
+        },
+    );
+
+    let final_result = match tokio::task::spawn_blocking(move || {
+        BatchAdapterRegistry::with_builtin_adapters().execute(&batch_request)
+    })
+    .await
+    {
+        Ok(Ok(batch)) => remote_task_result_from_batch(&task_id, &batch, Some(log_path.clone())),
+        Ok(Err(err)) => unsupported_task_result(&task_id, &log_path, &err.to_string()),
+        Err(err) => unsupported_task_result(
+            &task_id,
+            &log_path,
+            &format!("batch task worker panicked: {err}"),
+        ),
+    };
+
+    if let Some(message) = final_result.message.as_deref() {
+        let level = if matches!(final_result.status, TaskStatus::Completed) {
+            "info"
+        } else {
+            "error"
+        };
+        write_task_message(&log_path, &task_id, level, message).await?;
+    }
+    write_audit(
+        &log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: &task_id,
+            event: "task_ended",
+            payload: SessionEndedPayload {
+                status: format!("{:?}", final_result.status),
+                exit_code: final_result.exit_code,
+            },
+        },
+    )
+    .await?;
+
+    if let Some(handle) = state.tasks.lock().await.get_mut(&task_id) {
+        handle.result = final_result.clone();
+    }
+    Ok(final_result)
+}
+
+fn build_task_command(
+    state: &AppState,
+    req: &RemoteAgentTaskRequest,
+    gui_plan: Option<&GuiAutomationPlan>,
+) -> Result<Option<Command>> {
+    match &req.kind {
+        TaskKind::CodexFileTask => {
+            let mut cmd = Command::new(&state.codex_bin);
+            cmd.arg("exec")
+                .arg("--json")
+                .arg("--skip-git-repo-check")
+                .arg("--profile")
+                .arg(&state.profile);
+            if state.full_auto {
+                cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+            }
+            let prompt = req
+                .prompt
+                .as_deref()
+                .unwrap_or("Complete the requested Wormhole remote file task.");
+            cmd.arg(prompt).stdin(Stdio::null());
+            Ok(Some(cmd))
+        }
+        TaskKind::ProgramTask { program, args } => {
+            let mut cmd = Command::new(program);
+            cmd.args(args).stdin(Stdio::null());
+            for (key, value) in &req.env {
+                cmd.env(key, value);
+            }
+            Ok(Some(cmd))
+        }
+        TaskKind::GuiAutomation { .. } => {
+            let plan = gui_plan.ok_or_else(|| {
+                anyhow!("gui automation plan missing after recipe expansion")
+            })?;
+            Ok(Some(gui_automation_command(plan)))
+        }
+        TaskKind::ServiceControl { action } => service_control::service_control_command(
+            &state.log_dir,
+            &state.codex_bin,
+            action,
+        )
+        .map(Some),
+        TaskKind::BatchTask { .. } => Ok(None),
+        TaskKind::RdpSession { .. } => Ok(None),
+    }
+}
+
+fn gui_automation_command(plan: &GuiAutomationPlan) -> Command {
+    match plan.engine {
+        GuiEngine::Powershell => {
+            let mut cmd = Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &plan.script,
+            ]);
+            cmd
+        }
+        GuiEngine::Osascript => {
+            let mut cmd = Command::new("osascript");
+            cmd.args(["-e", &plan.script]);
+            cmd
+        }
+        GuiEngine::Shell => {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-lc", &plan.script]);
+            cmd
+        }
+    }
+}
+
+async fn reap_finished_tasks(state: &AppState) {
+    struct EndedTask {
+        task_id: String,
+        result: RemoteAgentTaskResult,
+        gui_plan: Option<GuiAutomationPlan>,
+        stderr_summary: String,
+    }
+
+    let mut ended = Vec::new();
+    {
+        let mut tasks = state.tasks.lock().await;
+        for (id, handle) in tasks.iter_mut() {
+            if !matches!(
+                handle.result.status,
+                TaskStatus::Running | TaskStatus::Accepted
+            ) {
+                continue;
+            }
+            let Some(child) = handle.child.as_mut() else {
+                continue;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    handle.result.exit_code = status.code();
+                    let stderr_summary = handle.stderr_summary.lock().await.clone();
+                    if let Some(plan) = handle.gui_plan.as_ref() {
+                        if !status.success() {
+                            handle.result.failure_reason = Some(classify_gui_failure(
+                                status.code(),
+                                &stderr_summary,
+                            ));
+                        }
+                    }
+                    handle.result.status = if status.success() {
+                        TaskStatus::Completed
+                    } else {
+                        TaskStatus::Failed
+                    };
+                    handle.result.message = Some(handle.result.status_text().to_string());
+                    ended.push(EndedTask {
+                        task_id: id.clone(),
+                        result: handle.result.clone(),
+                        gui_plan: handle.gui_plan.clone(),
+                        stderr_summary,
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    handle.result.status = TaskStatus::Failed;
+                    handle.result.failure_reason = Some(TaskFailureReason::SpawnError);
+                    handle.result.message = Some(err.to_string());
+                    ended.push(EndedTask {
+                        task_id: id.clone(),
+                        result: handle.result.clone(),
+                        gui_plan: handle.gui_plan.clone(),
+                        stderr_summary: handle.stderr_summary.lock().await.clone(),
+                    });
+                }
+            }
+        }
+    }
+    for ended in ended {
+        if let Some(log_path) = ended.result.log_path.as_deref() {
+            let _ = write_audit(
+                log_path,
+                &AuditEvent {
+                    timestamp: unix_secs(),
+                    session_id: &ended.task_id,
+                    event: "task_ended",
+                    payload: SessionEndedPayload {
+                        status: format!("{:?}", ended.result.status),
+                        exit_code: ended.result.exit_code,
+                    },
+                },
+            )
+            .await;
+            if let Some(plan) = ended.gui_plan.as_ref() {
+                let stderr_summary = summarize_stderr(&ended.stderr_summary, 512);
+                let failure_reason = if ended.result.status == TaskStatus::Failed {
+                    ended.result.failure_reason.clone()
+                } else {
+                    None
+                };
+                let _ = write_gui_automation_action(
+                    log_path,
+                    &ended.task_id,
+                    plan,
+                    ended.result.exit_code,
+                    &stderr_summary,
+                    failure_reason,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+trait TaskStatusText {
+    fn status_text(&self) -> &'static str;
+}
+
+impl TaskStatusText for RemoteAgentTaskResult {
+    fn status_text(&self) -> &'static str {
+        match self.status {
+            TaskStatus::Completed => "task completed",
+            TaskStatus::Failed => "task failed",
+            TaskStatus::Cancelled => "task cancelled",
+            TaskStatus::PermissionRequired => "permission required",
+            TaskStatus::Unsupported => "unsupported task",
+            TaskStatus::TimedOut => "task timed out",
+            TaskStatus::Accepted | TaskStatus::Running => "task running",
+        }
+    }
+}
+
+fn rdp_session_delegation_result(task_id: &str, log_path: &Path) -> RemoteAgentTaskResult {
+    RemoteAgentTaskResult {
+        task_id: task_id.to_string(),
+        status: TaskStatus::Unsupported,
+        exit_code: None,
+        artifacts: vec![TaskArtifact {
+            path: Some(log_path.to_path_buf()),
+            kind: TaskArtifactKind::Log,
+            label: "audit log".into(),
+        }],
+        changed_files: Vec::new(),
+        message: Some(
+            "rdp_session is handled by Wormhole Desktop (remote_agent_submit_task / RDP iroh node); \
+             use Agent Mode on the desktop host with iroh-transport+rdp features"
+                .into(),
+        ),
+        log_path: Some(log_path.to_path_buf()),
+        failure_reason: None,
+    }
+}
+
+fn unsupported_task_result(task_id: &str, log_path: &Path, message: &str) -> RemoteAgentTaskResult {
+    RemoteAgentTaskResult {
+        task_id: task_id.to_string(),
+        status: TaskStatus::Unsupported,
+        exit_code: None,
+        artifacts: vec![TaskArtifact {
+            path: Some(log_path.to_path_buf()),
+            kind: TaskArtifactKind::Log,
+            label: "audit log".into(),
+        }],
+        changed_files: Vec::new(),
+        message: Some(message.to_string()),
+        log_path: Some(log_path.to_path_buf()),
+        failure_reason: None,
+    }
+}
+
+fn failed_task_result(
+    task_id: &str,
+    log_path: &Path,
+    message: &str,
+    failure_reason: TaskFailureReason,
+) -> RemoteAgentTaskResult {
+    RemoteAgentTaskResult {
+        task_id: task_id.to_string(),
+        status: TaskStatus::Failed,
+        exit_code: None,
+        artifacts: vec![TaskArtifact {
+            path: Some(log_path.to_path_buf()),
+            kind: TaskArtifactKind::Log,
+            label: "audit log".into(),
+        }],
+        changed_files: Vec::new(),
+        message: Some(message.to_string()),
+        log_path: Some(log_path.to_path_buf()),
+        failure_reason: Some(failure_reason),
+    }
+}
+
+fn gui_error_to_failure_reason(err: &GuiAutomationError) -> TaskFailureReason {
+    match err {
+        GuiAutomationError::RecipeNotFound(_) => TaskFailureReason::RecipeNotFound,
+        GuiAutomationError::PlatformUnsupported { .. } => TaskFailureReason::PlatformUnsupported,
+        GuiAutomationError::MissingParam(_) => TaskFailureReason::InvalidParameters,
+        GuiAutomationError::MissingInput => TaskFailureReason::InvalidParameters,
+        GuiAutomationError::ReadRecipe { .. } | GuiAutomationError::InvalidDescriptor(_) => {
+            TaskFailureReason::ScriptError
+        }
+    }
+}
+
+fn gui_control_mode_label(mode: &GuiControlMode) -> &'static str {
+    match mode {
+        GuiControlMode::RdpVisible => "rdp_visible",
+        GuiControlMode::BackgroundAutomation => "background_automation",
+    }
+}
+
+fn engine_label(engine: &GuiEngine) -> &'static str {
+    match engine {
+        GuiEngine::Powershell => "powershell",
+        GuiEngine::Osascript => "osascript",
+        GuiEngine::Shell => "shell",
+    }
+}
+
+async fn write_gui_automation_started(
+    log_path: &Path,
+    task_id: &str,
+    plan: &GuiAutomationPlan,
+) -> Result<()> {
+    write_audit(
+        log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: task_id,
+            event: "gui_automation_started",
+            payload: GuiAutomationStartedPayload {
+                action: &plan.action,
+                platform: &plan.platform,
+                engine: engine_label(&plan.engine),
+                mode: gui_control_mode_label(&plan.mode),
+                recipe_id: plan.recipe_id.as_deref(),
+            },
+        },
+    )
+    .await
+}
+
+async fn write_gui_automation_action(
+    log_path: &Path,
+    task_id: &str,
+    plan: &GuiAutomationPlan,
+    exit_code: Option<i32>,
+    stderr_summary: &str,
+    failure_reason: Option<TaskFailureReason>,
+) -> Result<()> {
+    write_audit(
+        log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: task_id,
+            event: "gui_automation_action",
+            payload: GuiAutomationActionPayload {
+                action: plan.action.clone(),
+                platform: plan.platform.clone(),
+                engine: engine_label(&plan.engine).to_string(),
+                mode: gui_control_mode_label(&plan.mode).to_string(),
+                recipe_id: plan.recipe_id.clone(),
+                exit_code,
+                stderr_summary: stderr_summary.to_string(),
+                failure_reason,
+            },
+        },
+    )
+    .await
+}
+
+async fn write_task_message(
+    log_path: &Path,
+    task_id: &str,
+    level: &'static str,
+    message: &str,
+) -> Result<()> {
+    write_audit(
+        log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: task_id,
+            event: "task_event",
+            payload: TaskMessagePayload { level, message },
+        },
+    )
+    .await
+}
+
+fn task_kind_label(kind: &TaskKind) -> &'static str {
+    match kind {
+        TaskKind::CodexFileTask => "codex_file_task",
+        TaskKind::BatchTask { .. } => "batch_task",
+        TaskKind::ProgramTask { .. } => "program_task",
+        TaskKind::RdpSession { .. } => "rdp_session",
+        TaskKind::GuiAutomation { .. } => "gui_automation",
+        TaskKind::ServiceControl { .. } => "service_control",
+    }
+}
+
 async fn reap_finished_children(state: &AppState) {
     let mut ended = Vec::new();
     {
@@ -388,8 +1296,75 @@ async fn reap_finished_children(state: &AppState) {
     }
 }
 
-async fn copy_lines_to_audit<R>(log_path: PathBuf, session_id: String, stream: &'static str, reader: R)
-where
+async fn copy_lines_to_audit_with_summary<R>(
+    log_path: PathBuf,
+    session_id: String,
+    stream: &'static str,
+    reader: R,
+    summary: Arc<Mutex<String>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if stream == "stderr" {
+                    let mut guard = summary.lock().await;
+                    if !guard.is_empty() {
+                        guard.push('\n');
+                    }
+                    guard.push_str(&line);
+                }
+                let _ = write_audit(
+                    &log_path,
+                    &AuditEvent {
+                        timestamp: unix_secs(),
+                        session_id: &session_id,
+                        event: "codex_output",
+                        payload: StreamPayload {
+                            stream,
+                            line: &line,
+                        },
+                    },
+                )
+                .await;
+            }
+            Ok(None) => break,
+            Err(err) => {
+                let message = err.to_string();
+                if stream == "stderr" {
+                    let mut guard = summary.lock().await;
+                    if !guard.is_empty() {
+                        guard.push('\n');
+                    }
+                    guard.push_str(&message);
+                }
+                let _ = write_audit(
+                    &log_path,
+                    &AuditEvent {
+                        timestamp: unix_secs(),
+                        session_id: &session_id,
+                        event: "stream_error",
+                        payload: StreamPayload {
+                            stream,
+                            line: &message,
+                        },
+                    },
+                )
+                .await;
+                break;
+            }
+        }
+    }
+}
+
+async fn copy_lines_to_audit<R>(
+    log_path: PathBuf,
+    session_id: String,
+    stream: &'static str,
+    reader: R,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
@@ -453,11 +1428,17 @@ async fn write_session_file(path: &Path, endpoint: &str, token: &str) -> Result<
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
-        return Err(error_response(StatusCode::UNAUTHORIZED, "missing bearer token"));
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing bearer token",
+        ));
     };
     let expected = format!("Bearer {}", state.token);
     if value != expected {
-        return Err(error_response(StatusCode::FORBIDDEN, "invalid bearer token"));
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "invalid bearer token",
+        ));
     }
     Ok(())
 }
@@ -512,6 +1493,13 @@ fn unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::is_safe_session_id;
+    use agent_core::tail_task_audit_ndjson;
+    use compute_core::BatchAdapterRegistry;
+
+    #[test]
+    fn batch_capabilities_available_when_adapters_exist() {
+        assert!(!BatchAdapterRegistry::with_builtin_adapters().capabilities().is_empty());
+    }
 
     #[test]
     fn safe_session_id_rejects_paths() {
@@ -519,5 +1507,15 @@ mod tests {
         assert!(!is_safe_session_id("../secret"));
         assert!(!is_safe_session_id("a.jsonl"));
         assert!(!is_safe_session_id(""));
+    }
+
+    #[test]
+    fn read_task_events_since_returns_tail_only() {
+        let ndjson = "\
+{\"timestamp\":1,\"session_id\":\"t1\",\"event\":\"task_started\",\"kind\":\"program_task\"}\n\
+{\"timestamp\":2,\"session_id\":\"t1\",\"event\":\"task_event\",\"level\":\"info\",\"message\":\"a\"}\n";
+        let tail = tail_task_audit_ndjson(ndjson, Some(1));
+        assert_eq!(tail.matches('\n').count(), 1);
+        assert!(tail.contains("\"timestamp\":2"));
     }
 }
