@@ -22,11 +22,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use agent_core::{
-    GuiAutomationError, GuiAutomationPlan, GuiControlMode, GuiEngine, RecipeCatalog,
-    RemoteAgentCapabilities, RemoteAgentTaskRequest, RemoteAgentTaskResult, TaskArtifact,
-    TaskArtifactKind, TaskFailureReason, TaskKind, TaskStatus, batch_request_from_remote_task,
-    bundled_recipes_dir, classify_gui_failure, expand_gui_automation,
-    remote_task_result_from_batch, summarize_stderr, tail_task_audit_ndjson,
+    ComAutomationError, ComAutomationPlan, ComRecipeCatalog, GuiAutomationError, GuiAutomationPlan,
+    GuiControlMode, GuiEngine, RecipeCatalog, RemoteAgentCapabilities, RemoteAgentTaskRequest,
+    RemoteAgentTaskResult, TaskArtifact, TaskArtifactKind, TaskFailureReason, TaskKind, TaskStatus,
+    batch_request_from_remote_task, bundled_com_recipes_dir, bundled_recipes_dir,
+    classify_com_failure, classify_gui_failure, com_automation_supported, expand_com_automation,
+    expand_gui_automation, remote_task_result_from_batch, summarize_stderr, tail_task_audit_ndjson,
 };
 use compute_core::BatchAdapterRegistry;
 
@@ -57,6 +58,9 @@ struct Cli {
 
     #[arg(long)]
     recipes_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    com_recipes_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -68,6 +72,8 @@ struct AppState {
     codex_bin: PathBuf,
     recipes_dir: PathBuf,
     recipe_catalog: Arc<RecipeCatalog>,
+    com_recipes_dir: PathBuf,
+    com_recipe_catalog: Arc<ComRecipeCatalog>,
     sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
     tasks: Arc<Mutex<HashMap<String, TaskHandle>>>,
 }
@@ -81,6 +87,7 @@ struct TaskHandle {
     result: RemoteAgentTaskResult,
     child: Option<Child>,
     gui_plan: Option<GuiAutomationPlan>,
+    com_plan: Option<ComAutomationPlan>,
     stderr_summary: Arc<Mutex<String>>,
 }
 
@@ -122,6 +129,25 @@ struct GuiAutomationActionPayload {
     engine: String,
     mode: String,
     recipe_id: Option<String>,
+    exit_code: Option<i32>,
+    stderr_summary: String,
+    failure_reason: Option<TaskFailureReason>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComAutomationStartedPayload<'a> {
+    action: &'a str,
+    recipe_id: Option<&'a str>,
+    prog_id: Option<&'a str>,
+    visible: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ComAutomationActionPayload {
+    action: String,
+    recipe_id: Option<String>,
+    prog_id: Option<String>,
+    visible: bool,
     exit_code: Option<i32>,
     stderr_summary: String,
     failure_reason: Option<TaskFailureReason>,
@@ -210,6 +236,17 @@ async fn main() -> Result<()> {
         RecipeCatalog::bundled()
     });
 
+    let com_recipes_dir = cli
+        .com_recipes_dir
+        .unwrap_or_else(bundled_com_recipes_dir);
+    let com_recipe_catalog = ComRecipeCatalog::load_dir(&com_recipes_dir).unwrap_or_else(|err| {
+        eprintln!(
+            "warning: failed to load COM recipes from {}: {err}; using bundled recipes only",
+            com_recipes_dir.display()
+        );
+        ComRecipeCatalog::bundled()
+    });
+
     let state = AppState {
         token: cli.token,
         log_dir: cli.log_dir,
@@ -218,6 +255,8 @@ async fn main() -> Result<()> {
         codex_bin,
         recipes_dir,
         recipe_catalog: Arc::new(recipe_catalog),
+        com_recipes_dir,
+        com_recipe_catalog: Arc::new(com_recipe_catalog),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -258,6 +297,7 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Resp
         program: true,
         rdp: false,
         gui_automation: true,
+        com_automation: com_automation_supported(),
         service_control: true,
         platform: std::env::consts::OS.to_string(),
         permission_notes: vec![
@@ -265,6 +305,7 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "service install/uninstall is explicit and requires OS administrator or user approval".into(),
             "service control status returns JSON; install/start may fail without elevation".into(),
             "GUI automation may require Accessibility/UI Automation permissions".into(),
+            "COM automation requires Windows, installed Office for Office recipes, and an interactive desktop session".into(),
             "rdp_session tasks are executed by Wormhole Desktop RDP iroh node, not wormhole-agentd"
                 .into(),
         ],
@@ -594,6 +635,7 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                 result: result.clone(),
                 child: None,
                 gui_plan: None,
+                com_plan: None,
                 stderr_summary: Arc::new(Mutex::new(String::new())),
             },
         );
@@ -662,6 +704,7 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                         result: result.clone(),
                         child: None,
                         gui_plan: None,
+                        com_plan: None,
                         stderr_summary: Arc::new(Mutex::new(String::new())),
                     },
                 );
@@ -672,7 +715,43 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
         None
     };
 
-    let mut command = match build_task_command(&state, &req, gui_plan.as_ref())? {
+    let com_plan = if matches!(req.kind, TaskKind::ComAutomation { .. }) {
+        match expand_com_automation(
+            &req.kind,
+            state.com_recipe_catalog.as_ref(),
+            Some(state.com_recipes_dir.as_path()),
+        ) {
+            Ok(plan) => {
+                write_com_automation_started(&log_path, &task_id, &plan).await?;
+                Some(plan)
+            }
+            Err(err) => {
+                let failure_reason = com_error_to_failure_reason(&err);
+                let result = failed_task_result(
+                    &task_id,
+                    &log_path,
+                    &err.to_string(),
+                    failure_reason,
+                );
+                write_task_message(&log_path, &task_id, "error", &err.to_string()).await?;
+                state.tasks.lock().await.insert(
+                    task_id.clone(),
+                    TaskHandle {
+                        result: result.clone(),
+                        child: None,
+                        gui_plan: None,
+                        com_plan: None,
+                        stderr_summary: Arc::new(Mutex::new(String::new())),
+                    },
+                );
+                return Ok(result);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut command = match build_task_command(&state, &req, gui_plan.as_ref(), com_plan.as_ref())? {
         Some(command) => command,
         None => {
             let result = unsupported_task_result(
@@ -688,6 +767,7 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                     result: result.clone(),
                     child: None,
                     gui_plan: None,
+                    com_plan: None,
                     stderr_summary: Arc::new(Mutex::new(String::new())),
                 },
             );
@@ -713,7 +793,7 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
         ));
     }
     if let Some(stderr) = child.stderr.take() {
-        if gui_plan.is_some() {
+        if gui_plan.is_some() || com_plan.is_some() {
             tokio::spawn(copy_lines_to_audit_with_summary(
                 log_path.clone(),
                 task_id.clone(),
@@ -761,6 +841,7 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
             result: result.clone(),
             child: Some(child),
             gui_plan,
+            com_plan,
             stderr_summary,
         },
     );
@@ -810,6 +891,7 @@ async fn spawn_batch_task(
                     result: result.clone(),
                     child: None,
                     gui_plan: None,
+                    com_plan: None,
                     stderr_summary: Arc::new(Mutex::new(String::new())),
                 },
             );
@@ -847,6 +929,7 @@ async fn spawn_batch_task(
             result: running.clone(),
             child: None,
             gui_plan: None,
+            com_plan: None,
             stderr_summary: Arc::new(Mutex::new(String::new())),
         },
     );
@@ -897,6 +980,7 @@ fn build_task_command(
     state: &AppState,
     req: &RemoteAgentTaskRequest,
     gui_plan: Option<&GuiAutomationPlan>,
+    com_plan: Option<&ComAutomationPlan>,
 ) -> Result<Option<Command>> {
     match &req.kind {
         TaskKind::CodexFileTask => {
@@ -929,6 +1013,12 @@ fn build_task_command(
                 anyhow!("gui automation plan missing after recipe expansion")
             })?;
             Ok(Some(gui_automation_command(plan)))
+        }
+        TaskKind::ComAutomation { .. } => {
+            let plan = com_plan.ok_or_else(|| {
+                anyhow!("com automation plan missing after recipe expansion")
+            })?;
+            Ok(Some(com_automation_command(plan)))
         }
         TaskKind::ServiceControl { action } => service_control::service_control_command(
             &state.log_dir,
@@ -967,11 +1057,24 @@ fn gui_automation_command(plan: &GuiAutomationPlan) -> Command {
     }
 }
 
+fn com_automation_command(plan: &ComAutomationPlan) -> Command {
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &plan.script,
+    ]);
+    cmd
+}
+
 async fn reap_finished_tasks(state: &AppState) {
     struct EndedTask {
         task_id: String,
         result: RemoteAgentTaskResult,
         gui_plan: Option<GuiAutomationPlan>,
+        com_plan: Option<ComAutomationPlan>,
         stderr_summary: String,
     }
 
@@ -992,9 +1095,16 @@ async fn reap_finished_tasks(state: &AppState) {
                 Ok(Some(status)) => {
                     handle.result.exit_code = status.code();
                     let stderr_summary = handle.stderr_summary.lock().await.clone();
-                    if let Some(plan) = handle.gui_plan.as_ref() {
+                    if handle.gui_plan.is_some() {
                         if !status.success() {
                             handle.result.failure_reason = Some(classify_gui_failure(
+                                status.code(),
+                                &stderr_summary,
+                            ));
+                        }
+                    } else if handle.com_plan.is_some() {
+                        if !status.success() {
+                            handle.result.failure_reason = Some(classify_com_failure(
                                 status.code(),
                                 &stderr_summary,
                             ));
@@ -1010,6 +1120,7 @@ async fn reap_finished_tasks(state: &AppState) {
                         task_id: id.clone(),
                         result: handle.result.clone(),
                         gui_plan: handle.gui_plan.clone(),
+                        com_plan: handle.com_plan.clone(),
                         stderr_summary,
                     });
                 }
@@ -1022,6 +1133,7 @@ async fn reap_finished_tasks(state: &AppState) {
                         task_id: id.clone(),
                         result: handle.result.clone(),
                         gui_plan: handle.gui_plan.clone(),
+                        com_plan: handle.com_plan.clone(),
                         stderr_summary: handle.stderr_summary.lock().await.clone(),
                     });
                 }
@@ -1051,6 +1163,23 @@ async fn reap_finished_tasks(state: &AppState) {
                     None
                 };
                 let _ = write_gui_automation_action(
+                    log_path,
+                    &ended.task_id,
+                    plan,
+                    ended.result.exit_code,
+                    &stderr_summary,
+                    failure_reason,
+                )
+                .await;
+            }
+            if let Some(plan) = ended.com_plan.as_ref() {
+                let stderr_summary = summarize_stderr(&ended.stderr_summary, 512);
+                let failure_reason = if ended.result.status == TaskStatus::Failed {
+                    ended.result.failure_reason.clone()
+                } else {
+                    None
+                };
+                let _ = write_com_automation_action(
                     log_path,
                     &ended.task_id,
                     plan,
@@ -1154,6 +1283,21 @@ fn gui_error_to_failure_reason(err: &GuiAutomationError) -> TaskFailureReason {
     }
 }
 
+fn com_error_to_failure_reason(err: &ComAutomationError) -> TaskFailureReason {
+    match err {
+        ComAutomationError::RecipeNotFound(_) => TaskFailureReason::RecipeNotFound,
+        ComAutomationError::PlatformUnsupported { .. } | ComAutomationError::NotWindows => {
+            TaskFailureReason::PlatformUnsupported
+        }
+        ComAutomationError::MissingParam(_) | ComAutomationError::MissingInput => {
+            TaskFailureReason::InvalidParameters
+        }
+        ComAutomationError::ReadRecipe { .. } | ComAutomationError::InvalidDescriptor(_) => {
+            TaskFailureReason::ScriptError
+        }
+    }
+}
+
 fn gui_control_mode_label(mode: &GuiControlMode) -> &'static str {
     match mode {
         GuiControlMode::RdpVisible => "rdp_visible",
@@ -1221,6 +1365,56 @@ async fn write_gui_automation_action(
     .await
 }
 
+async fn write_com_automation_started(
+    log_path: &Path,
+    task_id: &str,
+    plan: &ComAutomationPlan,
+) -> Result<()> {
+    write_audit(
+        log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: task_id,
+            event: "com_automation_started",
+            payload: ComAutomationStartedPayload {
+                action: &plan.action,
+                recipe_id: plan.recipe_id.as_deref(),
+                prog_id: plan.prog_id.as_deref(),
+                visible: plan.visible,
+            },
+        },
+    )
+    .await
+}
+
+async fn write_com_automation_action(
+    log_path: &Path,
+    task_id: &str,
+    plan: &ComAutomationPlan,
+    exit_code: Option<i32>,
+    stderr_summary: &str,
+    failure_reason: Option<TaskFailureReason>,
+) -> Result<()> {
+    write_audit(
+        log_path,
+        &AuditEvent {
+            timestamp: unix_secs(),
+            session_id: task_id,
+            event: "com_automation_action",
+            payload: ComAutomationActionPayload {
+                action: plan.action.clone(),
+                recipe_id: plan.recipe_id.clone(),
+                prog_id: plan.prog_id.clone(),
+                visible: plan.visible,
+                exit_code,
+                stderr_summary: stderr_summary.to_string(),
+                failure_reason,
+            },
+        },
+    )
+    .await
+}
+
 async fn write_task_message(
     log_path: &Path,
     task_id: &str,
@@ -1246,6 +1440,7 @@ fn task_kind_label(kind: &TaskKind) -> &'static str {
         TaskKind::ProgramTask { .. } => "program_task",
         TaskKind::RdpSession { .. } => "rdp_session",
         TaskKind::GuiAutomation { .. } => "gui_automation",
+        TaskKind::ComAutomation { .. } => "com_automation",
         TaskKind::ServiceControl { .. } => "service_control",
     }
 }

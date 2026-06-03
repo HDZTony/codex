@@ -31,7 +31,9 @@ current user session only.
 
 The `/tasks` API accepts `agent-core::RemoteAgentTaskRequest`. It supports Codex
 file tasks, explicit program tasks, platform GUI automation scripts,
-`service_control` tasks, and `batch_task` (via `compute-core::BatchAdapterRegistry`).
+Windows `com_automation` recipes (PowerShell COM; see `docs/com_automation.md` in the
+Wormhole repo), `service_control` tasks, and `batch_task` (via
+`compute-core::BatchAdapterRegistry`).
 `rdp_session` tasks are **not** executed here: Wormhole Desktop handles them on the RDP
 iroh node (`remote_agent_submit_task` / P2P agent ALPN). Direct HTTP `POST /tasks` with
 `rdp_session` returns `unsupported` plus a delegation message in the audit log.
