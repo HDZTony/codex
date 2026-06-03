@@ -13,7 +13,7 @@ use crate::guardian::guardian_rejection_message;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
-use crate::guardian::routes_approval_to_guardian;
+use crate::guardian::routes_approval_to_guardian_with_reviewer;
 use crate::hook_runtime::run_permission_request_hooks;
 use crate::mcp_openai_file::rewrite_mcp_tool_arguments_for_openai_files;
 use crate::mcp_tool_approval_templates::RenderedMcpToolApprovalParam;
@@ -32,6 +32,7 @@ use codex_app_server_protocol::McpElicitationSchema;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_config::types::AppToolApproval;
+use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
 use codex_hooks::PermissionRequestDecision;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -110,7 +111,7 @@ pub(crate) async fn handle_mcp_tool_call(
     call_id: String,
     server: String,
     tool_name: String,
-    hook_tool_name: String,
+    hook_tool_name: HookToolName,
     arguments: String,
 ) -> HandledMcpToolCall {
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
@@ -1158,15 +1159,15 @@ async fn maybe_request_mcp_tool_approval(
     turn_context: &Arc<TurnContext>,
     call_id: &str,
     invocation: &McpInvocation,
-    hook_tool_name: &str,
+    hook_tool_name: &HookToolName,
     metadata: Option<&McpToolApprovalMetadata>,
     approval_mode: AppToolApproval,
 ) -> Option<McpToolApprovalDecision> {
+    let approvals_reviewer = mcp_approvals_reviewer(turn_context, &invocation.server, metadata);
     if mcp_permission_prompt_is_auto_approved(
         turn_context.approval_policy.value(),
         &turn_context.permission_profile(),
         McpPermissionPromptAutoApproveContext {
-            approvals_reviewer: Some(turn_context.config.approvals_reviewer),
             tool_approval_mode: Some(approval_mode),
         },
     ) {
@@ -1193,7 +1194,7 @@ async fn maybe_request_mcp_tool_approval(
         turn_context,
         call_id,
         PermissionRequestPayload {
-            tool_name: HookToolName::new(hook_tool_name),
+            tool_name: hook_tool_name.clone(),
             tool_input: invocation
                 .arguments
                 .clone()
@@ -1218,7 +1219,7 @@ async fn maybe_request_mcp_tool_approval(
         .features
         .enabled(Feature::ToolCallMcpElicitation);
 
-    if routes_approval_to_guardian(turn_context) {
+    if routes_approval_to_guardian_with_reviewer(turn_context, approvals_reviewer) {
         let review_id = new_guardian_review_id();
         let decision = review_approval_request(
             sess,
@@ -1326,6 +1327,18 @@ async fn maybe_request_mcp_tool_approval(
     )
     .await;
     Some(decision)
+}
+
+pub(crate) fn mcp_approvals_reviewer(
+    turn_context: &TurnContext,
+    server_name: &str,
+    metadata: Option<&McpToolApprovalMetadata>,
+) -> ApprovalsReviewer {
+    connectors::mcp_approvals_reviewer(
+        turn_context.config.as_ref(),
+        server_name,
+        metadata.and_then(|metadata| metadata.connector_id.as_deref()),
+    )
 }
 
 fn session_mcp_tool_approval_key(

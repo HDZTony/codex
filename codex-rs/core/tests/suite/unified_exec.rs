@@ -200,6 +200,7 @@ async fn submit_unified_exec_turn(
             environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 cwd: Some(test.config.cwd.to_path_buf()),
                 approval_policy: Some(AskForApproval::Never),
@@ -291,6 +292,7 @@ async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
             environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 cwd: Some(cwd),
                 approval_policy: Some(AskForApproval::Never),
@@ -914,7 +916,7 @@ allow_local_binding = true
     let permission_profile = permission_profile_for_config.clone();
     let mut builder = test_codex()
         .with_home(home)
-        .with_cloud_requirements(managed_network_requirements_loader())
+        .with_cloud_config_bundle(managed_network_requirements_loader())
         .with_config(move |config| {
             config.use_experimental_unified_exec_tool = true;
             config
@@ -2146,6 +2148,7 @@ async fn unified_exec_keeps_long_running_session_after_turn_end() -> Result<()> 
             environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 cwd: Some(turn_cwd),
                 approval_policy: Some(AskForApproval::Never),
@@ -2249,6 +2252,7 @@ async fn unified_exec_interrupt_preserves_long_running_session() -> Result<()> {
             environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 cwd: Some(turn_cwd),
                 approval_policy: Some(AskForApproval::Never),
@@ -2721,6 +2725,7 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
             environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 cwd: Some(turn_cwd),
                 approval_policy: Some(AskForApproval::Never),
@@ -2843,6 +2848,7 @@ async fn unified_exec_enforces_glob_deny_read_policy() -> Result<()> {
             environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 cwd: Some(turn_cwd),
                 approval_policy: Some(AskForApproval::Never),
@@ -2981,6 +2987,7 @@ async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
             environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 cwd: Some(turn_cwd),
                 approval_policy: Some(AskForApproval::Never),

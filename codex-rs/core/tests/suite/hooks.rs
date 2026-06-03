@@ -1850,6 +1850,7 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
             thread_settings: Default::default(),
         })
         .await?;
@@ -1869,6 +1870,7 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
                 }],
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
                 thread_settings: Default::default(),
             })
             .await?;
@@ -2227,7 +2229,7 @@ allow_local_binding = true
                 panic!("failed to write permission request hook test fixture: {error}");
             }
         })
-        .with_cloud_requirements(managed_network_requirements_loader())
+        .with_cloud_config_bundle(managed_network_requirements_loader())
         .with_config(move |config| {
             trust_discovered_hooks(config);
             config.permissions.approval_policy = Constrained::allow_any(approval_policy);
