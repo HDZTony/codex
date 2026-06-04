@@ -22,12 +22,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use agent_core::{
-    ComAutomationError, ComAutomationPlan, ComRecipeCatalog, GuiAutomationError, GuiAutomationPlan,
-    GuiControlMode, GuiEngine, RecipeCatalog, RemoteAgentCapabilities, RemoteAgentTaskRequest,
-    RemoteAgentTaskResult, TaskArtifact, TaskArtifactKind, TaskFailureReason, TaskKind, TaskStatus,
-    batch_request_from_remote_task, bundled_com_recipes_dir, bundled_recipes_dir,
-    classify_com_failure, classify_gui_failure, com_automation_supported, expand_com_automation,
-    expand_gui_automation, remote_task_result_from_batch, summarize_stderr, tail_task_audit_ndjson,
+    codex_exec_argv, resolve_codex_exec_sandbox, ComAutomationError, ComAutomationPlan,
+    ComRecipeCatalog, CodexExecPolicyInput, CodexExecSandbox, CodexExecTurn, GuiAutomationError,
+    GuiAutomationPlan, GuiControlMode, GuiEngine, RecipeCatalog, RemoteAgentCapabilities,
+    RemoteAgentTaskRequest, RemoteAgentTaskResult, TaskArtifact, TaskArtifactKind,
+    TaskFailureReason, TaskKind, TaskStatus, batch_request_from_remote_task,
+    bundled_com_recipes_dir, bundled_recipes_dir, classify_com_failure, classify_gui_failure,
+    com_automation_supported, expand_com_automation, expand_gui_automation,
+    remote_task_result_from_batch, summarize_stderr, tail_task_audit_ndjson,
 };
 use compute_core::BatchAdapterRegistry;
 
@@ -298,6 +300,7 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Resp
         rdp: false,
         gui_automation: true,
         com_automation: com_automation_supported(),
+        computer_use: cfg!(any(target_os = "macos", windows)),
         service_control: true,
         platform: std::env::consts::OS.to_string(),
         permission_notes: vec![
@@ -305,6 +308,7 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "service install/uninstall is explicit and requires OS administrator or user approval".into(),
             "service control status returns JSON; install/start may fail without elevation".into(),
             "GUI automation may require Accessibility/UI Automation permissions".into(),
+            "computer_use runs desktop_screenshot / pointer / type_text recipes via wormhole-computer-use".into(),
             "COM automation requires Windows, installed Office for Office recipes, and an interactive desktop session".into(),
             "rdp_session tasks are executed by Wormhole Desktop RDP iroh node, not wormhole-agentd"
                 .into(),
@@ -515,20 +519,14 @@ async fn spawn_codex_session(
     let profile = profile.unwrap_or_else(|| state.profile.clone());
     let full_auto = full_auto.unwrap_or(state.full_auto);
 
-    let mut cmd = Command::new(&state.codex_bin);
-    cmd.arg("exec")
-        .arg("--json")
-        .arg("--skip-git-repo-check")
-        .arg("--profile")
-        .arg(profile);
-    if full_auto {
-        cmd.arg("--dangerously-bypass-approvals-and-sandbox");
-    }
-    if let Some(cwd) = cwd.as_deref().filter(|value| !value.trim().is_empty()) {
-        cmd.arg("--cd").arg(cwd);
-    }
-    cmd.arg(&prompt)
-        .stdin(Stdio::null())
+    let mut cmd = build_codex_exec_command(
+        &state.codex_bin,
+        &profile,
+        &prompt,
+        cwd.as_deref(),
+        full_auto,
+    )?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -984,20 +982,23 @@ fn build_task_command(
 ) -> Result<Option<Command>> {
     match &req.kind {
         TaskKind::CodexFileTask => {
-            let mut cmd = Command::new(&state.codex_bin);
-            cmd.arg("exec")
-                .arg("--json")
-                .arg("--skip-git-repo-check")
-                .arg("--profile")
-                .arg(&state.profile);
-            if state.full_auto {
-                cmd.arg("--dangerously-bypass-approvals-and-sandbox");
-            }
             let prompt = req
                 .prompt
                 .as_deref()
                 .unwrap_or("Complete the requested Wormhole remote file task.");
-            cmd.arg(prompt).stdin(Stdio::null());
+            let cwd = req
+                .cwd
+                .as_ref()
+                .map(|p| p.to_string_lossy())
+                .filter(|v| !v.trim().is_empty());
+            let mut cmd = build_codex_exec_command(
+                &state.codex_bin,
+                &state.profile,
+                prompt,
+                cwd.as_deref(),
+                state.full_auto,
+            )?;
+            cmd.stdin(Stdio::null());
             Ok(Some(cmd))
         }
         TaskKind::ProgramTask { program, args } => {
@@ -1302,7 +1303,39 @@ fn gui_control_mode_label(mode: &GuiControlMode) -> &'static str {
     match mode {
         GuiControlMode::RdpVisible => "rdp_visible",
         GuiControlMode::BackgroundAutomation => "background_automation",
+        GuiControlMode::ComputerUse => "computer_use",
     }
+}
+
+fn codex_exec_sandbox(prompt: &str, full_auto: bool) -> CodexExecSandbox {
+    let computer_use_enabled = std::env::var("WORMHOLE_COMPUTER_USE_ENABLED")
+        .ok()
+        .is_some_and(|v| v == "1");
+    resolve_codex_exec_sandbox(CodexExecPolicyInput {
+        computer_use_enabled,
+        prompt,
+        force_full_auto: full_auto,
+    })
+}
+
+fn build_codex_exec_command(
+    codex_bin: &Path,
+    profile: &str,
+    prompt: &str,
+    cwd: Option<&str>,
+    full_auto: bool,
+) -> Result<Command> {
+    let argv = codex_exec_argv(&CodexExecTurn {
+        profile,
+        message: prompt,
+        thread_id: None,
+        cwd,
+        sandbox: codex_exec_sandbox(prompt, full_auto),
+    })
+    .map_err(|err| anyhow!(err))?;
+    let mut cmd = Command::new(codex_bin);
+    cmd.args(argv);
+    Ok(cmd)
 }
 
 fn engine_label(engine: &GuiEngine) -> &'static str {
@@ -1643,10 +1676,12 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 }
 
 fn find_codex_binary() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("WORMHOLE_CODEX") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
+    for key in ["WORMHOLE_CODEX_BIN", "WORMHOLE_CODEX"] {
+        if let Ok(path) = std::env::var(key) {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Ok(path);
+            }
         }
     }
     if let Ok(current) = std::env::current_exe()
@@ -1687,8 +1722,8 @@ fn unix_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_session_id;
-    use agent_core::tail_task_audit_ndjson;
+    use super::{codex_exec_sandbox, gui_control_mode_label, is_safe_session_id};
+    use agent_core::{codex_exec_argv, CodexExecTurn, GuiControlMode, tail_task_audit_ndjson};
     use compute_core::BatchAdapterRegistry;
 
     #[test]
@@ -1702,6 +1737,32 @@ mod tests {
         assert!(!is_safe_session_id("../secret"));
         assert!(!is_safe_session_id("a.jsonl"));
         assert!(!is_safe_session_id(""));
+    }
+
+    #[test]
+    fn gui_control_mode_includes_computer_use() {
+        assert_eq!(
+            gui_control_mode_label(&GuiControlMode::ComputerUse),
+            "computer_use"
+        );
+    }
+
+    #[test]
+    fn codex_exec_argv_full_auto_when_forced() {
+        let argv = codex_exec_argv(&CodexExecTurn {
+            profile: "wormhole",
+            message: "open calculator",
+            thread_id: None,
+            cwd: Some("/tmp"),
+            sandbox: codex_exec_sandbox("task", true),
+        })
+        .expect("argv");
+        assert!(argv.iter().any(|a| a == "exec"));
+        assert!(argv.iter().any(|a| a == "--profile"));
+        assert!(
+            argv.iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox")
+        );
     }
 
     #[test]
