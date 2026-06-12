@@ -21,9 +21,11 @@ axum = { workspace = true, default-features = false, features = [
     "query",
     "tokio",
 ] }
+base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = [
     "fs",
     "io-util",

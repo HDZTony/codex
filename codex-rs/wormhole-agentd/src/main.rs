@@ -12,8 +12,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -90,7 +92,10 @@ struct TaskHandle {
     child: Option<Child>,
     gui_plan: Option<GuiAutomationPlan>,
     com_plan: Option<ComAutomationPlan>,
+    input_workdir: Option<PathBuf>,
+    stdout_summary: Arc<Mutex<String>>,
     stderr_summary: Arc<Mutex<String>>,
+    stdout_as_message: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,9 +232,7 @@ async fn main() -> Result<()> {
     let endpoint = format!("http://{}", listener.local_addr()?);
     write_session_file(&cli.session_file, &endpoint, &cli.token).await?;
 
-    let recipes_dir = cli
-        .recipes_dir
-        .unwrap_or_else(bundled_recipes_dir);
+    let recipes_dir = cli.recipes_dir.unwrap_or_else(bundled_recipes_dir);
     let recipe_catalog = RecipeCatalog::load_dir(&recipes_dir).unwrap_or_else(|err| {
         eprintln!(
             "warning: failed to load GUI recipes from {}: {err}; using bundled recipes only",
@@ -238,9 +241,7 @@ async fn main() -> Result<()> {
         RecipeCatalog::bundled()
     });
 
-    let com_recipes_dir = cli
-        .com_recipes_dir
-        .unwrap_or_else(bundled_com_recipes_dir);
+    let com_recipes_dir = cli.com_recipes_dir.unwrap_or_else(bundled_com_recipes_dir);
     let com_recipe_catalog = ComRecipeCatalog::load_dir(&com_recipes_dir).unwrap_or_else(|err| {
         eprintln!(
             "warning: failed to load COM recipes from {}: {err}; using bundled recipes only",
@@ -592,6 +593,8 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
         return spawn_batch_task(state, req).await;
     }
 
+    let (req, input_workdir) = materialize_inline_task_files(state.log_dir.as_path(), req).await?;
+
     if matches!(req.kind, TaskKind::RdpSession { .. }) {
         let task_id = if req.task_id.trim().is_empty() {
             Uuid::now_v7().to_string()
@@ -634,7 +637,10 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                 child: None,
                 gui_plan: None,
                 com_plan: None,
+                input_workdir: None,
+                stdout_summary: Arc::new(Mutex::new(String::new())),
                 stderr_summary: Arc::new(Mutex::new(String::new())),
+                stdout_as_message: false,
             },
         );
         return Ok(result);
@@ -689,12 +695,8 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
             }
             Err(err) => {
                 let failure_reason = gui_error_to_failure_reason(&err);
-                let result = failed_task_result(
-                    &task_id,
-                    &log_path,
-                    &err.to_string(),
-                    failure_reason,
-                );
+                let result =
+                    failed_task_result(&task_id, &log_path, &err.to_string(), failure_reason);
                 write_task_message(&log_path, &task_id, "error", &err.to_string()).await?;
                 state.tasks.lock().await.insert(
                     task_id.clone(),
@@ -703,7 +705,10 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                         child: None,
                         gui_plan: None,
                         com_plan: None,
+                        input_workdir: input_workdir.clone(),
+                        stdout_summary: Arc::new(Mutex::new(String::new())),
                         stderr_summary: Arc::new(Mutex::new(String::new())),
+                        stdout_as_message: false,
                     },
                 );
                 return Ok(result);
@@ -725,12 +730,8 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
             }
             Err(err) => {
                 let failure_reason = com_error_to_failure_reason(&err);
-                let result = failed_task_result(
-                    &task_id,
-                    &log_path,
-                    &err.to_string(),
-                    failure_reason,
-                );
+                let result =
+                    failed_task_result(&task_id, &log_path, &err.to_string(), failure_reason);
                 write_task_message(&log_path, &task_id, "error", &err.to_string()).await?;
                 state.tasks.lock().await.insert(
                     task_id.clone(),
@@ -739,7 +740,10 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                         child: None,
                         gui_plan: None,
                         com_plan: None,
+                        input_workdir: input_workdir.clone(),
+                        stdout_summary: Arc::new(Mutex::new(String::new())),
                         stderr_summary: Arc::new(Mutex::new(String::new())),
+                        stdout_as_message: false,
                     },
                 );
                 return Ok(result);
@@ -749,7 +753,8 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
         None
     };
 
-    let mut command = match build_task_command(&state, &req, gui_plan.as_ref(), com_plan.as_ref())? {
+    let mut command = match build_task_command(&state, &req, gui_plan.as_ref(), com_plan.as_ref())?
+    {
         Some(command) => command,
         None => {
             let result = unsupported_task_result(
@@ -766,7 +771,10 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                     child: None,
                     gui_plan: None,
                     com_plan: None,
+                    input_workdir: input_workdir.clone(),
+                    stdout_summary: Arc::new(Mutex::new(String::new())),
                     stderr_summary: Arc::new(Mutex::new(String::new())),
+                    stdout_as_message: false,
                 },
             );
             return Ok(result);
@@ -781,13 +789,16 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
         .spawn()
         .with_context(|| format!("failed to spawn task {}", task_id))?;
 
+    let stdout_summary = Arc::new(Mutex::new(String::new()));
     let stderr_summary = Arc::new(Mutex::new(String::new()));
+    let stdout_as_message = matches!(req.kind, TaskKind::ProgramTask { .. });
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(copy_lines_to_audit(
+        tokio::spawn(copy_lines_to_audit_with_summary(
             log_path.clone(),
             task_id.clone(),
             "stdout",
             stdout,
+            stdout_summary.clone(),
         ));
     }
     if let Some(stderr) = child.stderr.take() {
@@ -840,7 +851,10 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
             child: Some(child),
             gui_plan,
             com_plan,
+            input_workdir,
+            stdout_summary,
             stderr_summary,
+            stdout_as_message,
         },
     );
     Ok(result)
@@ -890,7 +904,10 @@ async fn spawn_batch_task(
                     child: None,
                     gui_plan: None,
                     com_plan: None,
+                    input_workdir: None,
+                    stdout_summary: Arc::new(Mutex::new(String::new())),
                     stderr_summary: Arc::new(Mutex::new(String::new())),
+                    stdout_as_message: false,
                 },
             );
             return Ok(result);
@@ -928,7 +945,10 @@ async fn spawn_batch_task(
             child: None,
             gui_plan: None,
             com_plan: None,
+            input_workdir: None,
+            stdout_summary: Arc::new(Mutex::new(String::new())),
             stderr_summary: Arc::new(Mutex::new(String::new())),
+            stdout_as_message: false,
         },
     );
 
@@ -1002,7 +1022,8 @@ fn build_task_command(
             Ok(Some(cmd))
         }
         TaskKind::ProgramTask { program, args } => {
-            let mut cmd = Command::new(program);
+            let program_path = resolve_program_task_binary(program);
+            let mut cmd = Command::new(program_path);
             cmd.args(args).stdin(Stdio::null());
             for (key, value) in &req.env {
                 cmd.env(key, value);
@@ -1010,26 +1031,111 @@ fn build_task_command(
             Ok(Some(cmd))
         }
         TaskKind::GuiAutomation { .. } => {
-            let plan = gui_plan.ok_or_else(|| {
-                anyhow!("gui automation plan missing after recipe expansion")
-            })?;
+            let plan = gui_plan
+                .ok_or_else(|| anyhow!("gui automation plan missing after recipe expansion"))?;
             Ok(Some(gui_automation_command(plan)))
         }
         TaskKind::ComAutomation { .. } => {
-            let plan = com_plan.ok_or_else(|| {
-                anyhow!("com automation plan missing after recipe expansion")
-            })?;
+            let plan = com_plan
+                .ok_or_else(|| anyhow!("com automation plan missing after recipe expansion"))?;
             Ok(Some(com_automation_command(plan)))
         }
-        TaskKind::ServiceControl { action } => service_control::service_control_command(
-            &state.log_dir,
-            &state.codex_bin,
-            action,
-        )
-        .map(Some),
+        TaskKind::ServiceControl { action } => {
+            service_control::service_control_command(&state.log_dir, &state.codex_bin, action)
+                .map(Some)
+        }
         TaskKind::BatchTask { .. } => Ok(None),
         TaskKind::RdpSession { .. } => Ok(None),
     }
+}
+
+async fn materialize_inline_task_files(
+    log_dir: &Path,
+    mut req: RemoteAgentTaskRequest,
+) -> Result<(RemoteAgentTaskRequest, Option<PathBuf>)> {
+    let has_inline_files = req
+        .files
+        .iter()
+        .any(|file| file.inline_bytes_base64.is_some());
+    if !has_inline_files {
+        return Ok((req, None));
+    }
+
+    let task_id = if req.task_id.trim().is_empty() {
+        Uuid::now_v7().to_string()
+    } else {
+        req.task_id.clone()
+    };
+    if req.task_id.trim().is_empty() {
+        req.task_id = task_id.clone();
+    }
+    let workdir = log_dir.join("task-inputs").join(&task_id);
+    fs::create_dir_all(&workdir)
+        .await
+        .with_context(|| format!("create inline task input dir {}", workdir.display()))?;
+
+    for file in &mut req.files {
+        let Some(encoded) = file.inline_bytes_base64.take() else {
+            continue;
+        };
+        if !matches!(
+            file.role,
+            agent_core::TaskFileRole::Input | agent_core::TaskFileRole::InOut
+        ) {
+            anyhow::bail!(
+                "inline task file {} must be input or in_out",
+                file.path.display()
+            );
+        }
+        let relative = safe_inline_task_file_path(&file.path)?;
+        let data = BASE64
+            .decode(encoded.as_bytes())
+            .with_context(|| format!("decode inline task file {}", file.path.display()))?;
+        if let Some(expected) = file.inline_sha256.as_deref() {
+            let actual = format!("{:x}", Sha256::digest(&data));
+            if !actual.eq_ignore_ascii_case(expected) {
+                anyhow::bail!(
+                    "inline task file {} sha256 mismatch: expected {}, got {}",
+                    file.path.display(),
+                    expected,
+                    actual
+                );
+            }
+        }
+        let target = workdir.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create inline task file dir {}", parent.display()))?;
+        }
+        fs::write(&target, data)
+            .await
+            .with_context(|| format!("write inline task file {}", target.display()))?;
+        file.path = relative;
+    }
+
+    if req.cwd.is_none() {
+        req.cwd = Some(workdir.clone());
+    }
+    Ok((req, Some(workdir)))
+}
+
+fn safe_inline_task_file_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        anyhow::bail!("inline task file path must be relative: {}", path.display());
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!("inline task file path is unsafe: {}", path.display()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        anyhow::bail!("inline task file path cannot be empty");
+    }
+    Ok(out)
 }
 
 fn gui_automation_command(plan: &GuiAutomationPlan) -> Command {
@@ -1076,6 +1182,7 @@ async fn reap_finished_tasks(state: &AppState) {
         result: RemoteAgentTaskResult,
         gui_plan: Option<GuiAutomationPlan>,
         com_plan: Option<ComAutomationPlan>,
+        input_workdir: Option<PathBuf>,
         stderr_summary: String,
     }
 
@@ -1098,17 +1205,13 @@ async fn reap_finished_tasks(state: &AppState) {
                     let stderr_summary = handle.stderr_summary.lock().await.clone();
                     if handle.gui_plan.is_some() {
                         if !status.success() {
-                            handle.result.failure_reason = Some(classify_gui_failure(
-                                status.code(),
-                                &stderr_summary,
-                            ));
+                            handle.result.failure_reason =
+                                Some(classify_gui_failure(status.code(), &stderr_summary));
                         }
                     } else if handle.com_plan.is_some() {
                         if !status.success() {
-                            handle.result.failure_reason = Some(classify_com_failure(
-                                status.code(),
-                                &stderr_summary,
-                            ));
+                            handle.result.failure_reason =
+                                Some(classify_com_failure(status.code(), &stderr_summary));
                         }
                     }
                     handle.result.status = if status.success() {
@@ -1116,12 +1219,21 @@ async fn reap_finished_tasks(state: &AppState) {
                     } else {
                         TaskStatus::Failed
                     };
-                    handle.result.message = Some(handle.result.status_text().to_string());
+                    let stdout_summary = handle.stdout_summary.lock().await.clone();
+                    handle.result.message = if status.success()
+                        && handle.stdout_as_message
+                        && !stdout_summary.trim().is_empty()
+                    {
+                        Some(summarize_stderr(&stdout_summary, 8192))
+                    } else {
+                        Some(handle.result.status_text().to_string())
+                    };
                     ended.push(EndedTask {
                         task_id: id.clone(),
                         result: handle.result.clone(),
                         gui_plan: handle.gui_plan.clone(),
                         com_plan: handle.com_plan.clone(),
+                        input_workdir: handle.input_workdir.take(),
                         stderr_summary,
                     });
                 }
@@ -1135,6 +1247,7 @@ async fn reap_finished_tasks(state: &AppState) {
                         result: handle.result.clone(),
                         gui_plan: handle.gui_plan.clone(),
                         com_plan: handle.com_plan.clone(),
+                        input_workdir: handle.input_workdir.take(),
                         stderr_summary: handle.stderr_summary.lock().await.clone(),
                     });
                 }
@@ -1190,6 +1303,9 @@ async fn reap_finished_tasks(state: &AppState) {
                 )
                 .await;
             }
+        }
+        if let Some(input_workdir) = ended.input_workdir.as_ref() {
+            let _ = fs::remove_dir_all(input_workdir).await;
         }
     }
 }
@@ -1699,6 +1815,70 @@ fn find_codex_binary() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("codex binary not found"))
 }
 
+fn resolve_program_task_binary(program: &str) -> PathBuf {
+    let requested = PathBuf::from(program);
+    if requested.is_absolute()
+        || requested.components().count() > 1
+        || program.contains('/')
+        || program.contains('\\')
+    {
+        return requested;
+    }
+    for dir in program_task_candidate_dirs() {
+        if let Some(path) = find_program_in_dir(&dir, program) {
+            return path;
+        }
+    }
+    find_in_path(program).unwrap_or(requested)
+}
+
+fn program_task_candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(current) = std::env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        dirs.push(dir.to_path_buf());
+        dirs.push(dir.join("../Resources"));
+        dirs.push(dir.join("../resources"));
+    }
+    dirs
+}
+
+fn find_program_in_dir(dir: &Path, program: &str) -> Option<PathBuf> {
+    let direct = dir.join(program);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let requested = Path::new(program);
+    let stem = requested
+        .file_stem()
+        .or_else(|| requested.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or(program);
+    let expected_prefix = format!("{stem}-");
+    let expected_extension = requested.extension().and_then(|value| value.to_str());
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries.filter_map(|entry| entry.ok()).find_map(|entry| {
+        let path = entry.path();
+        if !path.is_file() {
+            return None;
+        }
+        let file_name = path.file_name()?.to_str()?;
+        if !file_name.starts_with(&expected_prefix) {
+            return None;
+        }
+        let extension_matches = match expected_extension {
+            Some(extension) => path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|candidate| candidate.eq_ignore_ascii_case(extension))
+                .unwrap_or(false),
+            None => path.extension().is_none(),
+        };
+        extension_matches.then_some(path)
+    })
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
@@ -1728,7 +1908,11 @@ mod tests {
 
     #[test]
     fn batch_capabilities_available_when_adapters_exist() {
-        assert!(!BatchAdapterRegistry::with_builtin_adapters().capabilities().is_empty());
+        assert!(
+            !BatchAdapterRegistry::with_builtin_adapters()
+                .capabilities()
+                .is_empty()
+        );
     }
 
     #[test]
