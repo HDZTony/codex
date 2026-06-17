@@ -249,7 +249,7 @@ mcp_test_support = { path = "mcp-server/tests/common" }
 
 # External
 age = "0.11.1"
-allocative = "0.3.3"
+allocative = "=0.3.4"
 ansi-to-tui = "7.0.0"
 anyhow = "1"
 arboard = { version = "3", features = ["wayland-data-control"] }
@@ -396,7 +396,7 @@ tempfile = "3.23.0"
 test-log = "0.2.19"
 textwrap = "0.16.2"
 thiserror = "2.0.17"
-time = "0.3.47"
+time = "=0.3.47"
 tiny_http = "0.12"
 tokio = "1"
 tokio-stream = "0.1.18"

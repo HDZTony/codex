@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "compute-core",
  "serde",
@@ -290,22 +290,22 @@ dependencies = [
 
 [[package]]
 name = "allocative"
-version = "0.3.6"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8cf9afc79c83d514444b55df3935d317da54b1ce3b17a133c646889cc260de8"
+checksum = "8fac2ce611db8b8cee9b2aa886ca03c924e9da5e5295d0dbd0526e5d0b0710f7"
 dependencies = [
  "allocative_derive",
  "bumpalo",
- "ctor 1.0.7",
- "hashbrown 0.16.1",
+ "ctor 0.1.26",
+ "hashbrown 0.14.5",
  "num-bigint",
 ]
 
 [[package]]
 name = "allocative_derive"
-version = "0.3.6"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "614043c56c1173b800acb007b81fd0cbc0a0d7d717b71ba705fc2230d0760a23"
+checksum = "fe233a377643e0fc1a56421d7c90acdec45c291b30345eb9f08e8d0ddce5a4ab"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "cluster-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -4505,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "compute-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cluster-core",
@@ -5001,22 +5001,22 @@ dependencies = [
 
 [[package]]
 name = "ctor"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d2301688392eb071b0bf1a37be05c469d3cc4dbbd95df672fe28ab021e6a096"
+dependencies = [
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "ctor"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "424e0138278faeb2b401f174ad17e715c829512d74f3d1e81eb43365c2e0590e"
 dependencies = [
  "ctor-proc-macro",
  "dtor",
-]
-
-[[package]]
-name = "ctor"
-version = "1.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01334b89b69ff726750c5ce5073fc8bd860e99aa9a8fc5ca11b04730e3aee97a"
-dependencies = [
- "link-section",
- "linktime-proc-macro",
 ]
 
 [[package]]
@@ -5387,6 +5387,7 @@ version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
+ "powerfmt",
  "serde_core",
 ]
 
@@ -7745,11 +7746,11 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
- "hashbrown 0.14.5",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -9535,9 +9536,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.30.1"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
+checksum = "947e6816f7825b2b45027c2c32e7085da9934defa535de4a6a46b10a4d5257fa"
 dependencies = [
  "cc",
  "pkg-config",
@@ -9590,22 +9591,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "link-section"
-version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2b1dd6fe32e55c0fc0ea9493aa57459ca3cf4ff3c857c7d0302290150da6e4f"
-
-[[package]]
 name = "linked-hash-map"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
-
-[[package]]
-name = "linktime-proc-macro"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c7b0a3383c2a1002d11349c92c85a666a5fb679e96c79d782cf0dbe557fd6ee"
 
 [[package]]
 name = "linux-keyutils"
@@ -12861,14 +12850,14 @@ source = "git+https://github.com/dzbarsky/rules_rust?rev=b56cbaa8465e74127f1ea21
 
 [[package]]
 name = "rusqlite"
-version = "0.32.1"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+checksum = "a22715a5d6deef63c637207afbe68d0c72c3f8d0022d7cf9714c442d6157606b"
 dependencies = [
  "bitflags 2.13.0",
  "fallible-iterator",
  "fallible-streaming-iterator",
- "hashlink 0.9.1",
+ "hashlink 0.10.0",
  "libsqlite3-sys",
  "smallvec",
 ]
@@ -14340,7 +14329,7 @@ dependencies = [
 
 [[package]]
 name = "storage-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -14895,11 +14884,12 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.48"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1aa89044e7786ffb2ec017acb22cb7de5b0be46d0f21aea2b224b8561e5db2"
+checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
+ "itoa",
  "js-sys",
  "libc",
  "num-conv",
@@ -14912,15 +14902,15 @@ dependencies = [
 
 [[package]]
 name = "time-core"
-version = "0.1.9"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "time-macros"
-version = "0.2.28"
+version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d3bfe86347f0cc659f586f01e26303ccd32418f26f30c7b0309b3ca3a07d695"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
