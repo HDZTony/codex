@@ -26,14 +26,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use agent_core::{
-    codex_exec_argv, resolve_codex_exec_sandbox, ComAutomationError, ComAutomationPlan,
-    ComRecipeCatalog, CodexExecPolicyInput, CodexExecSandbox, CodexExecTurn, GuiAutomationError,
-    GuiAutomationPlan, GuiControlMode, GuiEngine, RecipeCatalog, RemoteAgentCapabilities,
-    RemoteAgentTaskRequest, RemoteAgentTaskResult, TaskArtifact, TaskArtifactKind,
-    TaskFailureReason, TaskKind, TaskStatus, batch_request_from_remote_task,
-    bundled_com_recipes_dir, bundled_recipes_dir, classify_com_failure, classify_gui_failure,
-    com_automation_supported, expand_com_automation, expand_gui_automation,
-    remote_task_result_from_batch, summarize_stderr, tail_task_audit_ndjson,
+    CodexExecPolicyInput, CodexExecSandbox, CodexExecTurn, ComAutomationError, ComAutomationPlan,
+    ComRecipeCatalog, GuiAutomationError, GuiAutomationPlan, GuiControlMode, GuiEngine,
+    RecipeCatalog, RemoteAgentCapabilities, RemoteAgentTaskRequest, RemoteAgentTaskResult,
+    TaskArtifact, TaskArtifactKind, TaskFailureReason, TaskKind, TaskStatus,
+    batch_request_from_remote_task, bundled_com_recipes_dir, bundled_recipes_dir,
+    classify_com_failure, classify_gui_failure, codex_exec_argv, com_automation_supported,
+    expand_com_automation, expand_gui_automation, remote_task_result_from_batch,
+    resolve_codex_exec_sandbox, summarize_stderr, tail_task_audit_ndjson,
 };
 use compute_core::BatchAdapterRegistry;
 
@@ -1909,7 +1909,7 @@ fn unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{codex_exec_sandbox, gui_control_mode_label, is_safe_session_id};
-    use agent_core::{codex_exec_argv, CodexExecTurn, GuiControlMode, tail_task_audit_ndjson};
+    use agent_core::{CodexExecTurn, GuiControlMode, codex_exec_argv, tail_task_audit_ndjson};
     use compute_core::BatchAdapterRegistry;
 
     #[test]
