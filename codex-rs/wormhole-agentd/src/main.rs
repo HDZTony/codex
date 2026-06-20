@@ -296,6 +296,8 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
     Json(RemoteAgentCapabilities {
         codex: state.codex_bin.is_file(),
+        cursor: false,
+        warp: false,
         batch: !BatchAdapterRegistry::with_builtin_adapters()
             .capabilities()
             .is_empty(),
@@ -1048,6 +1050,7 @@ fn build_task_command(
         }
         TaskKind::BatchTask { .. } => Ok(None),
         TaskKind::RdpSession { .. } => Ok(None),
+        TaskKind::WarpAgentTask { .. } => Ok(None),
     }
 }
 
@@ -1593,6 +1596,7 @@ fn task_kind_label(kind: &TaskKind) -> &'static str {
         TaskKind::GuiAutomation { .. } => "gui_automation",
         TaskKind::ComAutomation { .. } => "com_automation",
         TaskKind::ServiceControl { .. } => "service_control",
+        TaskKind::WarpAgentTask { .. } => "warp_agent_task",
     }
 }
 
