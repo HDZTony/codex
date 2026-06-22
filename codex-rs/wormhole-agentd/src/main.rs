@@ -26,14 +26,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use agent_core::{
-    CodexExecPolicyInput, CodexExecSandbox, CodexExecTurn, ComAutomationError, ComAutomationPlan,
-    ComRecipeCatalog, GuiAutomationError, GuiAutomationPlan, GuiControlMode, GuiEngine,
-    RecipeCatalog, RemoteAgentCapabilities, RemoteAgentTaskRequest, RemoteAgentTaskResult,
-    TaskArtifact, TaskArtifactKind, TaskFailureReason, TaskKind, TaskStatus,
     batch_request_from_remote_task, bundled_com_recipes_dir, bundled_recipes_dir,
     classify_com_failure, classify_gui_failure, codex_exec_argv, com_automation_supported,
     expand_com_automation, expand_gui_automation, remote_task_result_from_batch,
-    resolve_codex_exec_sandbox, summarize_stderr, tail_task_audit_ndjson,
+    resolve_codex_exec_sandbox, summarize_stderr, tail_task_audit_ndjson, ComAutomationError,
+    ComAutomationPlan, ComRecipeCatalog, CodexExecPolicyInput, CodexExecSandbox, CodexExecTurn,
+    GuiAutomationError, GuiAutomationPlan, GuiControlMode, GuiEngine, RecipeCatalog,
+    RemoteAgentCapabilities, RemoteAgentTaskRequest, RemoteAgentTaskResult, TaskArtifact,
+    TaskArtifactKind, TaskFailureReason, TaskKind, TaskStatus, WarpAgentKind,
 };
 use compute_core::BatchAdapterRegistry;
 
@@ -296,8 +296,8 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
     Json(RemoteAgentCapabilities {
         codex: state.codex_bin.is_file(),
-        cursor: false,
-        warp: false,
+        cursor: resolve_agent_cli().is_some(),
+        warp: state.codex_bin.is_file(),
         batch: !BatchAdapterRegistry::with_builtin_adapters()
             .capabilities()
             .is_empty(),
@@ -316,6 +316,8 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "computer_use runs desktop_screenshot / pointer / type_text recipes via wormhole-computer-use".into(),
             "COM automation requires Windows, installed Office for Office recipes, and an interactive desktop session".into(),
             "rdp_session tasks are executed by Wormhole Desktop RDP iroh node, not wormhole-agentd"
+                .into(),
+            "warp_agent tasks (iOS Warp / remote Codex or Cursor prompts) execute here via codex exec or agent -p"
                 .into(),
         ],
     })
@@ -1050,7 +1052,51 @@ fn build_task_command(
         }
         TaskKind::BatchTask { .. } => Ok(None),
         TaskKind::RdpSession { .. } => Ok(None),
-        TaskKind::WarpAgentTask { .. } => Ok(None),
+        TaskKind::WarpAgentTask { agent } => {
+            let prompt = req
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("WarpAgentTask requires a non-empty prompt"))?;
+            let cwd = req
+                .cwd
+                .as_ref()
+                .map(|p| p.to_string_lossy())
+                .filter(|v| !v.trim().is_empty());
+            match agent {
+                WarpAgentKind::Codex => {
+                    let mut cmd = build_codex_exec_command(
+                        &state.codex_bin,
+                        &state.profile,
+                        prompt,
+                        cwd.as_deref(),
+                        true,
+                    )?;
+                    cmd.stdin(Stdio::null());
+                    Ok(Some(cmd))
+                }
+                WarpAgentKind::Cursor => {
+                    let agent_bin = resolve_agent_cli()
+                        .ok_or_else(|| anyhow!("Cursor agent CLI not found on PATH"))?;
+                    let mut cmd = Command::new(agent_bin);
+                    cmd.arg("-p").arg(prompt).stdin(Stdio::null());
+                    if let Some(model) = std::env::var("WORMHOLE_CURSOR_MODEL")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        cmd.args(["--model", model.trim()]);
+                    }
+                    if let Some(key) = std::env::var("CURSOR_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        cmd.env("CURSOR_API_KEY", key);
+                    }
+                    Ok(Some(cmd))
+                }
+            }
+        }
     }
 }
 
@@ -1892,6 +1938,16 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+fn resolve_agent_cli() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("WORMHOLE_AGENT_CLI") {
+        let path = PathBuf::from(path.trim());
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    find_in_path("agent.exe").or_else(|| find_in_path("agent"))
+}
+
 fn is_safe_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id
@@ -1953,6 +2009,20 @@ mod tests {
             argv.iter()
                 .any(|a| a == "--dangerously-bypass-approvals-and-sandbox")
         );
+    }
+
+    #[test]
+    fn warp_agent_task_codex_builds_exec_argv() {
+        let argv = codex_exec_argv(&CodexExecTurn {
+            profile: "wormhole",
+            message: "fix the bug",
+            thread_id: None,
+            cwd: None,
+            sandbox: codex_exec_sandbox("fix the bug", true),
+        })
+        .expect("argv");
+        assert!(argv.iter().any(|arg| arg == "exec"));
+        assert!(argv.iter().any(|arg| arg == "fix the bug"));
     }
 
     #[test]

@@ -30,7 +30,8 @@ software. By default Wormhole Desktop launches and stops the daemon for the
 current user session only.
 
 The `/tasks` API accepts `agent-core::RemoteAgentTaskRequest`. It supports Codex
-file tasks, explicit program tasks, platform GUI automation scripts,
+file tasks, **`warp_agent` tasks** (iOS Warp remote prompts: `WarpAgentTask` with
+`codex exec --full-auto` or Cursor `agent -p`), explicit program tasks, platform GUI automation scripts,
 Windows `com_automation` recipes (PowerShell COM; see `docs/com_automation.md` in the
 Wormhole repo), `service_control` tasks, and `batch_task` (via
 `compute-core::BatchAdapterRegistry`).
