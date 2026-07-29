@@ -693,7 +693,7 @@ async fn spawn_task(state: AppState, req: RemoteAgentTaskRequest) -> Result<Remo
                         &log_path,
                         &task_id,
                         "warning",
-                        "rdp_visible mode selected; session binding is not yet enforced",
+                        "rdp_visible must run on desktop (remote_agent_submit_task local path); agentd will not bind a Viewer session",
                     )
                     .await?;
                 }
