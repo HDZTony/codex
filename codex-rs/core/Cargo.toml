@@ -118,6 +118,10 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 which = { workspace = true }
 whoami = { workspace = true }
+# Wormhole TokenJuice host (tool-output compression). Path is relative to this
+# crate inside the Wormhole monorepo checkout. Treesitter disabled: Codex already
+# links tree-sitter 0.25 via apply-patch; tinyjuice's 0.26 would conflict on `links`.
+wormhole-tokenjuice = { path = "../../../../crates/wormhole-tokenjuice", default-features = false }
 
 # Build OpenSSL from source for musl builds.
 [target.x86_64-unknown-linux-musl.dependencies]

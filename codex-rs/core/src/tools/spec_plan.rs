@@ -23,6 +23,7 @@ use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::TestSyncHandler;
+use crate::tools::handlers::TokenjuiceRetrieveHandler;
 use crate::tools::handlers::ToolSearchHandler;
 use crate::tools::handlers::UpdateGoalHandler;
 use crate::tools::handlers::ViewImageHandler;
@@ -611,6 +612,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let environment_mode = turn_context.tool_environment_mode();
 
     planned_tools.add(PlanHandler);
+    planned_tools.add(TokenjuiceRetrieveHandler::canonical());
+    planned_tools.add_dispatch_only(TokenjuiceRetrieveHandler::legacy_tokenjuice());
+    planned_tools.add_dispatch_only(TokenjuiceRetrieveHandler::legacy_retrieve_tool_output());
     if goal_tools_enabled(turn_context) {
         planned_tools.add(GetGoalHandler);
         planned_tools.add(CreateGoalHandler);

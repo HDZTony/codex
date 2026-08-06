@@ -70,7 +70,14 @@ impl ToolCallRuntime {
             self.handle_tool_call_with_source(call, ToolCallSource::Direct, cancellation_token);
         async move {
             match future.await {
-                Ok(response) => Ok(response.into_response()),
+                Ok(response) => {
+                    let tool_name = error_call.tool_name.to_string();
+                    let item = response.into_response();
+                    Ok(crate::tokenjuice_compact::compact_response_input_item(
+                        item, &tool_name,
+                    )
+                    .await)
+                }
                 Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
                 Err(other) => Ok(Self::failure_response(error_call, other)),
             }

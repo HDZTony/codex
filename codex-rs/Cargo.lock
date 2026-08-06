@@ -2956,6 +2956,7 @@ dependencies = [
  "which 8.0.3",
  "whoami 1.6.1",
  "wiremock",
+ "wormhole-tokenjuice",
  "zstd 0.13.3",
 ]
 
@@ -15318,6 +15319,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyjuice"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "hex",
+ "log",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width 0.2.1",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17452,6 +17472,19 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "wormhole-tokenjuice"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tinyjuice",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
