@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
  "compute-core",
  "serde",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "cluster-core"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -4631,7 +4631,7 @@ dependencies = [
 
 [[package]]
 name = "compute-core"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "cluster-core",
@@ -14691,7 +14691,7 @@ dependencies = [
 
 [[package]]
 name = "storage-core"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -17476,7 +17476,7 @@ dependencies = [
 
 [[package]]
 name = "wormhole-tokenjuice"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "serde",
