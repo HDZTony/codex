@@ -1,16 +1,18 @@
+use crate::clock_format::ClockFormat;
 use crate::exec_command::relativize_to_home;
 use crate::legacy_core::config::Config;
 use crate::status::StatusAccountDisplay;
 use crate::text_formatting;
+use crate::width::display_width;
 use chrono::DateTime;
 use chrono::Local;
 use codex_protocol::account::PlanType;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathConvention;
+use codex_utils_path_uri::PathUri;
 use std::path::Path;
-use unicode_width::UnicodeWidthStr;
 
 fn normalize_agents_display_path(path: &Path) -> String {
-    dunce::simplified(path).display().to_string()
+    format_directory_display(dunce::simplified(path), /*max_width*/ None)
 }
 
 pub(crate) fn compose_model_display(
@@ -33,10 +35,20 @@ pub(crate) fn compose_model_display(
     (model_name.to_string(), details)
 }
 
-pub(crate) fn compose_agents_summary(config: &Config, paths: &[AbsolutePathBuf]) -> String {
+pub(crate) fn compose_agents_summary(config: &Config, paths: &[PathUri]) -> String {
     let mut rels: Vec<String> = Vec::new();
 
-    for p in paths {
+    for path in paths {
+        // TODO(anp): Rationalize instruction-source summaries with the TUI's broader foreign-path
+        // display strategy once other status surfaces can retain environment-native paths.
+        if path.infer_path_convention() != Some(PathConvention::native()) {
+            rels.push(path.inferred_native_path_string());
+            continue;
+        }
+        let Ok(p) = path.to_abs_path() else {
+            rels.push(path.inferred_native_path_string());
+            continue;
+        };
         let p = p.as_path();
         let file_name = p
             .file_name()
@@ -86,15 +98,9 @@ pub(crate) fn compose_account_display(
 }
 
 pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {
-    if plan_type.is_team_like() {
-        "Business".to_string()
-    } else if plan_type.is_business_like() {
-        "Enterprise".to_string()
-    } else if plan_type == PlanType::ProLite {
-        "Pro Lite".to_string()
-    } else {
-        title_case(format!("{plan_type:?}").as_str())
-    }
+    crate::subscription::SubscriptionDisplay::Status
+        .label(plan_type)
+        .to_string()
 }
 
 pub(crate) fn format_tokens_compact(value: i64) -> String {
@@ -107,11 +113,12 @@ pub(crate) fn format_tokens_compact(value: i64) -> String {
     }
 
     let value_f64 = value as f64;
-    let (scaled, suffix) = if value >= 1_000_000_000_000 {
+    // Promote values that would round to 1000 in the smaller unit.
+    let (scaled, suffix) = if value >= 999_500_000_000 {
         (value_f64 / 1_000_000_000_000.0, "T")
-    } else if value >= 1_000_000_000 {
+    } else if value >= 999_500_000 {
         (value_f64 / 1_000_000_000.0, "B")
-    } else if value >= 1_000_000 {
+    } else if value >= 999_500 {
         (value_f64 / 1_000_000.0, "M")
     } else {
         (value_f64 / 1_000.0, "K")
@@ -153,7 +160,7 @@ pub(crate) fn format_directory_display(directory: &Path, max_width: Option<usize
         if max_width == 0 {
             return String::new();
         }
-        if UnicodeWidthStr::width(formatted.as_str()) > max_width {
+        if display_width(&formatted) > max_width {
             return text_formatting::center_truncate_path(&formatted, max_width);
         }
     }
@@ -161,8 +168,12 @@ pub(crate) fn format_directory_display(directory: &Path, max_width: Option<usize
     formatted
 }
 
-pub(crate) fn format_reset_timestamp(dt: DateTime<Local>, captured_at: DateTime<Local>) -> String {
-    let time = dt.format("%H:%M").to_string();
+pub(crate) fn format_reset_timestamp(
+    dt: DateTime<Local>,
+    captured_at: DateTime<Local>,
+    clock_format: ClockFormat,
+) -> String {
+    let time = dt.format(clock_format.time_format()).to_string();
     if dt.date_naive() == captured_at.date_naive() {
         time
     } else {
@@ -170,23 +181,9 @@ pub(crate) fn format_reset_timestamp(dt: DateTime<Local>, captured_at: DateTime<
     }
 }
 
-fn title_case(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let rest = chars.as_str().to_ascii_lowercase();
-    first.to_uppercase().collect::<String>() + &rest
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::legacy_core::DEFAULT_AGENTS_MD_FILENAME;
-    use crate::legacy_core::LOCAL_AGENTS_MD_FILENAME;
     use crate::legacy_core::config::ConfigBuilder;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use pretty_assertions::assert_eq;
@@ -207,11 +204,13 @@ mod tests {
             (PlanType::Free, "Free"),
             (PlanType::Go, "Go"),
             (PlanType::Plus, "Plus"),
-            (PlanType::Pro, "Pro"),
-            (PlanType::ProLite, "Pro Lite"),
+            (PlanType::Pro, "Pro 200"),
+            (PlanType::ProLite, "Pro 100"),
+            (PlanType::ProMax, "Pro 500"),
             (PlanType::Team, "Business"),
             (PlanType::SelfServeBusinessUsageBased, "Business"),
             (PlanType::Business, "Enterprise"),
+            (PlanType::EnterpriseCbpAutomation, "Enterprise (Automation)"),
             (PlanType::EnterpriseCbpUsageBased, "Enterprise"),
             (PlanType::Enterprise, "Enterprise"),
             (PlanType::Edu, "Edu"),
@@ -221,18 +220,72 @@ mod tests {
         for (plan_type, expected) in cases {
             assert_eq!(plan_type_display_name(plan_type), expected);
         }
+        insta::assert_snapshot!(
+            plan_type_display_name(PlanType::SelfServeBusinessProLite),
+            @"Business Premium"
+        );
+        insta::assert_snapshot!(
+            "education_plan_display_names",
+            [PlanType::Edu, PlanType::EduPlus, PlanType::EduPro]
+                .map(plan_type_display_name)
+                .join("\n")
+        );
+        insta::assert_snapshot!(
+            [PlanType::Sci, PlanType::SciPlus]
+                .map(plan_type_display_name)
+                .join("\n"),
+            @"Academic Researchers\nAcademic Researchers Plus"
+        );
+    }
+
+    #[test]
+    fn format_directory_display_truncates_halfwidth_sound_marks() {
+        let directory = Path::new("workspace").join("ｶﾞ").join("project");
+        let max_width = display_width(directory.to_string_lossy().as_ref()) - 1;
+        let formatted = format_directory_display(&directory, Some(max_width));
+
+        insta::assert_snapshot!(formatted.replace('\\', "/"), @"workspace/…/project");
     }
 
     #[tokio::test]
     async fn compose_agents_summary_includes_global_agents_path() {
         let codex_home = TempDir::new().expect("temp codex home");
         let cwd = TempDir::new().expect("temp cwd");
-        let global_agents_path = codex_home.path().join(DEFAULT_AGENTS_MD_FILENAME);
+        let global_agents_path = codex_home.path().join("global.md");
         let config = test_config(&codex_home, &cwd).await;
 
         assert_eq!(
-            compose_agents_summary(&config, &[global_agents_path.abs()]),
+            compose_agents_summary(
+                &config,
+                &[PathUri::from_abs_path(&global_agents_path.abs())]
+            ),
             format_directory_display(&global_agents_path, /*max_width*/ None)
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_agents_summary_collapses_home_and_preserves_project_relative_paths() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let codex_home = TempDir::new().expect("temp codex home");
+        let cwd = TempDir::new().expect("temp cwd");
+        let mut config = test_config(&codex_home, &cwd).await;
+        config.cwd = home.join("workspace").join("project").abs();
+
+        let paths = [
+            home.join(".codex").join("AGENTS.md"),
+            home.join("workspace").join("AGENTS.md"),
+            config.cwd.join("AGENTS.md").to_path_buf(),
+            config.cwd.join("nested").join("AGENTS.md").to_path_buf(),
+        ]
+        .map(|path| PathUri::from_abs_path(&path.abs()));
+
+        let summary = compose_agents_summary(&config, &paths);
+
+        insta::assert_snapshot!(
+            summary.replace('\\', "/"),
+            @"~/.codex/AGENTS.md, ../AGENTS.md, AGENTS.md, nested/AGENTS.md"
         );
     }
 
@@ -240,28 +293,50 @@ mod tests {
     async fn compose_agents_summary_names_global_agents_override() {
         let codex_home = TempDir::new().expect("temp codex home");
         let cwd = TempDir::new().expect("temp cwd");
-        let override_path = codex_home.path().join(LOCAL_AGENTS_MD_FILENAME);
+        let override_path = codex_home.path().join("override.md");
         let config = test_config(&codex_home, &cwd).await;
 
         assert_eq!(
-            compose_agents_summary(&config, &[override_path.abs()]),
+            compose_agents_summary(&config, &[PathUri::from_abs_path(&override_path.abs())]),
             format_directory_display(&override_path, /*max_width*/ None)
         );
+    }
+
+    #[tokio::test]
+    async fn compose_agents_summary_shows_relative_native_and_full_foreign_paths() {
+        let codex_home = TempDir::new().expect("temp codex home");
+        let cwd = TempDir::new().expect("temp cwd");
+        let config = test_config(&codex_home, &cwd).await;
+        let native_source = PathUri::from_abs_path(&config.cwd.join("AGENTS.md"));
+        let foreign_source = if cfg!(windows) {
+            PathUri::parse("file:///remote%20workspace/AGENTS.md")
+                .expect("POSIX instruction source")
+        } else {
+            PathUri::parse("file:///C:/remote%20workspace/AGENTS.md")
+                .expect("Windows instruction source")
+        };
+
+        let summary = compose_agents_summary(&config, &[native_source, foreign_source]);
+        if cfg!(windows) {
+            insta::assert_snapshot!(summary, @r"AGENTS.md, /remote workspace/AGENTS.md");
+        } else {
+            insta::assert_snapshot!(summary, @r"AGENTS.md, C:\remote workspace\AGENTS.md");
+        }
     }
 
     #[tokio::test]
     async fn compose_agents_summary_orders_global_before_project_agents() {
         let codex_home = TempDir::new().expect("temp codex home");
         let cwd = TempDir::new().expect("temp cwd");
-        let global_agents_path = codex_home.path().join(DEFAULT_AGENTS_MD_FILENAME);
-        let project_agents_path = cwd.path().join(DEFAULT_AGENTS_MD_FILENAME);
+        let global_agents_path = codex_home.path().join("global.md");
+        let project_agents_path = cwd.path().join("project.md");
         let config = test_config(&codex_home, &cwd).await;
 
         let summary = compose_agents_summary(
             &config,
             &[
-                global_agents_path.clone().abs(),
-                project_agents_path.clone().abs(),
+                PathUri::from_abs_path(&global_agents_path.clone().abs()),
+                PathUri::from_abs_path(&project_agents_path.clone().abs()),
             ],
         );
         let mut paths = summary.split(", ");
@@ -270,7 +345,7 @@ mod tests {
             Some(format_directory_display(&global_agents_path, /*max_width*/ None).as_str())
         );
         let project_path = paths.next().expect("project agents path");
-        assert!(project_path.ends_with(DEFAULT_AGENTS_MD_FILENAME));
+        assert!(project_path.ends_with("project.md"));
         assert_eq!(paths.next(), None);
     }
 }

@@ -43,6 +43,7 @@ struct ClientState {
 }
 
 pub(crate) struct ClientTracker {
+    pub(super) auth: Option<crate::ConnectionAuth>,
     clients: HashMap<(ClientId, StreamId), ClientState>,
     legacy_stream_ids: HashMap<ClientId, StreamId>,
     join_set: JoinSet<(ClientId, StreamId)>,
@@ -58,6 +59,7 @@ impl ClientTracker {
         shutdown_token: &CancellationToken,
     ) -> Self {
         Self {
+            auth: None,
             clients: HashMap::new(),
             legacy_stream_ids: HashMap::new(),
             join_set: JoinSet::new(),
@@ -168,6 +170,7 @@ impl ClientTracker {
                 self.send_transport_event(TransportEvent::ConnectionOpened {
                     connection_id,
                     origin: ConnectionOrigin::RemoteControl,
+                    auth: self.auth.clone(),
                     writer: writer_tx,
                     disconnect_sender: Some(disconnect_token.clone()),
                 })
@@ -423,6 +426,7 @@ fn transport_event_name(event: &TransportEvent) -> &'static str {
         TransportEvent::ConnectionOpened { .. } => "connection_opened",
         TransportEvent::ConnectionClosed { .. } => "connection_closed",
         TransportEvent::IncomingMessage { .. } => "incoming_message",
+        TransportEvent::DaemonShutdown => "daemon_shutdown",
     }
 }
 
@@ -448,6 +452,7 @@ mod tests {
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ServerNotificationEnvelope;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::time::timeout;
@@ -588,14 +593,15 @@ mod tests {
 
         writer
             .send(QueuedOutgoingMessage::new(
-                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                    ConfigWarningNotification {
+                OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                    notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                         summary: "test".to_string(),
                         details: None,
                         path: None,
                         range: None,
-                    },
-                )),
+                    }),
+                    emitted_at_ms: Some(1_234),
+                }),
             ))
             .await
             .expect("writer should accept queued message");
@@ -692,14 +698,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn initialize_timeout_closes_open_connection() {
         let (server_event_tx, _server_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (transport_event_tx, mut transport_event_rx) = mpsc::channel(1);
         let shutdown_token = CancellationToken::new();
         let client_tracker =
             ClientTracker::new(server_event_tx, transport_event_tx, &shutdown_token);
-        let mut handle_message = tokio::spawn(async move {
+        let handle_message = tokio::spawn(async move {
             let mut client_tracker = client_tracker;
             client_tracker
                 .handle_message(initialize_envelope_with_stream_id(
@@ -709,13 +715,13 @@ mod tests {
                 .await
         });
 
-        assert!(
-            timeout(Duration::from_millis(50), &mut handle_message)
-                .await
-                .expect("initialize timeout rollback should not wait for close delivery")
-                .expect("handle message task should not panic")
-                .is_err()
-        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(
+            REMOTE_CONTROL_TRANSPORT_EVENT_SEND_TIMEOUT + Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(handle_message.await.expect("handle message task").is_err());
         let connection_id = match transport_event_rx.recv().await.expect("open event") {
             TransportEvent::ConnectionOpened { connection_id, .. } => connection_id,
             other => panic!("expected connection opened, got {other:?}"),

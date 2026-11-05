@@ -24,6 +24,9 @@ pub(super) fn server_request_thread_id(request: &ServerRequest) -> Option<Thread
         ServerRequest::DynamicToolCall { params, .. } => {
             ThreadId::from_string(&params.thread_id).ok()
         }
+        ServerRequest::CurrentTimeRead { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
         ServerRequest::ChatgptAuthTokensRefresh { .. }
         | ServerRequest::AttestationGenerate { .. }
         | ServerRequest::ApplyPatchApproval { .. }
@@ -35,6 +38,7 @@ pub(super) fn server_request_thread_id(request: &ServerRequest) -> Option<Thread
 pub(super) enum ServerNotificationThreadTarget {
     Thread(ThreadId),
     InvalidThreadId(String),
+    AppScoped,
     Global,
 }
 
@@ -47,10 +51,18 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadStatusChanged(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadReverted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadArchived(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ThreadDeleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadUnarchived(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadClosed(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadNameUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadAttachmentUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadProjectUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadTokenUsageUpdated(notification) => {
@@ -59,7 +71,13 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadGoalUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadPredictionUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadGoalCleared(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadQueueChanged(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadSettingsUpdated(notification) => {
@@ -78,8 +96,14 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ItemGuardianApprovalReviewCompleted(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::StrictReviewRequired(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ItemCompleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::RawResponseItemCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::RawResponseCompleted(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::AgentMessageDelta(notification) => {
@@ -118,10 +142,25 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ModelVerification(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::TurnModerationMetadata(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadRealtimeStarted(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadRealtimeItemAdded(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemStarted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemTranscriptDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemCompleted(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadRealtimeTranscriptDelta(notification) => {
@@ -142,15 +181,38 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadRealtimeClosed(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::AuthRecoveryStarted(notification)
+        | ServerNotification::AuthRecoveryCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadReadStateChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
         ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
-        ServerNotification::SkillsChanged(_)
-        | ServerNotification::McpServerStatusUpdated(_)
-        | ServerNotification::McpServerOauthLoginCompleted(_)
+        ServerNotification::McpServerOauthLoginCompleted(notification) => {
+            match notification.thread_id.as_deref() {
+                Some(thread_id) => Some(thread_id),
+                None => return ServerNotificationThreadTarget::AppScoped,
+            }
+        }
+        ServerNotification::McpServerStatusUpdated(notification) => {
+            match notification.thread_id.as_deref() {
+                Some(thread_id) => Some(thread_id),
+                None => return ServerNotificationThreadTarget::AppScoped,
+            }
+        }
+        ServerNotification::ProjectChanged(_)
+        | ServerNotification::SkillsChanged(_)
         | ServerNotification::AccountUpdated(_)
+        | ServerNotification::ThreadSectionChanged(_)
+        | ServerNotification::GatewayOAuthChanged(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
+        | ServerNotification::EnvironmentConnected(_)
+        | ServerNotification::EnvironmentDisconnected(_)
         | ServerNotification::RemoteControlStatusChanged(_)
+        | ServerNotification::ExternalAgentConfigImportProgress(_)
         | ServerNotification::ExternalAgentConfigImportCompleted(_)
         | ServerNotification::DeprecationNotice(_)
         | ServerNotification::ConfigWarning(_)
@@ -159,6 +221,7 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::CommandExecOutputDelta(_)
         | ServerNotification::ProcessOutputDelta(_)
         | ServerNotification::ProcessExited(_)
+        | ServerNotification::McpServerEventStream(_)
         | ServerNotification::FsChanged(_)
         | ServerNotification::WindowsWorldWritableWarning(_)
         | ServerNotification::WindowsSandboxSetupCompleted(_)
@@ -181,7 +244,11 @@ mod tests {
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
     use codex_app_server_protocol::GuardianWarningNotification;
+    use codex_app_server_protocol::McpServerStartupState;
+    use codex_app_server_protocol::McpServerStatusUpdatedNotification;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ThreadAttachmentOperation;
+    use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
     use codex_app_server_protocol::ThreadSettings;
     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
     use codex_app_server_protocol::WarningNotification;
@@ -194,6 +261,7 @@ mod tests {
 
     fn test_thread_settings() -> ThreadSettings {
         ThreadSettings {
+            disabled_plugin_ids: Vec::new(),
             cwd: test_path_buf("/tmp/thread-settings").abs(),
             approval_policy: codex_app_server_protocol::AskForApproval::Never,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
@@ -214,6 +282,7 @@ mod tests {
                     developer_instructions: None,
                 },
             },
+            multi_agent_mode: Default::default(),
             personality: None,
         }
     }
@@ -257,12 +326,62 @@ mod tests {
     }
 
     #[test]
+    fn mcp_startup_notifications_route_to_threads() {
+        let thread_id = ThreadId::new();
+        let notification =
+            ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
+                thread_id: Some(thread_id.to_string()),
+                name: "sentry".to_string(),
+                status: McpServerStartupState::Failed,
+                error: Some("sentry is not logged in".to_string()),
+                failure_reason: None,
+            });
+
+        let target = server_notification_thread_target(&notification);
+
+        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn mcp_startup_notifications_without_threads_are_app_scoped() {
+        let notification =
+            ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
+                thread_id: None,
+                name: "sentry".to_string(),
+                status: McpServerStartupState::Failed,
+                error: Some("sentry is not logged in".to_string()),
+                failure_reason: None,
+            });
+
+        let target = server_notification_thread_target(&notification);
+
+        assert_eq!(target, ServerNotificationThreadTarget::AppScoped);
+    }
+
+    #[test]
     fn thread_settings_updated_notifications_route_to_threads() {
         let thread_id = ThreadId::new();
         let notification =
             ServerNotification::ThreadSettingsUpdated(ThreadSettingsUpdatedNotification {
                 thread_id: thread_id.to_string(),
                 thread_settings: test_thread_settings(),
+            });
+
+        let target = server_notification_thread_target(&notification);
+
+        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn thread_attachment_updated_notifications_route_to_threads() {
+        let thread_id = ThreadId::new();
+        let notification =
+            ServerNotification::ThreadAttachmentUpdated(ThreadAttachmentUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                attachment_type: "pull_request".to_string(),
+                identity_key: r#"["github.com","openai","codex",123]"#.to_string(),
+                attachment_id: "attachment-1".to_string(),
+                operation: ThreadAttachmentOperation::Deleted,
             });
 
         let target = server_notification_thread_target(&notification);

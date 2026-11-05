@@ -29,7 +29,11 @@ use tempfile::TempDir;
 
 fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThread {
     StoredThread {
+        creator_user_id: None,
+        creator_account_id: None,
+        originator: None,
         thread_id: ThreadId::new(),
+        extra_config: None,
         rollout_path: Some(PathBuf::from("/tmp/rollout.jsonl")),
         forked_from_id: None,
         parent_thread_id: None,
@@ -46,10 +50,20 @@ fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThre
             .timestamp_opt(1_709_251_200, 0)
             .single()
             .expect("valid timestamp"),
+        recency_at: Utc
+            .timestamp_opt(1_709_251_200, 0)
+            .single()
+            .expect("valid timestamp"),
         archived_at: None,
+        project_id: None,
+        daybreak_enabled: None,
+        section: None,
+        section_position: None,
+        section_entered_at: None,
         cwd: PathBuf::from(cwd),
         cli_version: "test".to_string(),
         source: SessionSource::Cli,
+        history_mode: Default::default(),
         thread_source: None,
         agent_nickname: None,
         agent_role: None,
@@ -69,10 +83,13 @@ fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThre
 
 fn message(role: &str, content: ContentItem) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: role.to_string(),
         content: vec![content],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -81,7 +98,14 @@ fn user_message(text: impl Into<String>) -> ResponseItem {
 }
 
 fn assistant_message(text: impl Into<String>) -> ResponseItem {
-    message("assistant", ContentItem::OutputText { text: text.into() })
+    message(
+        "assistant",
+        ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
+            text: text.into(),
+        },
+    )
 }
 
 fn long_turn_text(index: usize) -> String {

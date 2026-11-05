@@ -9,8 +9,12 @@ pub struct RelayMessageFrame {
     pub ack: u32,
     #[prost(uint32, tag = "4")]
     pub ack_bits: u32,
-    #[prost(oneof = "relay_message_frame::Body", tags = "5, 6, 7, 8, 9")]
+    #[prost(oneof = "relay_message_frame::Body", tags = "5, 6, 7, 8, 9, 10")]
     pub body: ::core::option::Option<relay_message_frame::Body>,
+    #[prost(string, optional, tag = "11")]
+    pub traceparent: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "12")]
+    pub tracestate: ::core::option::Option<::prost::alloc::string::String>,
 }
 pub mod relay_message_frame {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -25,6 +29,8 @@ pub mod relay_message_frame {
         Reset(super::RelayReset),
         #[prost(message, tag = "9")]
         Heartbeat(super::RelayHeartbeat),
+        #[prost(message, tag = "10")]
+        Handshake(super::RelayHandshake),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -52,3 +58,8 @@ pub struct RelayReset {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelayHeartbeat {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RelayHandshake {
+    #[prost(bytes = "vec", tag = "1")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+}

@@ -11,6 +11,7 @@ use anyhow::Result;
 use codex_utils_pty::ProcessDriver;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
+use codex_utils_pty::WindowsTtyInputNormalizer;
 use codex_utils_pty::spawn_from_driver;
 use std::fs::File;
 use tokio::sync::broadcast;
@@ -23,23 +24,6 @@ pub(crate) fn finish_driver_spawn(driver: ProcessDriver, stdin_open: bool) -> Sp
         spawned.session.close_stdin();
     }
     spawned
-}
-
-pub(crate) fn normalize_windows_tty_input(bytes: &[u8], previous_was_cr: &mut bool) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    for &byte in bytes {
-        if byte == b'\n' {
-            if !*previous_was_cr {
-                normalized.push(b'\r');
-            }
-            normalized.push(b'\n');
-            *previous_was_cr = false;
-        } else {
-            normalized.push(byte);
-            *previous_was_cr = byte == b'\r';
-        }
-    }
-    normalized
 }
 
 pub(crate) fn start_runner_pipe_writer(
@@ -63,10 +47,10 @@ pub(crate) fn start_runner_stdin_writer(
     stdin_open: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let mut previous_was_cr = false;
+        let mut windows_input = WindowsTtyInputNormalizer::default();
         while let Some(bytes) = writer_rx.blocking_recv() {
             let bytes = if normalize_newlines {
-                normalize_windows_tty_input(&bytes, &mut previous_was_cr)
+                windows_input.normalize(&bytes)
             } else {
                 bytes
             };
@@ -100,7 +84,7 @@ pub(crate) fn start_runner_stdout_reader(
     exit_tx: oneshot::Sender<i32>,
 ) {
     std::thread::spawn(move || {
-        loop {
+        let exit = loop {
             let msg = match crate::ipc_framed::read_frame(&mut pipe_read) {
                 Ok(Some(v)) => v,
                 Ok(None) => {
@@ -109,8 +93,7 @@ pub(crate) fn start_runner_stdout_reader(
                         &stdout_tx,
                         stderr_tx.as_ref(),
                     );
-                    let _ = exit_tx.send(-1);
-                    break;
+                    break None;
                 }
                 Err(err) => {
                     send_runner_error(
@@ -118,8 +101,7 @@ pub(crate) fn start_runner_stdout_reader(
                         &stdout_tx,
                         stderr_tx.as_ref(),
                     );
-                    let _ = exit_tx.send(-1);
-                    break;
+                    break None;
                 }
             };
 
@@ -141,13 +123,11 @@ pub(crate) fn start_runner_stdout_reader(
                     }
                 }
                 Message::Exit { payload } => {
-                    let _ = exit_tx.send(payload.exit_code);
-                    break;
+                    break Some((payload.exit_code, payload.timed_out));
                 }
                 Message::Error { payload } => {
                     send_runner_error(&payload.message, &stdout_tx, stderr_tx.as_ref());
-                    let _ = exit_tx.send(-1);
-                    break;
+                    break None;
                 }
                 Message::SpawnReady { .. }
                 | Message::Stdin { .. }
@@ -156,7 +136,9 @@ pub(crate) fn start_runner_stdout_reader(
                 | Message::SpawnRequest { .. }
                 | Message::Terminate { .. } => {}
             }
-        }
+        };
+        crate::elevated::runner_metrics::record_command(exit);
+        let _ = exit_tx.send(exit.map_or(-1, |(code, _)| code));
     });
 }
 
@@ -190,3 +172,7 @@ fn send_runner_error(
         let _ = stdout_tx.send(formatted);
     }
 }
+
+#[cfg(test)]
+#[path = "windows_common_tests.rs"]
+mod tests;

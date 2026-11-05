@@ -2,7 +2,7 @@
 //!
 //! This module is the TUI boundary for non-interactive commands that need to run wherever
 //! the active workspace lives. Callers describe a command in terms of argv, cwd, environment
-//! overrides, timeout, and output cap; the runner translates that request to app-server
+//! overrides and timeout; the runner translates that request to app-server
 //! `command/exec`. Keeping this as a TUI-local abstraction lets status surfaces avoid knowing
 //! whether the current app-server is embedded or remote.
 //!
@@ -37,35 +37,29 @@ pub(crate) type WorkspaceCommandRunner = Arc<dyn WorkspaceCommandExecutor>;
 pub(crate) struct WorkspaceCommand {
     /// Program and arguments to execute without shell interpolation.
     pub(crate) argv: Vec<String>,
-    /// Working directory for the command, if different from app-server's session cwd.
-    pub(crate) cwd: Option<PathBuf>,
+    /// Explicit working directory on the host that executes the command.
+    pub(crate) cwd: PathBuf,
     /// Environment overrides where `None` removes a variable.
     pub(crate) env: HashMap<String, Option<String>>,
     /// Maximum wall-clock duration before app-server cancels the command.
     pub(crate) timeout: Duration,
-    /// Maximum captured stdout/stderr bytes returned by app-server.
-    pub(crate) output_bytes_cap: usize,
     /// Whether app-server should return uncapped stdout/stderr.
     pub(crate) disable_output_cap: bool,
 }
 
 impl WorkspaceCommand {
     /// Creates a workspace command with conservative defaults for metadata probes.
-    pub(crate) fn new(argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub(crate) fn new(
+        argv: impl IntoIterator<Item = impl Into<String>>,
+        cwd: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             argv: argv.into_iter().map(Into::into).collect(),
-            cwd: None,
+            cwd: cwd.into(),
             env: HashMap::new(),
             timeout: Duration::from_secs(/*secs*/ 5),
-            output_bytes_cap: 64 * 1024,
             disable_output_cap: false,
         }
-    }
-
-    /// Sets the command working directory.
-    pub(crate) fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
     }
 
     /// Adds or replaces one environment variable override.
@@ -138,9 +132,8 @@ pub(crate) trait WorkspaceCommandExecutor: Send + Sync {
     /// Runs a workspace command and returns captured output or an app-server request error.
     ///
     /// Callers should treat errors as infrastructure failures and should treat successful output
-    /// with a non-zero exit code as ordinary command failure. Returning a future instead of using
-    /// `async_trait` keeps the trait object-safe while matching the repo's native async trait
-    /// conventions.
+    /// with a non-zero exit code as ordinary command failure. Returning a boxed future keeps the
+    /// trait object-safe.
     fn run(
         &self,
         command: WorkspaceCommand,
@@ -165,9 +158,10 @@ impl AppServerWorkspaceCommandRunner {
 impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
     /// Sends the command as a one-off app-server `command/exec` request.
     ///
-    /// The request is non-tty, does not stream stdin/stdout/stderr, and uses the caller's timeout
-    /// and output cap. It leaves sandbox and permission profile selection to app-server so the same
-    /// runner follows the active session's embedded or remote execution policy.
+    /// The request is non-tty, does not stream stdin/stdout/stderr, and uses the caller's timeout.
+    /// Bounded commands use app-server's default output cap. It leaves sandbox and permission
+    /// profile selection to app-server so the same runner follows the active session's embedded or
+    /// remote execution policy.
     fn run(
         &self,
         command: WorkspaceCommand,
@@ -191,12 +185,11 @@ impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
                         tty: false,
                         stream_stdin: false,
                         stream_stdout_stderr: false,
-                        output_bytes_cap: (!command.disable_output_cap)
-                            .then_some(command.output_bytes_cap),
+                        output_bytes_cap: None,
                         disable_output_cap: command.disable_output_cap,
                         disable_timeout: false,
                         timeout_ms: Some(timeout_ms),
-                        cwd: command.cwd,
+                        cwd: Some(command.cwd),
                         env,
                         size: None,
                         sandbox_policy: None,

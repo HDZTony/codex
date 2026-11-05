@@ -102,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional workflow URL to reuse for native artifacts.",
     )
     parser.add_argument(
+        "--artifacts-dir",
+        type=Path,
+        help="Directory containing previously downloaded workflow artifacts.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -176,7 +181,7 @@ def resolve_workflow_url(version: str, override: str | None) -> tuple[str, str |
 
 
 def install_native_components(
-    workflow_url: str,
+    workflow_url: str | None,
     components: set[str],
     vendor_root: Path,
     artifacts_dir: Path,
@@ -187,16 +192,24 @@ def install_native_components(
     vendor_dir = vendor_root / "vendor"
     vendor_dir.mkdir(parents=True, exist_ok=True)
 
-    workflow_id = workflow_url.rstrip("/").split("/")[-1]
-    print(f"Downloading native artifacts from workflow {workflow_id}...", flush=True)
-    with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        install_from_workflow_artifacts(
-            workflow_id,
-            artifacts_dir,
-            sorted(components),
-            vendor_dir,
+    if workflow_url is None:
+        with _gha_group("Install downloaded native artifacts"):
+            install_from_downloaded_artifacts(
+                artifacts_dir, sorted(components), vendor_dir
+            )
+    else:
+        workflow_id = workflow_url.rstrip("/").split("/")[-1]
+        print(
+            f"Downloading native artifacts from workflow {workflow_id}...", flush=True
         )
+        with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            install_from_workflow_artifacts(
+                workflow_id,
+                artifacts_dir,
+                sorted(components),
+                vendor_dir,
+            )
     print(f"Installed native dependencies into {vendor_dir}", flush=True)
 
 
@@ -208,6 +221,14 @@ def install_from_workflow_artifacts(
 ) -> None:
     artifacts = select_target_artifacts(workflow_id, components)
     download_artifacts(workflow_id, artifacts_dir, artifacts)
+    install_from_downloaded_artifacts(artifacts_dir, components, vendor_dir)
+
+
+def install_from_downloaded_artifacts(
+    artifacts_dir: Path,
+    components: Sequence[str],
+    vendor_dir: Path,
+) -> None:
     if CODEX_PACKAGE_COMPONENT in components:
         install_codex_package_archives(artifacts_dir, vendor_dir, BINARY_TARGETS)
     install_binary_components(
@@ -496,20 +517,37 @@ def main() -> int:
     vendor_temp_roots: list[Path] = []
     vendor_src_by_components: dict[tuple[str, ...], Path] = {}
     artifacts_temp_root: Path | None = None
+    remove_artifacts_temp_root = False
     resolved_head_sha: str | None = None
-
-    final_messages = []
+    staging_jobs: list[tuple[Path, list[str], str]] = []
 
     try:
         if native_component_sets:
-            workflow_url, resolved_head_sha = resolve_workflow_url(
-                args.release_version, args.workflow_url
-            )
-            print(f"Using native artifacts from {workflow_url}", flush=True)
-            artifacts_temp_root = Path(
-                tempfile.mkdtemp(prefix="npm-native-artifacts-", dir=runner_temp)
-            )
-            print(f"Caching downloaded artifacts in {artifacts_temp_root}", flush=True)
+            if args.artifacts_dir is not None:
+                artifacts_temp_root = args.artifacts_dir.resolve()
+                artifacts_temp_root.mkdir(parents=True, exist_ok=True)
+            else:
+                artifacts_temp_root = Path(
+                    tempfile.mkdtemp(prefix="npm-native-artifacts-", dir=runner_temp)
+                )
+                remove_artifacts_temp_root = True
+
+            target_artifact_dirs = [
+                artifact_dir_for_target(artifacts_temp_root, target)
+                for target in BINARY_TARGETS
+            ]
+            if args.artifacts_dir is not None and all(
+                artifact_dir.is_dir() and any(artifact_dir.iterdir())
+                for artifact_dir in target_artifact_dirs
+            ):
+                workflow_url = None
+            else:
+                workflow_url, resolved_head_sha = resolve_workflow_url(
+                    args.release_version, args.workflow_url
+                )
+                print(f"Using native artifacts from {workflow_url}", flush=True)
+
+            print(f"Using artifact cache at {artifacts_temp_root}", flush=True)
             for components in native_component_sets:
                 vendor_temp_root = Path(
                     tempfile.mkdtemp(prefix="npm-native-", dir=runner_temp)
@@ -559,22 +597,33 @@ def main() -> int:
             if vendor_src is not None:
                 cmd.extend(["--vendor-src", str(vendor_src)])
 
-            try:
-                run_command(cmd)
-            finally:
-                if not args.keep_staging_dirs:
-                    shutil.rmtree(staging_dir, ignore_errors=True)
+            staging_jobs.append(
+                (staging_dir, cmd, f"Staged {package} at {pack_output}")
+            )
 
-            final_messages.append(f"Staged {package} at {pack_output}")
+        max_workers = min(len(staging_jobs), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(run_command, cmd): staging_dir
+                for staging_dir, cmd, _message in staging_jobs
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                finally:
+                    if not args.keep_staging_dirs:
+                        shutil.rmtree(futures[future], ignore_errors=True)
     finally:
         if not args.keep_staging_dirs:
+            for staging_dir, _cmd, _message in staging_jobs:
+                shutil.rmtree(staging_dir, ignore_errors=True)
             for vendor_temp_root in vendor_temp_roots:
                 shutil.rmtree(vendor_temp_root, ignore_errors=True)
-        if artifacts_temp_root is not None:
+        if remove_artifacts_temp_root and artifacts_temp_root is not None:
             shutil.rmtree(artifacts_temp_root, ignore_errors=True)
 
-    for msg in final_messages:
-        print(msg, flush=True)
+    for _staging_dir, _cmd, message in staging_jobs:
+        print(message, flush=True)
 
     return 0
 

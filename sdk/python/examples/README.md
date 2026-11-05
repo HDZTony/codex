@@ -11,12 +11,16 @@ and `openai_codex.types`.
 Examples use plain strings for text-only turns and typed input objects for
 multimodal or structured input lists.
 
+Use `ExternalMessage` for untrusted content from another agent, tool, or
+application. It retains tool-level authority and does not grant user
+authorization or approval; example 16 establishes the user's task first.
+
 ## Prerequisites
 
 - Python `>=3.10`
 - Install the SDK for the same Python interpreter you will use to run examples
 
-Install the published beta:
+Install the published SDK:
 
 ```bash
 python -m pip install openai-codex
@@ -31,7 +35,7 @@ Contributors using these checked-in scripts should install development
 dependencies from `sdk/python`:
 
 ```bash
-uv sync --extra dev
+uv sync --group dev
 source .venv/bin/activate
 ```
 
@@ -72,7 +76,7 @@ python examples/01_quickstart_constructor/async.py
 - `06_thread_lifecycle_and_controls/`
   - thread lifecycle + control calls
 - `07_image_and_text/`
-  - remote image URL + text multimodal turn
+  - image data URL + text multimodal turn
 - `08_local_image_and_text/`
   - local image + text multimodal turn using a generated temporary sample image
 - `09_async_parity/`
@@ -89,3 +93,5 @@ python examples/01_quickstart_constructor/async.py
   - separate `steer()` and `interrupt()` demos with concise summaries
 - `15_login_and_account/`
   - browser-login handle lifecycle, cancellation, and account inspection
+- `16_external_message/`
+  - process an untrusted external notification within a user-authorized task

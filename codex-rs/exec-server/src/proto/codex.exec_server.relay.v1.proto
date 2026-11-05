@@ -14,7 +14,11 @@ message RelayMessageFrame {
     RelayResume resume = 7;
     RelayReset reset = 8;
     RelayHeartbeat heartbeat = 9;
+    RelayHandshake handshake = 10;
   }
+
+  optional string traceparent = 11;
+  optional string tracestate = 12;
 }
 
 message RelayData {
@@ -35,3 +39,7 @@ message RelayReset {
 }
 
 message RelayHeartbeat {}
+
+message RelayHandshake {
+  bytes payload = 1;
+}

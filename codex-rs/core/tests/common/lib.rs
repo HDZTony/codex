@@ -1,4 +1,4 @@
-#![expect(clippy::expect_used)]
+#![allow(clippy::expect_used)]
 
 use anyhow::Context as _;
 use anyhow::ensure;
@@ -15,22 +15,40 @@ use codex_core::CodexThread;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+pub use codex_core::test_support::TestCodexResponsesRequestKind;
+pub use codex_core::test_support::responses_metadata;
 use codex_utils_absolute_path::AbsolutePathBuf;
 pub use codex_utils_absolute_path::test_support::PathBufExt;
 pub use codex_utils_absolute_path::test_support::PathExt;
 use regex_lite::Regex;
+use std::path::Path;
 use std::path::PathBuf;
 
 pub mod apps_test_server;
+#[cfg(unix)]
+pub mod code_mode_host;
 pub mod context_snapshot;
+pub mod exec_server;
 pub mod hooks;
 pub mod process;
 pub mod responses;
+pub mod runtime_auth;
+pub mod startup;
 pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
+mod test_environment;
 pub mod tracing;
-pub mod zsh_fork;
+
+pub(crate) use test_environment::TestEnvironment;
+pub use test_environment::TestTargetOs;
+pub use test_environment::is_remote_test_environment;
+#[doc(hidden)]
+pub use test_environment::is_wine_exec_test_environment;
+#[doc(hidden)]
+pub use test_environment::test_docker_container_name;
+pub(crate) use test_environment::test_environment;
+pub use test_environment::test_target_os;
 
 static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
 
@@ -67,12 +85,10 @@ fn configure_insta_workspace_root_for_snapshot_tests() {
 
 #[track_caller]
 pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Captures<'s> {
-    let regex = Regex::new(pattern).unwrap_or_else(|err| {
-        panic!("failed to compile regex {pattern:?}: {err}");
-    });
+    let regex = Regex::new(pattern).expect("failed to compile regex");
     regex
         .captures(actual)
-        .unwrap_or_else(|| panic!("regex {pattern:?} did not match {actual:?}"))
+        .expect("regex did not match actual value")
 }
 
 pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {
@@ -108,6 +124,20 @@ pub fn test_absolute_path_with_windows(
 
 pub fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf {
     test_absolute_path_with_windows(unix_path, /*windows_path*/ None)
+}
+
+#[cfg(unix)]
+#[allow(clippy::expect_used)]
+pub fn create_directory_symlink(source: &Path, link: &Path) {
+    std::os::unix::fs::symlink(source, link).expect("create directory symlink");
+}
+
+#[cfg(windows)]
+#[allow(clippy::expect_used)]
+pub fn create_directory_symlink(source: &Path, link: &Path) {
+    // Running this test locally may require Windows Developer Mode or an elevated process.
+    std::os::windows::fs::symlink_dir(source, link)
+        .expect("create directory symlink; enable Developer Mode or run the test elevated");
 }
 
 pub trait TempDirExt {
@@ -244,6 +274,16 @@ where
     wait_for_event_with_timeout(codex, predicate, Duration::from_secs(1)).await
 }
 
+pub async fn wait_for_successful_turn(codex: &CodexThread) {
+    use codex_protocol::protocol::EventMsg;
+
+    let event = wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(
+        matches!(&event, EventMsg::TurnComplete(completed) if completed.error.is_none()),
+        "turn failed: {event:?}"
+    );
+}
+
 /// Waits for a configured MCP server to finish startup and requires it to be ready.
 pub async fn wait_for_mcp_server(codex: &CodexThread, server_name: &str) -> anyhow::Result<()> {
     use codex_protocol::protocol::EventMsg;
@@ -286,7 +326,12 @@ pub async fn submit_thread_settings(
     use tokio::time::Duration;
     use tokio::time::timeout;
 
-    let submission_id = codex.submit(Op::ThreadSettings { thread_settings }).await?;
+    let submission_id = codex
+        .submit(Op::ThreadSettings {
+            thread_settings,
+            reply: None,
+        })
+        .await?;
     loop {
         let ev = timeout(Duration::from_secs(10), codex.next_event())
             .await
@@ -299,6 +344,40 @@ pub async fn submit_thread_settings(
                 other => panic!("unexpected thread settings update event: {other:?}"),
             }
         }
+    }
+}
+
+/// For sequential tests, register this contributor and wait once after every completed turn.
+/// Notifications are thread-scoped so a child or sibling cannot satisfy the wait.
+pub struct ThreadIdle;
+
+#[derive(Default)]
+struct ThreadIdleNotification(tokio::sync::Notify);
+
+impl codex_extension_api::ThreadLifecycleContributor<Config> for ThreadIdle {
+    fn on_thread_idle<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadIdleInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input
+                .thread_store
+                .get_or_init(ThreadIdleNotification::default)
+                .0
+                .notify_one();
+        })
+    }
+}
+
+impl ThreadIdle {
+    pub async fn wait(thread: &CodexThread) {
+        // TurnComplete is sent before active-turn cleanup. Rollback requires the later idle signal.
+        let idle = thread
+            .thread_extension_data()
+            .get_or_init(ThreadIdleNotification::default);
+        tokio::time::timeout(std::time::Duration::from_secs(10), idle.0.notified())
+            .await
+            .expect("thread should become idle after turn completion");
     }
 }
 
@@ -338,33 +417,6 @@ pub fn sandbox_env_var() -> &'static str {
 
 pub fn sandbox_network_env_var() -> &'static str {
     codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-}
-
-const REMOTE_ENV_ENV_VAR: &str = "CODEX_TEST_REMOTE_ENV";
-
-pub fn remote_env_env_var() -> &'static str {
-    REMOTE_ENV_ENV_VAR
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RemoteEnvConfig {
-    pub container_name: String,
-}
-
-pub fn get_remote_test_env() -> Option<RemoteEnvConfig> {
-    if std::env::var_os(REMOTE_ENV_ENV_VAR).is_none() {
-        eprintln!("Skipping test because {REMOTE_ENV_ENV_VAR} is not set.");
-        return None;
-    }
-
-    let container_name = std::env::var(REMOTE_ENV_ENV_VAR)
-        .unwrap_or_else(|_| panic!("{REMOTE_ENV_ENV_VAR} must be set"));
-    assert!(
-        !container_name.trim().is_empty(),
-        "{REMOTE_ENV_ENV_VAR} must not be empty"
-    );
-
-    Some(RemoteEnvConfig { container_name })
 }
 
 pub fn format_with_current_shell(command: &str) -> Vec<String> {
@@ -580,27 +632,94 @@ macro_rules! skip_if_no_network {
     }};
 }
 
+// Exported so the public skip macros can expand in downstream test crates.
 #[macro_export]
-macro_rules! skip_if_remote {
-    ($reason:expr $(,)?) => {{
-        if ::std::env::var_os($crate::remote_env_env_var()).is_some() {
-            eprintln!(
-                "Skipping test under {}: {}",
-                $crate::remote_env_env_var(),
-                $reason
-            );
+#[doc(hidden)]
+macro_rules! skip_if_test_condition {
+    ($condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return;
         }
     }};
-    ($return_value:expr, $reason:expr $(,)?) => {{
-        if ::std::env::var_os($crate::remote_env_env_var()).is_some() {
-            eprintln!(
-                "Skipping test under {}: {}",
-                $crate::remote_env_env_var(),
-                $reason
-            );
+    ($return_value:expr, $condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return $return_value;
         }
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_remote {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
+            $reason,
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_no_remote_env {
+    () => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return;
+        }
+    }};
+    ($return_value:expr $(,)?) => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return $return_value;
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_wine_exec {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_target_windows {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
+            $reason,
+        );
     }};
 }
 
@@ -641,7 +760,7 @@ macro_rules! codex_linux_sandbox_exe_or_skip {
 }
 
 #[macro_export]
-macro_rules! skip_if_windows {
+macro_rules! skip_if_host_windows {
     ($return_value:expr $(,)?) => {{
         if cfg!(target_os = "windows") {
             println!("Skipping test because it cannot execute on Windows.");

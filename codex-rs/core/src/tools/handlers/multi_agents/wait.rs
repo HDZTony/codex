@@ -1,9 +1,11 @@
 use super::*;
+use crate::agent::control::StatusSubscription;
 use crate::agent::status::is_final;
+use crate::session::session::Session;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v1;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_tools::ToolSpec;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -11,7 +13,6 @@ use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch::Receiver;
 use tokio::time::Instant;
 
 use tokio::time::timeout_at;
@@ -27,7 +28,6 @@ impl Handler {
     }
 }
 
-#[async_trait::async_trait]
 impl ToolExecutor<ToolInvocation> for Handler {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "wait_agent")
@@ -44,7 +44,16 @@ impl ToolExecutor<ToolInvocation> for Handler {
         )
     }
 
-    async fn handle(
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl Handler {
+    async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
@@ -58,12 +67,14 @@ impl ToolExecutor<ToolInvocation> for Handler {
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+        let local_agent_control = session
+            .services
+            .local_agent_runtime
+            .control(session.session_id());
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
-            let agent_metadata = session
-                .services
-                .agent_control
+            let agent_metadata = local_agent_control
                 .get_agent_metadata(*receiver_thread_id)
                 .unwrap_or_default();
             target_by_thread_id.insert(
@@ -92,50 +103,65 @@ impl ToolExecutor<ToolInvocation> for Handler {
         };
 
         session
-            .send_event(
+            .emit_turn_item_started(
                 &turn,
-                CollabWaitingBeginEvent {
-                    started_at_ms: now_unix_timestamp_ms(),
+                &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id.clone(),
+                    tool: CollabAgentTool::Wait,
+                    status: CollabAgentToolCallStatus::InProgress,
                     sender_thread_id: session.thread_id,
                     receiver_thread_ids: receiver_thread_ids.clone(),
                     receiver_agents: receiver_agents.clone(),
-                    call_id: call_id.clone(),
-                }
-                .into(),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: Default::default(),
+                }),
             )
             .await;
 
         let mut status_rxs = Vec::with_capacity(receiver_thread_ids.len());
         let mut initial_final_statuses = Vec::new();
         for id in &receiver_thread_ids {
-            match session.services.agent_control.subscribe_status(*id).await {
-                Ok(rx) => {
-                    let status = rx.borrow().clone();
+            let subscription = async {
+                let mut updates = local_agent_control.subscribe_status(*id).await?;
+                let initial = updates
+                    .next()
+                    .await
+                    .transpose()?
+                    .ok_or(CodexErr::InternalAgentDied)?;
+                Ok::<_, CodexErr>((initial, updates))
+            }
+            .await;
+            match subscription {
+                Ok((initial, updates)) => {
+                    let status = initial.status().cloned().unwrap_or(AgentStatus::NotFound);
                     if is_final(&status) {
                         initial_final_statuses.push((*id, status));
                     }
-                    status_rxs.push((*id, rx));
+                    status_rxs.push((*id, updates));
                 }
-                Err(CodexErr::ThreadNotFound(_)) => {
+                Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
                     initial_final_statuses.push((*id, AgentStatus::NotFound));
                 }
                 Err(err) => {
                     let mut statuses = HashMap::with_capacity(1);
-                    statuses.insert(*id, session.services.agent_control.get_status(*id).await);
+                    statuses.insert(*id, local_agent_control.get_status(*id).await);
                     session
-                        .send_event(
+                        .emit_turn_item_completed(
                             &turn,
-                            CollabWaitingEndEvent {
+                            TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                                id: call_id.clone(),
+                                tool: CollabAgentTool::Wait,
+                                status: wait_tool_call_status(&statuses),
                                 sender_thread_id: session.thread_id,
-                                call_id: call_id.clone(),
-                                completed_at_ms: now_unix_timestamp_ms(),
-                                agent_statuses: build_wait_agent_statuses(
-                                    &statuses,
-                                    &receiver_agents,
-                                ),
-                                statuses,
-                            }
-                            .into(),
+                                receiver_thread_ids: statuses.keys().copied().collect(),
+                                receiver_agents: wait_receiver_agents(&statuses, &receiver_agents),
+                                prompt: None,
+                                model: None,
+                                reasoning_effort: None,
+                                agents_states: statuses,
+                            }),
                         )
                         .await;
                     return Err(collab_agent_error(*id, err));
@@ -155,19 +181,21 @@ impl ToolExecutor<ToolInvocation> for Handler {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
             loop {
                 match timeout_at(deadline, futures.next()).await {
-                    Ok(Some(Some(result))) => {
+                    Ok(Some(Ok(Some(result)))) => {
                         results.push(result);
                         break;
                     }
-                    Ok(Some(None)) => continue,
+                    Ok(Some(Ok(None))) => continue,
+                    Ok(Some(Err(err))) => return Err(err),
                     Ok(None) | Err(_) => break,
                 }
             }
             if !results.is_empty() {
                 loop {
                     match futures.next().now_or_never() {
-                        Some(Some(Some(result))) => results.push(result),
-                        Some(Some(None)) => continue,
+                        Some(Some(Ok(Some(result)))) => results.push(result),
+                        Some(Some(Ok(None))) => continue,
+                        Some(Some(Err(err))) => return Err(err),
                         Some(None) | None => break,
                     }
                 }
@@ -177,7 +205,6 @@ impl ToolExecutor<ToolInvocation> for Handler {
 
         let timed_out = statuses.is_empty();
         let statuses_by_id = statuses.clone().into_iter().collect::<HashMap<_, _>>();
-        let agent_statuses = build_wait_agent_statuses(&statuses_by_id, &receiver_agents);
         let result = WaitAgentResult {
             status: statuses
                 .into_iter()
@@ -192,21 +219,67 @@ impl ToolExecutor<ToolInvocation> for Handler {
         };
 
         session
-            .send_event(
+            .emit_turn_item_completed(
                 &turn,
-                CollabWaitingEndEvent {
+                TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id,
+                    tool: CollabAgentTool::Wait,
+                    status: wait_tool_call_status(&statuses_by_id),
                     sender_thread_id: session.thread_id,
-                    call_id,
-                    completed_at_ms: now_unix_timestamp_ms(),
-                    agent_statuses,
-                    statuses: statuses_by_id,
-                }
-                .into(),
+                    receiver_thread_ids: statuses_by_id.keys().copied().collect(),
+                    receiver_agents: wait_receiver_agents(&statuses_by_id, &receiver_agents),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: statuses_by_id,
+                }),
             )
             .await;
 
         Ok(boxed_tool_output(result))
     }
+}
+
+fn wait_tool_call_status(statuses: &HashMap<ThreadId, AgentStatus>) -> CollabAgentToolCallStatus {
+    if statuses
+        .values()
+        .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
+    {
+        CollabAgentToolCallStatus::Failed
+    } else {
+        CollabAgentToolCallStatus::Completed
+    }
+}
+
+fn wait_receiver_agents(
+    statuses: &HashMap<ThreadId, AgentStatus>,
+    receiver_agents: &[CollabAgentRef],
+) -> Vec<CollabAgentRef> {
+    if statuses.is_empty() {
+        return Vec::new();
+    }
+
+    let mut agents = Vec::with_capacity(statuses.len());
+    let mut seen = HashMap::with_capacity(receiver_agents.len());
+    for receiver_agent in receiver_agents {
+        seen.insert(receiver_agent.thread_id, ());
+        if statuses.contains_key(&receiver_agent.thread_id) {
+            agents.push(receiver_agent.clone());
+        }
+    }
+
+    let mut extras = statuses
+        .keys()
+        .filter(|thread_id| !seen.contains_key(thread_id))
+        .map(|thread_id| CollabAgentRef {
+            thread_id: *thread_id,
+            agent_nickname: None,
+            agent_role: None,
+        })
+        .collect::<Vec<_>>();
+    extras.sort_by_key(|agent| agent.thread_id.to_string());
+    agents.extend(extras);
+    agents
 }
 
 impl CoreToolRuntime for Handler {
@@ -229,7 +302,7 @@ pub(crate) struct WaitAgentResult {
 }
 
 impl ToolOutput for WaitAgentResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "wait_agent")
     }
 
@@ -249,21 +322,20 @@ impl ToolOutput for WaitAgentResult {
 async fn wait_for_final_status(
     session: Arc<Session>,
     thread_id: ThreadId,
-    mut status_rx: Receiver<AgentStatus>,
-) -> Option<(ThreadId, AgentStatus)> {
-    let mut status = status_rx.borrow().clone();
-    if is_final(&status) {
-        return Some((thread_id, status));
-    }
-
-    loop {
-        if status_rx.changed().await.is_err() {
-            let latest = session.services.agent_control.get_status(thread_id).await;
-            return is_final(&latest).then_some((thread_id, latest));
-        }
-        status = status_rx.borrow().clone();
+    mut updates: StatusSubscription,
+) -> Result<Option<(ThreadId, AgentStatus)>, FunctionCallError> {
+    while let Some(snapshot) = updates.next().await {
+        let snapshot = snapshot.map_err(|err| collab_agent_error(thread_id, err))?;
+        let status = snapshot.status().cloned().unwrap_or(AgentStatus::NotFound);
         if is_final(&status) {
-            return Some((thread_id, status));
+            return Ok(Some((thread_id, status)));
         }
     }
+    let latest = session
+        .services
+        .local_agent_runtime
+        .control(session.session_id())
+        .get_status(thread_id)
+        .await;
+    Ok(is_final(&latest).then_some((thread_id, latest)))
 }

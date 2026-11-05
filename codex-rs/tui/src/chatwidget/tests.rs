@@ -8,21 +8,16 @@ pub(super) use super::*;
 pub(super) use crate::app_command::AppCommand as Op;
 pub(super) use crate::app_event::AppEvent;
 pub(super) use crate::app_event::ExitMode;
-#[cfg(not(target_os = "linux"))]
-pub(super) use crate::app_event::RealtimeAudioDeviceKind;
 pub(super) use crate::app_event_sender::AppEventSender;
 pub(super) use crate::approval_events::ApplyPatchApprovalRequestEvent;
 pub(super) use crate::approval_events::ExecApprovalRequestEvent;
 pub(super) use crate::bottom_pane::LocalImageAttachment;
 pub(super) use crate::bottom_pane::MentionBinding;
 pub(super) use crate::bottom_pane::QueuedInputAction;
-pub(super) use crate::chatwidget::realtime::RealtimeConversationPhase;
 pub(super) use crate::diff_model::FileChange;
 pub(super) use crate::history_cell::UserHistoryCell;
 pub(super) use crate::legacy_core::config::Config;
 pub(super) use crate::legacy_core::config::ConfigBuilder;
-pub(super) use crate::legacy_core::config::Constrained;
-pub(super) use crate::legacy_core::config::ConstraintError;
 pub(super) use crate::model_catalog::ModelCatalog;
 pub(super) use crate::test_backend::VT100Backend;
 pub(super) use crate::test_support::PathBufExt;
@@ -82,6 +77,7 @@ pub(super) use codex_app_server_protocol::MarketplaceUpgradeResponse;
 pub(super) use codex_app_server_protocol::McpServerStartupState;
 pub(super) use codex_app_server_protocol::McpServerStatusDetail;
 pub(super) use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+pub(super) use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
 pub(super) use codex_app_server_protocol::ModelVerification as AppServerModelVerification;
 pub(super) use codex_app_server_protocol::ModelVerificationNotification;
 pub(super) use codex_app_server_protocol::NonSteerableTurnKind;
@@ -103,11 +99,10 @@ pub(super) use codex_app_server_protocol::RateLimitWindow;
 pub(super) use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
 pub(super) use codex_app_server_protocol::ReviewTarget;
 pub(super) use codex_app_server_protocol::ServerNotification;
+pub(super) use codex_app_server_protocol::SkillMetadata;
 pub(super) use codex_app_server_protocol::SkillSummary;
 pub(super) use codex_app_server_protocol::ThreadClosedNotification;
-pub(super) use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
-pub(super) use codex_app_server_protocol::ThreadRealtimeClosedNotification;
-pub(super) use codex_app_server_protocol::ThreadRealtimeErrorNotification;
+pub(super) use codex_app_server_protocol::ThreadItemPayload as AppServerThreadItemPayload;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputOption;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputParams;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -119,16 +114,18 @@ pub(super) use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 pub(super) use codex_app_server_protocol::UserInput;
 pub(super) use codex_app_server_protocol::UserInput as AppServerUserInput;
 pub(super) use codex_app_server_protocol::WarningNotification;
+pub(super) use codex_app_server_protocol::WindowsSandboxSetupMode;
 pub(super) use codex_config::ConfigLayerStack;
+pub(super) use codex_config::Constrained;
+pub(super) use codex_config::ConstraintError;
 pub(super) use codex_config::RequirementSource;
 pub(super) use codex_config::types::ApprovalsReviewer;
 pub(super) use codex_config::types::Notifications;
-pub(super) use codex_config::types::WindowsSandboxModeToml;
 pub(super) use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
-pub(super) use codex_core_skills::model::SkillMetadata;
-pub(super) use codex_features::FEATURES;
 pub(super) use codex_features::Feature;
 pub(super) use codex_git_utils::CommitLogEntry;
+pub(super) use codex_models_manager::test_support::construct_model_info_offline_for_tests;
+pub(super) use codex_models_manager::test_support::get_model_offline_for_tests;
 pub(super) use codex_otel::RuntimeMetricsSummary;
 pub(super) use codex_otel::SessionTelemetry;
 pub(super) use codex_protocol::ThreadId;
@@ -142,7 +139,6 @@ pub(super) use codex_protocol::approvals::GuardianRiskLevel;
 pub(super) use codex_protocol::approvals::GuardianUserAuthorization;
 pub(super) use codex_protocol::config_types::CollaborationMode;
 pub(super) use codex_protocol::config_types::ModeKind;
-pub(super) use codex_protocol::config_types::Personality;
 pub(super) use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 pub(super) use codex_protocol::config_types::ServiceTier;
 pub(super) use codex_protocol::models::ActivePermissionProfile;
@@ -162,11 +158,9 @@ pub(super) use codex_protocol::plan_tool::StepStatus;
 pub(super) use codex_protocol::plan_tool::UpdatePlanArgs;
 pub(super) use codex_protocol::request_permissions::RequestPermissionProfile;
 pub(super) use codex_protocol::user_input::TextElement;
-pub(super) use codex_terminal_detection::Multiplexer;
-pub(super) use codex_terminal_detection::TerminalInfo;
-pub(super) use codex_terminal_detection::TerminalName;
 pub(super) use codex_utils_absolute_path::AbsolutePathBuf;
 pub(super) use codex_utils_approval_presets::builtin_approval_presets;
+pub(super) use codex_utils_path_uri::LegacyAppPathString;
 pub(super) use crossterm::event::KeyCode;
 pub(super) use crossterm::event::KeyEvent;
 pub(super) use crossterm::event::KeyModifiers;
@@ -209,35 +203,135 @@ macro_rules! assert_chatwidget_snapshot {
         settings.bind(|| {
             insta::assert_snapshot!(
                 format!("codex_tui__chatwidget__tests__{}", $name),
-                &($value),
+                $value,
                 @$snapshot
             );
         });
     }};
 }
 
+fn next_goal_draft(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    expected_thread_id: ThreadId,
+) -> crate::goal_files::GoalDraft {
+    loop {
+        let event = rx.try_recv().expect("expected goal draft event");
+        if let AppEvent::SetThreadGoalDraft {
+            thread_id, draft, ..
+        } = event
+        {
+            assert_eq!(thread_id, expected_thread_id);
+            return draft;
+        }
+    }
+}
+
 mod app_server;
 mod approval_requests;
+#[path = "tests/backend_banners_tests.rs"]
+mod backend_banners_tests;
+#[path = "tests/bedrock_catalog_tests.rs"]
+mod bedrock_catalog_tests;
+#[path = "tests/collaboration_catalog_tests.rs"]
+mod collaboration_catalog_tests;
+#[path = "tests/compaction_tests.rs"]
+mod compaction_tests;
+#[path = "tests/completion_styling_tests.rs"]
+mod completion_styling;
 mod composer_submission;
+#[path = "tests/computer_activity_tests.rs"]
+mod computer_activity_tests;
+#[path = "tests/config_errors_tests.rs"]
+mod config_errors;
+#[path = "tests/copy_export_picker_tests.rs"]
+mod copy_export_picker_tests;
+#[path = "tests/dynamic_activity_tests.rs"]
+mod dynamic_activity_tests;
 mod exec_flow;
 mod goal_menu;
 mod goal_validation;
 mod guardian;
-mod helpers;
+pub(crate) mod helpers;
+#[path = "tests/history_projection.rs"]
+mod history_projection;
 mod history_replay;
+#[path = "tests/home_cleanup_tests.rs"]
+mod home_cleanup_tests;
+#[path = "tests/luna_reserve_usage_tests.rs"]
+mod luna_reserve_usage_tests;
 mod mcp_startup;
+#[path = "tests/misalignment_policy_tests.rs"]
+mod misalignment_policy;
+#[path = "tests/model_display_name_tests.rs"]
+mod model_display_name_tests;
+#[path = "tests/model_picker_tests.rs"]
+mod model_picker_tests;
+#[path = "tests/permission_picker_tests.rs"]
+mod permission_picker_tests;
+#[path = "tests/permission_shortcuts_tests.rs"]
+mod permission_shortcuts_tests;
 mod permissions;
 mod plan_mode;
+#[path = "tests/plugin_catalog_tests.rs"]
+mod plugin_catalog;
 mod popups_and_settings;
+#[path = "tests/program_status.rs"]
+mod program_status;
+#[path = "tests/rate_limit_recovery_tests.rs"]
+mod rate_limit_recovery_tests;
+#[path = "tests/reasoning_status_tests.rs"]
+mod reasoning_status_tests;
+#[path = "tests/replay_render_tests.rs"]
+mod replay_render_tests;
 mod review_mode;
+#[path = "tests/review_picker_tests.rs"]
+mod review_picker_tests;
+#[path = "tests/session_model_selection_tests.rs"]
+mod session_model_selection_tests;
 mod side;
+#[path = "tests/skills_summary_tests.rs"]
+mod skills_summary_tests;
 mod slash_commands;
+#[path = "tests/sparkle_submission_tests.rs"]
+mod sparkle_submission_tests;
+#[path = "tests/startup_submission_tests.rs"]
+mod startup_submission_tests;
 mod status_and_layout;
 mod status_command_tests;
+#[path = "tests/status_surface_command_tests.rs"]
+mod status_surface_command_tests;
 mod status_surface_previews;
+#[path = "tests/subagent_activity_tests.rs"]
+mod subagent_activity;
+#[path = "tests/terminal_program_status.rs"]
+mod terminal_program_status;
 mod terminal_title;
+#[path = "tests/tool_activity_tests.rs"]
+mod tool_activity_tests;
+mod usage;
+#[path = "tests/worktree_picker_tests.rs"]
+mod worktree_picker;
 
 pub(crate) use helpers::make_chatwidget_manual_with_sender;
+pub(crate) use helpers::render_bottom_popup;
 pub(crate) use helpers::set_chatgpt_auth;
 pub(crate) use helpers::set_fast_mode_test_catalog;
 pub(super) use helpers::*;
+
+#[path = "tests/questions_tests.rs"]
+mod questions_tests;
+
+#[path = "tests/question_turn_end_tests.rs"]
+mod question_turn_end_tests;
+
+#[path = "tests/list_spacing_tests.rs"]
+mod list_spacing_tests;
+
+#[path = "tests/question_notifications_tests.rs"]
+mod question_notifications_tests;
+
+#[path = "tests/security_setup_tests.rs"]
+mod security_setup_tests;
+
+#[path = "tests/quick_dials_tests.rs"]
+mod quick_dials_tests;

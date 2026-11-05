@@ -8,13 +8,19 @@ use codex_install_context::StandalonePlatform;
 /// Update action the CLI should perform after the TUI exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
+    /// Replace the local daemon after restoring the terminal.
+    Daemon(DaemonUpdateSource),
     /// Update via `npm install -g @openai/codex@latest`.
     NpmGlobalLatest,
     /// Update via `bun install -g @openai/codex@latest`.
     BunGlobalLatest,
+    /// Update via `vp install -g @openai/codex@latest`.
+    VitePlusGlobalLatest,
+    /// Update via `pnpm add -g @openai/codex@latest`.
+    PnpmGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
-    /// Update via `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`.
+    /// Update via the standalone Unix installer.
     StandaloneUnix,
     /// Update via `$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex`.
     StandaloneWindows,
@@ -26,6 +32,8 @@ impl UpdateAction {
         match &context.method {
             InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
             InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
+            InstallMethod::VitePlus => Some(UpdateAction::VitePlusGlobalLatest),
+            InstallMethod::Pnpm => Some(UpdateAction::PnpmGlobalLatest),
             InstallMethod::Brew => Some(UpdateAction::BrewUpgrade),
             InstallMethod::Standalone { platform, .. } => Some(match platform {
                 StandalonePlatform::Unix => UpdateAction::StandaloneUnix,
@@ -38,14 +46,17 @@ impl UpdateAction {
     /// Returns the list of command-line arguments for invoking the update.
     pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
         match self {
+            UpdateAction::Daemon(source) => ("codex", source.command_args()),
             UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
             UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
+            UpdateAction::VitePlusGlobalLatest => ("vp", &["install", "-g", "@openai/codex"]),
+            UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
             UpdateAction::StandaloneUnix => (
                 "sh",
                 &[
                     "-c",
-                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
+                    r#"s=$(curl -fsSL https://chatgpt.com/codex/install.sh) && CODEX_NON_INTERACTIVE=1 eval "$s""#,
                 ],
             ),
             UpdateAction::StandaloneWindows => (
@@ -108,6 +119,13 @@ mod tests {
         );
         assert_eq!(
             UpdateAction::from_install_context(&InstallContext {
+                method: InstallMethod::Pnpm,
+                package_layout: None,
+            }),
+            Some(UpdateAction::PnpmGlobalLatest)
+        );
+        assert_eq!(
+            UpdateAction::from_install_context(&InstallContext {
                 method: InstallMethod::Brew,
                 package_layout: None,
             }),
@@ -138,17 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_update_commands_rerun_latest_installer() {
-        assert_eq!(
-            UpdateAction::StandaloneUnix.command_args(),
-            (
-                "sh",
-                &[
-                    "-c",
-                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
-                ][..],
-            )
-        );
+    fn standalone_windows_update_command_reruns_latest_installer() {
         assert_eq!(
             UpdateAction::StandaloneWindows.command_args(),
             (
@@ -161,5 +169,38 @@ mod tests {
                 ][..],
             )
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_unix_update_fails_when_installer_download_fails() {
+        let (command, args) = UpdateAction::StandaloneUnix.command_args();
+        let offline_command = args[1].replace("https://chatgpt.com", "file:///dev/null");
+        assert_ne!(offline_command, args[1], "installer URL must be replaced");
+        let output = std::process::Command::new(command)
+            .args([args[0], &offline_command])
+            .env_clear()
+            .env("HOME", "/dev/null")
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run standalone Unix update command");
+
+        assert!(!output.status.success(), "{output:?}");
+    }
+}
+
+/// Package source explicitly selected by the user in the daemon menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonUpdateSource {
+    PublicStable,
+    ThisCli,
+}
+
+impl DaemonUpdateSource {
+    pub fn command_args(self) -> &'static [&'static str] {
+        match self {
+            Self::PublicStable => &["app-server", "daemon", "update"],
+            Self::ThisCli => &["app-server", "daemon", "update", "--from-cli", "--yes"],
+        }
     }
 }

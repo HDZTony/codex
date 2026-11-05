@@ -7,6 +7,48 @@ use std::sync::PoisonError;
 
 type ErasedData = Arc<dyn Any + Send + Sync>;
 
+/// Typed values supplied before an [`ExtensionData`] scope is created.
+///
+/// Hosts may retain a clone when later operations must use the same initial
+/// inputs. Cloning freezes the attachment map and shares each value by `Arc`;
+/// values with interior mutability remain shared. This type does not install
+/// extensions or provide persistence.
+#[derive(Clone, Debug, Default)]
+pub struct ExtensionDataInit {
+    entries: HashMap<TypeId, ErasedData>,
+}
+
+impl ExtensionDataInit {
+    /// Creates an empty extension data initializer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores `value` as the initial attachment of type `T`.
+    pub fn insert<T>(&mut self, value: T) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        self.entries
+            .insert(TypeId::of::<T>(), Arc::new(value))
+            .map(downcast_data)
+    }
+
+    /// Consumes a startup-only attachment before creating the live scope.
+    pub fn remove<T: Any + Send + Sync>(&mut self) -> Option<Arc<T>> {
+        self.entries.remove(&TypeId::of::<T>()).map(downcast_data)
+    }
+
+    /// Returns a host-supplied initial attachment without creating a mutable scope.
+    pub fn get<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let value = self.entries.get(&TypeId::of::<T>())?.clone();
+        Some(downcast_data(value))
+    }
+}
+
 /// Typed extension-owned data attached to one host object.
 #[derive(Debug)]
 pub struct ExtensionData {
@@ -17,9 +59,14 @@ pub struct ExtensionData {
 impl ExtensionData {
     /// Creates an empty attachment map for one host-owned scope.
     pub fn new(level_id: impl Into<String>) -> Self {
+        Self::new_with_init(level_id, ExtensionDataInit::default())
+    }
+
+    /// Creates an attachment map seeded with host-supplied initial data.
+    pub fn new_with_init(level_id: impl Into<String>, init: ExtensionDataInit) -> Self {
         Self {
             level_id: level_id.into(),
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(init.entries),
         }
     }
 
@@ -57,9 +104,36 @@ impl ExtensionData {
     where
         T: Any + Send + Sync,
     {
+        self.insert_arc(Arc::new(value))
+    }
+
+    /// Stores a shared attachment without cloning its contents.
+    pub fn insert_arc<T>(&self, value: Arc<T>) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
         self.entries()
-            .insert(TypeId::of::<T>(), Arc::new(value))
+            .insert(TypeId::of::<T>(), value)
             .map(downcast_data)
+    }
+
+    /// Stores `value` only when `should_insert` accepts the current attachment.
+    ///
+    /// The predicate and insertion happen while this map is locked, so concurrent
+    /// callers cannot replace a value after checking a stale attachment.
+    pub fn insert_if<T>(&self, value: T, should_insert: impl FnOnce(Option<&T>) -> bool) -> bool
+    where
+        T: Any + Send + Sync,
+    {
+        let mut entries = self.entries();
+        let existing = entries
+            .get(&TypeId::of::<T>())
+            .map(|value| downcast_data::<T>(Arc::clone(value)));
+        if !should_insert(existing.as_deref()) {
+            return false;
+        }
+        entries.insert(TypeId::of::<T>(), Arc::new(value));
+        true
     }
 
     /// Removes and returns the attached value of type `T`, if one exists.

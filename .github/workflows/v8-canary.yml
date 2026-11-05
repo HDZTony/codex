@@ -1,48 +1,13 @@
 name: v8-canary
 
+# Do not use trigger-level path filters here. This workflow is also called by
+# postmerge-ci, and GitHub cannot share a path filter between pull_request and
+# workflow_call. v8_canary_changes.py is the single source of truth instead;
+# unrelated events run only the cheap metadata job below.
 on:
-  pull_request:
-    paths:
-      - ".bazelrc"
-      - ".github/actions/setup-bazel-ci/**"
-      - ".github/scripts/run_bazel_with_buildbuddy.py"
-      - ".github/scripts/rusty_v8_bazel.py"
-      - ".github/scripts/rusty_v8_module_bazel.py"
-      - ".github/workflows/rusty-v8-release.yml"
-      - ".github/workflows/v8-canary.yml"
-      - "MODULE.bazel"
-      - "MODULE.bazel.lock"
-      - "codex-rs/Cargo.toml"
-      - "patches/BUILD.bazel"
-      - "patches/llvm_*.patch"
-      - "patches/rules_cc_*.patch"
-      - "patches/v8_*.patch"
-      - "third_party/v8/**"
-  push:
-    branches:
-      - main
-    paths:
-      - ".bazelrc"
-      - ".github/actions/setup-bazel-ci/**"
-      - ".github/scripts/run_bazel_with_buildbuddy.py"
-      - ".github/scripts/rusty_v8_bazel.py"
-      - ".github/scripts/rusty_v8_module_bazel.py"
-      - ".github/workflows/rusty-v8-release.yml"
-      - ".github/workflows/v8-canary.yml"
-      - "MODULE.bazel"
-      - "MODULE.bazel.lock"
-      - "codex-rs/Cargo.toml"
-      - "patches/BUILD.bazel"
-      - "patches/llvm_*.patch"
-      - "patches/rules_cc_*.patch"
-      - "patches/v8_*.patch"
-      - "third_party/v8/**"
+  workflow_call:
+  pull_request: {}
   workflow_dispatch:
-
-# Cargo's libgit2 transport has been flaky when fetching git dependencies with
-# nested submodules. Prefer the system git CLI for Cargo builds and smoke tests.
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 concurrency:
   group: ${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
@@ -52,12 +17,17 @@ jobs:
   metadata:
     runs-on: ubuntu-latest
     outputs:
+      # Older revisions can contain a detector that does not emit this output.
+      # Missing must mean "run" so they cannot silently skip the expensive V8
+      # coverage while reporting success.
+      canary_required: ${{ steps.changes.outputs.canary_required || 'true' }}
       v8_version: ${{ steps.v8_version.outputs.version }}
+      windows_source_required: ${{ steps.changes.outputs.windows_source_required }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -73,13 +43,44 @@ jobs:
           version="$(python3 .github/scripts/rusty_v8_bazel.py resolved-v8-crate-version)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      - name: Detect V8 canary changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Manual runs have no meaningful before/after range. Force every V8
+          # variant so workflow_dispatch remains a reliable retry path.
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            output="$(python3 .github/scripts/v8_canary_changes.py --force)"
+          else
+            output="$(python3 .github/scripts/v8_canary_changes.py \
+              --base "${BASE_SHA}" \
+              --head "${HEAD_SHA}")"
+          fi
+          echo "${output}"
+          echo "${output}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   build:
     name: Build ${{ matrix.variant }} ${{ matrix.target }}
     needs: metadata
+    # Metadata always runs; only relevant changes pay for the large matrix.
+    if: ${{ needs.metadata.outputs.canary_required == 'true' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       actions: read
+    environment:
+      name: bazel
+      deployment: false
     strategy:
       fail-fast: false
       matrix:
@@ -108,13 +109,13 @@ jobs:
             sandbox: true
             target: aarch64-unknown-linux-gnu
             variant: ptrcomp-sandbox
-          - runner: macos-15-xlarge
+          - runner: macos-15-intel
             bazel_config: ci-macos
             platform: macos_amd64
             sandbox: false
             target: x86_64-apple-darwin
             variant: release
-          - runner: macos-15-xlarge
+          - runner: macos-15-intel
             bazel_config: ci-macos
             platform: macos_amd64
             sandbox: true
@@ -159,13 +160,13 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - name: Set up Bazel
-        uses: ./.github/actions/setup-bazel-ci
+      - name: Prepare Bazel CI
+        uses: ./.github/actions/prepare-bazel-ci
         with:
           target: ${{ matrix.target }}
+          cache-scope: bazel-v8
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -176,10 +177,10 @@ jobs:
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
 
       - name: Build Bazel V8 release pair
         env:
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
           PLATFORM: ${{ matrix.platform }}
           SANDBOX: ${{ matrix.sandbox }}
           TARGET: ${{ matrix.target }}
@@ -197,13 +198,9 @@ jobs:
           bazel_args=(
             build
             "--platforms=@llvm//platforms:${PLATFORM}"
-            --config=rusty-v8-upstream-libcxx
             "${pair_target}"
             --build_metadata=COMMIT_SHA=$(git rev-parse HEAD)
           )
-          if [[ "${SANDBOX}" != "true" ]]; then
-            bazel_args+=(--config=v8-release-compat)
-          fi
 
           ./.github/scripts/run_bazel_with_buildbuddy.py \
             --noexperimental_remote_repo_contents_cache \
@@ -213,7 +210,6 @@ jobs:
       - name: Stage release pair
         env:
           BAZEL_CONFIG: ${{ matrix.bazel_config }}
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
           PLATFORM: ${{ matrix.platform }}
           SANDBOX: ${{ matrix.sandbox }}
           TARGET: ${{ matrix.target }}
@@ -229,11 +225,29 @@ jobs:
           )
           if [[ "${SANDBOX}" == "true" ]]; then
             stage_args+=(--sandbox)
-          else
-            stage_args+=(--bazel-config v8-release-compat)
           fi
 
           python3 .github/scripts/rusty_v8_bazel.py stage-release-pair "${stage_args[@]}"
+
+      # Larger Linux runner images may omit the host linker used by Cargo build scripts.
+      - name: Install native Linux Cargo smoke dependencies
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(build-essential)
+          if [[ "${TARGET}" == *-musl ]]; then
+            packages+=(musl-tools)
+          fi
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+          if [[ "${TARGET}" == *-musl ]]; then
+            # Use musl only for target links; Cargo build scripts still link on the glibc host.
+            linker_var="CARGO_TARGET_${TARGET^^}_LINKER"
+            echo "${linker_var//-/_}=$(command -v musl-gcc)" >> "${GITHUB_ENV}"
+          fi
 
       - name: Smoke test staged artifact with Cargo
         env:
@@ -243,16 +257,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          host_arch="$(uname -m)"
-          case "${TARGET}:${host_arch}" in
-            x86_64-apple-darwin:x86_64|aarch64-apple-darwin:arm64|x86_64-unknown-linux-gnu:x86_64|aarch64-unknown-linux-gnu:aarch64)
-              ;;
-            *)
-              echo "Skipping non-native Cargo smoke for ${TARGET} on ${host_arch}."
-              exit 0
-              ;;
-          esac
-
           archive="$(find "dist/${TARGET}" -maxdepth 1 -type f -name 'librusty_v8_*.a.gz' -print -quit)"
           binding="$(find "dist/${TARGET}" -maxdepth 1 -type f -name 'src_binding_*.rs' -print -quit)"
           if [[ -z "${archive}" || -z "${binding}" ]]; then
@@ -260,10 +264,11 @@ jobs:
             exit 1
           fi
 
-          cargo_args=(test -p codex-v8-poc)
+          cargo_args=(test -p codex-v8-poc --target "${TARGET}")
           if [[ "${SANDBOX}" == "true" ]]; then
             cargo_args+=(--features sandbox)
           fi
+          cargo_args+=(-- --include-ignored)
 
           (
             cd codex-rs
@@ -279,9 +284,14 @@ jobs:
           name: v8-canary-${{ needs.metadata.outputs.v8_version }}-${{ matrix.variant }}-${{ matrix.target }}
           path: dist/${{ matrix.target }}/*
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   build-windows-source:
     name: Build ptrcomp-sandbox ${{ matrix.target }} from source
     needs: metadata
+    if: ${{ needs.metadata.outputs.windows_source_required == 'true' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -289,13 +299,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-2022
+          - runner: windows-2025
             target: x86_64-pc-windows-msvc
-          - runner: windows-2022
+          - runner: windows-2025
             target: aarch64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - id: setup_ci
+        uses: ./.github/actions/setup-ci
 
       - name: Configure git for upstream checkout
         shell: bash
@@ -308,6 +323,17 @@ jobs:
           ref: v${{ needs.metadata.outputs.v8_version }}
           path: upstream-rusty-v8
           submodules: recursive
+          persist-credentials: false
+
+      - name: Download upstream Windows build tools
+        shell: bash
+        working-directory: upstream-rusty-v8
+        run: |
+          set -euo pipefail
+          # Upstream skips this submodule and downloads the pinned archive in CI.
+          mkdir -p tools/win
+          curl -fL https://chromium.googlesource.com/chromium/src/tools/win/+archive/faefd1b6fa9eeb033ad6fe60368ccb9bf908cbd0.tar.gz |
+            tar -xz -C tools/win
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -339,28 +365,29 @@ jobs:
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: |
-            upstream-rusty-v8/target/sccache
-            upstream-rusty-v8/target/${{ matrix.target }}/release/gn_out
-          key: rusty-v8-source-${{ matrix.target }}-sandbox-${{ hashFiles('upstream-rusty-v8/Cargo.lock', 'upstream-rusty-v8/build.rs', 'upstream-rusty-v8/git_submodule_status.txt') }}
+            ${{ steps.setup_ci.outputs.cargo-target-dir }}/sccache
+            ${{ steps.setup_ci.outputs.cargo-target-dir }}/${{ matrix.target }}/release/gn_out
+          key: rusty-v8-source-${{ matrix.target }}-${{ matrix.runner }}-sandbox-${{ hashFiles('upstream-rusty-v8/Cargo.lock', 'upstream-rusty-v8/build.rs', 'upstream-rusty-v8/git_submodule_status.txt', 'patches/v8_array_sort_elements_kind.patch') }}
           restore-keys: |
-            rusty-v8-source-${{ matrix.target }}-sandbox-
+            rusty-v8-source-${{ matrix.target }}-${{ matrix.runner }}-sandbox-
 
-      - name: Install and start sccache
+      - name: Apply V8 Array.sort backport
+        shell: bash
+        working-directory: upstream-rusty-v8/v8
+        run: git apply -p3 "${GITHUB_WORKSPACE}/patches/v8_array_sort_elements_kind.patch"
+
+      - name: Install sccache
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.8.2
+
+      - name: Start sccache
         shell: pwsh
         env:
           SCCACHE_CACHE_SIZE: 256M
-          SCCACHE_DIR: ${{ github.workspace }}/upstream-rusty-v8/target/sccache
+          SCCACHE_DIR: ${{ steps.setup_ci.outputs.cargo-target-dir }}/sccache
           SCCACHE_IDLE_TIMEOUT: 0
-        run: |
-          $version = "v0.8.2"
-          $platform = "x86_64-pc-windows-msvc"
-          $basename = "sccache-$version-$platform"
-          $url = "https://github.com/mozilla/sccache/releases/download/$version/$basename.tar.gz"
-          cd ~
-          curl -LO $url
-          tar -xzvf "$basename.tar.gz"
-          . $basename/sccache --start-server
-          echo "$(pwd)/$basename" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run: sccache --start-server
 
       - name: Install Chromium clang for ARM64 MSVC cross build
         if: matrix.target == 'aarch64-pc-windows-msvc'
@@ -384,7 +411,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/rusty_v8_bazel.py stage-upstream-release-pair \
-            --source-root upstream-rusty-v8 \
+            --target-dir "${CARGO_TARGET_DIR}" \
             --target "${TARGET}" \
             --output-dir "dist/${TARGET}" \
             --sandbox
@@ -415,3 +442,7 @@ jobs:
         with:
           name: v8-canary-${{ needs.metadata.outputs.v8_version }}-ptrcomp-sandbox-${{ matrix.target }}
           path: dist/${{ matrix.target }}/*
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree

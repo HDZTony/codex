@@ -4,8 +4,15 @@ The `image_gen.imagegen` tool enables image generation from descriptions and edi
 - The user wants to modify an attached or previously generated image with specific changes, including adding or removing elements, altering colors, improving quality/resolution, or transforming the style (e.g., cartoon, oil painting).
 
 Guidelines:
-- Set `action` to `generate` when the user asks for a brand new image.
-- Set `action` to `edit` when the user asks to modify an existing image from the conversation history.
-- Directly generate the image without reconfirmation or clarification.
-- After each image generation, do not mention anything related to download. Do not summarize the image. Do not ask followup question. Do not say ANYTHING after you generate an image.
+- imagegen needs a few minutes to finish. In code-mode, use the first-line @exec directive to give the initial call 120 seconds and the same yield for any waits that follow. Once it finishes, return the image with generatedImage(result).
+- Avoid printing the full result or its base64 image data with `text()` or `notify()`; print only small metadata when needed.
+- Set `transparent_background` to true when the request calls for a transparent background, including background removal or a cutout; set it to false otherwise. For edits, preserve existing transparency unless the user asks to change it.
+- Omit both `referenced_image_paths` and `num_last_images_to_include` when generating a brand new image.
+- For edits, use `referenced_image_paths` when every target image has a local file path.
+- If you have not seen a local image yet, use `view_image` to inspect it before editing.
+- Use `num_last_images_to_include` only when at least one target image has no local file path.
+- Set `num_last_images_to_include` to the smallest number of recent conversation images that includes every target image, up to 5.
+- Never provide both `referenced_image_paths` and `num_last_images_to_include`.
+- If neither mechanism can include every target image, ask the user to attach the missing images again.
+- Directly generate the image without reconfirmation or clarification unless required images must be attached again.
 - Always use this tool for image editing unless the user explicitly requests otherwise. Do not use the `python` tool for image editing unless specifically instructed.

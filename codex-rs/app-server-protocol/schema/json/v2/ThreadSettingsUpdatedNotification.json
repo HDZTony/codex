@@ -39,7 +39,6 @@
         {
           "enum": [
             "untrusted",
-            "on-failure",
             "on-request",
             "never"
           ],
@@ -108,6 +107,31 @@
       ],
       "type": "string"
     },
+    "MultiAgentMode": {
+      "description": "Controls the effective multi-agent delegation instructions for a turn. `custom` means the configured mode hint defines the policy instead of a built-in policy.",
+      "oneOf": [
+        {
+          "enum": [
+            "explicitRequestOnly",
+            "proactive"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "custom": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "custom"
+          ],
+          "title": "CustomMultiAgentMode",
+          "type": "object"
+        }
+      ]
+    },
     "NetworkAccess": {
       "enum": [
         "restricted",
@@ -116,6 +140,7 @@
       "type": "string"
     },
     "Personality": {
+      "description": "Deprecated: `friendly` and `pragmatic` no longer select a style.",
       "enum": [
         "none",
         "friendly",
@@ -124,15 +149,8 @@
       "type": "string"
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
-      "enum": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
+      "description": "A non-empty reasoning effort value advertised by the model.",
+      "minLength": 1,
       "type": "string"
     },
     "ReasoningSummary": {
@@ -306,6 +324,14 @@
         "cwd": {
           "$ref": "#/definitions/AbsolutePathBuf"
         },
+        "disabledPluginIds": {
+          "default": [],
+          "description": "Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "effort": {
           "anyOf": [
             {
@@ -330,7 +356,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "@deprecated Reports the saved setting; `friendly` and `pragmatic` no longer select a style."
         },
         "sandboxPolicy": {
           "$ref": "#/definitions/SandboxPolicy"

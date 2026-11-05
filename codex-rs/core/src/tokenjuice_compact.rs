@@ -7,6 +7,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use tracing::debug;
 
 use wormhole_tokenjuice::AgentTokenjuiceCompression;
@@ -69,6 +70,45 @@ pub(crate) async fn compact_response_input_item(
             call_id,
             name,
             output: compact_payload(output, tool_name).await,
+        },
+        other => other,
+    }
+}
+
+/// Compact a model-history [`ResponseItem`] before it is recorded on the turn.
+pub(crate) async fn compact_response_item(item: ResponseItem, tool_name: &str) -> ResponseItem {
+    ensure_tokenjuice_installed();
+    if is_recovery_tool(tool_name) {
+        return item;
+    }
+    match item {
+        ResponseItem::FunctionCallOutput {
+            id,
+            call_id,
+            name,
+            namespace,
+            output,
+            internal_chat_message_metadata_passthrough,
+        } => ResponseItem::FunctionCallOutput {
+            id,
+            call_id,
+            name,
+            namespace,
+            output: compact_payload(output, tool_name).await,
+            internal_chat_message_metadata_passthrough,
+        },
+        ResponseItem::CustomToolCallOutput {
+            id,
+            call_id,
+            name,
+            output,
+            internal_chat_message_metadata_passthrough,
+        } => ResponseItem::CustomToolCallOutput {
+            id,
+            call_id,
+            name,
+            output: compact_payload(output, tool_name).await,
+            internal_chat_message_metadata_passthrough,
         },
         other => other,
     }

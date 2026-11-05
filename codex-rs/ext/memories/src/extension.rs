@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
 use codex_core::config::Config;
+use codex_core::context::ContextualUserFragment;
+use codex_core::context::MemoryContextFragment;
 use codex_extension_api::ConfigContributor;
+use codex_extension_api::ContentItemKind;
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::PromptFragment;
 use codex_extension_api::ThreadLifecycleContributor;
@@ -11,6 +15,7 @@ use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ToolContributor;
 use codex_features::Feature;
 use codex_otel::MetricsClient;
+use codex_protocol::MemoryVersion;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::local::LocalMemoriesBackend;
@@ -34,6 +39,7 @@ pub(crate) struct MemoriesExtensionConfig {
     pub(crate) enabled: bool,
     pub(crate) dedicated_tools: bool,
     pub(crate) codex_home: AbsolutePathBuf,
+    pub(crate) version: MemoryVersion,
 }
 
 impl MemoriesExtensionConfig {
@@ -42,12 +48,13 @@ impl MemoriesExtensionConfig {
             enabled: config.features.enabled(Feature::MemoryTool) && config.memories.use_memories,
             dedicated_tools: config.memories.dedicated_tools,
             codex_home: config.codex_home.clone(),
+            version: config.memories.version,
         }
     }
 }
 
 impl ContextContributor for MemoriesExtension {
-    fn contribute<'a>(
+    fn contribute_thread_context<'a>(
         &'a self,
         _session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
@@ -60,21 +67,53 @@ impl ContextContributor for MemoriesExtension {
                 return Vec::new();
             }
 
-            build_memory_tool_developer_instructions(&config.codex_home)
-                .await
-                .map(PromptFragment::developer_policy)
+            let Some(instructions) =
+                build_memory_tool_developer_instructions(&config.codex_home, config.version).await
+            else {
+                return Vec::new();
+            };
+            let instructions = match config.version {
+                MemoryVersion::V1 => vec![instructions],
+                MemoryVersion::V2 => {
+                    // Keep the complete summary while respecting each fragment's byte cap.
+                    let mut remaining = instructions.as_str();
+                    let mut fragments = Vec::new();
+                    while !remaining.is_empty() {
+                        let end = remaining.floor_char_boundary(remaining.len().min(8_900));
+                        fragments.push(
+                            MemoryContextFragment::ReadInstructions(remaining[..end].to_string())
+                                .render()
+                                .into_text()
+                                .unwrap_or_default(),
+                        );
+                        remaining = &remaining[end..];
+                    }
+                    fragments
+                }
+            };
+            instructions
                 .into_iter()
+                .map(|instructions| {
+                    PromptFragment::developer_policy(
+                        instructions,
+                        ContentItemKind(MemoryContextFragment::READ_INSTRUCTIONS_KIND.to_string()),
+                    )
+                })
                 .collect()
         })
     }
 }
 
-#[async_trait::async_trait]
 impl ThreadLifecycleContributor<Config> for MemoriesExtension {
-    async fn on_thread_start(&self, input: ThreadStartInput<'_, Config>) {
-        input
-            .thread_store
-            .insert(MemoriesExtensionConfig::from_config(input.config));
+    fn on_thread_start<'a>(
+        &'a self,
+        input: ThreadStartInput<'a, Config>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input
+                .thread_store
+                .insert(MemoriesExtensionConfig::from_config(input.config));
+        })
     }
 }
 
@@ -86,7 +125,12 @@ impl ConfigContributor<Config> for MemoriesExtension {
         _previous_config: &Config,
         new_config: &Config,
     ) {
-        thread_store.insert(MemoriesExtensionConfig::from_config(new_config));
+        let mut config = MemoriesExtensionConfig::from_config(new_config);
+        if let Some(previous) = thread_store.get::<MemoriesExtensionConfig>() {
+            // The initial summary and retrieval tools must use the same namespace.
+            config.version = previous.version;
+        }
+        thread_store.insert(config);
     }
 }
 
@@ -95,7 +139,9 @@ impl ToolContributor for MemoriesExtension {
         &self,
         _session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>> {
+    ) -> Vec<
+        Arc<dyn for<'call> codex_extension_api::ToolExecutor<codex_extension_api::ToolCall<'call>>>,
+    > {
         let Some(config) = thread_store.get::<MemoriesExtensionConfig>() else {
             return Vec::new();
         };
@@ -104,7 +150,12 @@ impl ToolContributor for MemoriesExtension {
         }
 
         tools::memory_tools(
-            LocalMemoriesBackend::from_codex_home(&config.codex_home),
+            LocalMemoriesBackend::from_memory_root(
+                config
+                    .codex_home
+                    .join(config.version.directory_name())
+                    .to_path_buf(),
+            ),
             self.metrics_client.clone(),
         )
     }

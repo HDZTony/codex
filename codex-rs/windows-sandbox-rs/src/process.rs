@@ -4,12 +4,18 @@ use crate::proc_thread_attr::ProcThreadAttributeList;
 use crate::winutil::argv_to_command_line;
 use crate::winutil::format_last_error;
 use crate::winutil::to_wide;
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_utils_pty::JobObject;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::BorrowedHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::ptr;
+use std::sync::Arc;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -22,6 +28,7 @@ use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
@@ -33,19 +40,19 @@ use windows_sys::Win32::System::Threading::STARTUPINFOW;
 pub struct CreatedProcess {
     pub process_info: PROCESS_INFORMATION,
     pub startup_info: STARTUPINFOW,
+    pub(crate) job: Arc<JobObject>,
     _desktop: LaunchDesktop,
 }
 
+/// Controls console creation for pipe-backed child processes.
+pub enum ConsoleMode {
+    Inherit,
+    NoWindow,
+}
+
 pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
-    let mut items: Vec<(String, String)> =
-        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    items.sort_by(|a, b| {
-        a.0.to_uppercase()
-            .cmp(&b.0.to_uppercase())
-            .then(a.0.cmp(&b.0))
-    });
     let mut w: Vec<u16> = Vec::new();
-    for (k, v) in items {
+    for (k, v) in ordered_env_entries(env) {
         let mut s = to_wide(format!("{k}={v}"));
         s.pop();
         w.extend_from_slice(&s);
@@ -55,10 +62,27 @@ pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
     w
 }
 
+// Match the environment we actually serialize, including for callers which
+// supply multiple spellings of a Windows key. Keep the first spelling in the
+// existing block order instead of letting HashMap iteration pick the value.
+pub(crate) fn ordered_env_entries(env: &HashMap<String, String>) -> Vec<(&str, &str)> {
+    let mut items: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    items.sort_by(|a, b| {
+        a.0.to_uppercase()
+            .cmp(&b.0.to_uppercase())
+            .then(a.0.cmp(b.0))
+    });
+    items.dedup_by(|a, b| a.0.eq_ignore_ascii_case(b.0));
+    items
+}
+
 unsafe fn ensure_inheritable_stdio(si: &mut STARTUPINFOW) -> Result<()> {
     for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         let h = GetStdHandle(kind);
-        if h == 0 || h == INVALID_HANDLE_VALUE {
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
             return Err(anyhow!("GetStdHandle failed: {}", GetLastError()));
         }
         if SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
@@ -75,6 +99,8 @@ unsafe fn ensure_inheritable_stdio(si: &mut STARTUPINFOW) -> Result<()> {
 /// # Safety
 /// Caller must provide a valid primary token handle (`h_token`) with appropriate access,
 /// and the `argv`, `cwd`, and `env_map` must remain valid for the duration of the call.
+// Low-level CreateProcessAsUserW wrapper mirrors the Windows API shape.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn create_process_as_user(
     h_token: HANDLE,
     argv: &[String],
@@ -82,23 +108,38 @@ pub unsafe fn create_process_as_user(
     env_map: &HashMap<String, String>,
     logs_base_dir: Option<&Path>,
     stdio: Option<(HANDLE, HANDLE, HANDLE)>,
-    use_private_desktop: bool,
+    console_mode: ConsoleMode,
+    desktop: LaunchDesktop,
 ) -> Result<CreatedProcess> {
     let cmdline_str = argv_to_command_line(argv);
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
     let env_block = make_env_block(env_map);
-    let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
+    let job = Arc::new(JobObject::create().context("create process job")?);
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
     let cwd_wide = to_wide(cwd);
     let env_block_len = env_block.len();
+    let console_flags = match (&stdio, console_mode) {
+        (Some(_), ConsoleMode::NoWindow) => CREATE_NO_WINDOW,
+        (Some(_), ConsoleMode::Inherit)
+        | (None, ConsoleMode::Inherit)
+        | (None, ConsoleMode::NoWindow) => 0,
+    };
+    let preserve_app_context = crate::app_package::current_process_has_package_identity()?;
+    let attr_count = if stdio.is_some() { 2 } else { 1 } + u32::from(preserve_app_context);
+    let mut attrs = ProcThreadAttributeList::new(attr_count)?;
+    attrs.set_job(job.as_raw_handle() as HANDLE)?;
+    if preserve_app_context {
+        attrs.preserve_desktop_app_context()?;
+    }
+
+    let mut si: STARTUPINFOEXW = std::mem::zeroed();
+    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    // Some processes (e.g., PowerShell) can fail with STATUS_DLL_INIT_FAILED
+    // if lpDesktop is not set when launching with a restricted token.
+    // Point explicitly at the interactive desktop or a private desktop.
+    si.StartupInfo.lpDesktop = desktop.startup_info_desktop();
     match stdio {
         Some((stdin_h, stdout_h, stderr_h)) => {
-            let mut si: STARTUPINFOEXW = std::mem::zeroed();
-            si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            // Some processes (e.g., PowerShell) can fail with STATUS_DLL_INIT_FAILED
-            // if lpDesktop is not set when launching with a restricted token.
-            // Point explicitly at the interactive desktop or a private desktop.
-            si.StartupInfo.lpDesktop = desktop.startup_info_desktop();
             si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
             si.StartupInfo.hStdInput = stdin_h;
             si.StartupInfo.hStdOutput = stdout_h;
@@ -115,87 +156,50 @@ pub unsafe fn create_process_as_user(
                     ));
                 }
             }
-            let mut attrs = ProcThreadAttributeList::new(/*attr_count*/ 1)?;
             attrs.set_handle_list(inherited_handles)?;
-            si.lpAttributeList = attrs.as_mut_ptr();
-
-            let creation_flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
-            let ok = CreateProcessAsUserW(
-                h_token,
-                std::ptr::null(),
-                cmdline.as_mut_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                1,
-                creation_flags,
-                env_block.as_ptr() as *mut c_void,
-                cwd_wide.as_ptr(),
-                &si.StartupInfo,
-                &mut pi,
-            );
-            if ok == 0 {
-                let err = GetLastError() as i32;
-                let msg = format!(
-                    "CreateProcessAsUserW failed: {} ({}) | cwd={} | cmd={} | env_u16_len={} | si_flags={} | creation_flags={}",
-                    err,
-                    format_last_error(err),
-                    cwd.display(),
-                    cmdline_str,
-                    env_block_len,
-                    si.StartupInfo.dwFlags,
-                    creation_flags,
-                );
-                logging::debug_log(&msg, logs_base_dir);
-                return Err(anyhow!("CreateProcessAsUserW failed: {err}"));
-            }
-            Ok(CreatedProcess {
-                process_info: pi,
-                startup_info: si.StartupInfo,
-                _desktop: desktop,
-            })
         }
         None => {
-            let mut si: STARTUPINFOW = std::mem::zeroed();
-            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-            si.lpDesktop = desktop.startup_info_desktop();
-            ensure_inheritable_stdio(&mut si)?;
-
-            let creation_flags = CREATE_UNICODE_ENVIRONMENT;
-            let ok = CreateProcessAsUserW(
-                h_token,
-                std::ptr::null(),
-                cmdline.as_mut_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                1,
-                creation_flags,
-                env_block.as_ptr() as *mut c_void,
-                cwd_wide.as_ptr(),
-                &si,
-                &mut pi,
-            );
-            if ok == 0 {
-                let err = GetLastError() as i32;
-                let msg = format!(
-                    "CreateProcessAsUserW failed: {} ({}) | cwd={} | cmd={} | env_u16_len={} | si_flags={} | creation_flags={}",
-                    err,
-                    format_last_error(err),
-                    cwd.display(),
-                    cmdline_str,
-                    env_block_len,
-                    si.dwFlags,
-                    creation_flags,
-                );
-                logging::debug_log(&msg, logs_base_dir);
-                return Err(anyhow!("CreateProcessAsUserW failed: {err}"));
-            }
-            Ok(CreatedProcess {
-                process_info: pi,
-                startup_info: si,
-                _desktop: desktop,
-            })
+            ensure_inheritable_stdio(&mut si.StartupInfo)?;
         }
     }
+    si.lpAttributeList = attrs.as_mut_ptr();
+
+    let creation_flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | console_flags;
+    let ok = CreateProcessAsUserW(
+        h_token,
+        std::ptr::null(),
+        cmdline.as_mut_ptr(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        1,
+        creation_flags,
+        env_block.as_ptr() as *mut c_void,
+        cwd_wide.as_ptr(),
+        &si.StartupInfo,
+        &mut pi,
+    );
+    if ok == 0 {
+        let err = GetLastError() as i32;
+        let msg = format!(
+            "CreateProcessAsUserW failed: {} ({}) | cwd={} | cmd={} | env_u16_len={} | si_flags={} | creation_flags={}",
+            err,
+            format_last_error(err),
+            cwd.display(),
+            cmdline_str,
+            env_block_len,
+            si.StartupInfo.dwFlags,
+            creation_flags,
+        );
+        logging::debug_log(&msg, logs_base_dir);
+        return Err(std::io::Error::from_raw_os_error(err)).context(msg);
+    }
+
+    Ok(CreatedProcess {
+        process_info: pi,
+        startup_info: si.StartupInfo,
+        job,
+        _desktop: desktop,
+    })
 }
 
 /// Controls whether the child's stdin handle is kept open for writing.
@@ -216,30 +220,39 @@ pub enum StderrMode {
 #[allow(dead_code)]
 pub struct PipeSpawnHandles {
     pub process: PROCESS_INFORMATION,
+    job: Arc<JobObject>,
     pub stdin_write: Option<HANDLE>,
     pub stdout_read: HANDLE,
     pub stderr_read: Option<HANDLE>,
     pub(crate) desktop: LaunchDesktop,
 }
 
+impl PipeSpawnHandles {
+    /// Returns the Job Object containing the spawned process.
+    pub fn job(&self) -> Arc<JobObject> {
+        Arc::clone(&self.job)
+    }
+}
+
 /// Spawns a process with anonymous pipes and returns the relevant handles.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_process_with_pipes(
-    h_token: HANDLE,
+    h_token: BorrowedHandle<'_>,
     argv: &[String],
     cwd: &Path,
     env_map: &HashMap<String, String>,
     stdin_mode: StdinMode,
     stderr_mode: StderrMode,
-    use_private_desktop: bool,
+    console_mode: ConsoleMode,
+    desktop: LaunchDesktop,
     logs_base_dir: Option<&Path>,
 ) -> Result<PipeSpawnHandles> {
-    let mut in_r: HANDLE = 0;
-    let mut in_w: HANDLE = 0;
-    let mut out_r: HANDLE = 0;
-    let mut out_w: HANDLE = 0;
-    let mut err_r: HANDLE = 0;
-    let mut err_w: HANDLE = 0;
+    let mut in_r: HANDLE = std::ptr::null_mut();
+    let mut in_w: HANDLE = std::ptr::null_mut();
+    let mut out_r: HANDLE = std::ptr::null_mut();
+    let mut out_w: HANDLE = std::ptr::null_mut();
+    let mut err_r: HANDLE = std::ptr::null_mut();
+    let mut err_w: HANDLE = std::ptr::null_mut();
     unsafe {
         if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
             return Err(anyhow!("CreatePipe stdin failed: {}", GetLastError()));
@@ -268,13 +281,14 @@ pub fn spawn_process_with_pipes(
     let stdio = Some((in_r, out_w, stderr_handle));
     let spawn_result = unsafe {
         create_process_as_user(
-            h_token,
+            h_token.as_raw_handle(),
             argv,
             cwd,
             env_map,
             logs_base_dir,
             stdio,
-            use_private_desktop,
+            console_mode,
+            desktop,
         )
     };
     let created = match spawn_result {
@@ -295,6 +309,7 @@ pub fn spawn_process_with_pipes(
     };
     let CreatedProcess {
         process_info: pi,
+        job,
         _desktop: desktop,
         ..
     } = created;
@@ -312,6 +327,7 @@ pub fn spawn_process_with_pipes(
 
     Ok(PipeSpawnHandles {
         process: pi,
+        job,
         stdin_write: match stdin_mode {
             StdinMode::Open => Some(in_w),
             StdinMode::Closed => None,
@@ -325,8 +341,8 @@ pub fn spawn_process_with_pipes(
     })
 }
 
-/// Reads a HANDLE until EOF and invokes `on_chunk` for each read.
-pub fn read_handle_loop<F>(handle: HANDLE, mut on_chunk: F) -> std::thread::JoinHandle<()>
+/// Reads an owned handle until EOF and invokes `on_chunk` for each read.
+pub fn read_handle_loop<F>(handle: OwnedHandle, mut on_chunk: F) -> std::thread::JoinHandle<()>
 where
     F: FnMut(&[u8]) + Send + 'static,
 {
@@ -336,7 +352,7 @@ where
             let mut read_bytes: u32 = 0;
             let ok = unsafe {
                 ReadFile(
-                    handle,
+                    handle.as_raw_handle(),
                     buf.as_mut_ptr(),
                     buf.len() as u32,
                     &mut read_bytes,
@@ -347,9 +363,6 @@ where
                 break;
             }
             on_chunk(&buf[..read_bytes as usize]);
-        }
-        unsafe {
-            CloseHandle(handle);
         }
     })
 }

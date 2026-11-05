@@ -2,6 +2,7 @@
 
 use crate::agent::AgentStatus;
 use crate::agent::agent_resolver::resolve_agent_target;
+use crate::agent::types::AgentMessage;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -11,34 +12,56 @@ use crate::tools::handlers::multi_agents_common::*;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_protocol::AgentPath;
+use codex_protocol::items::CollabAgentTool;
+use codex_protocol::items::CollabAgentToolCallItem;
+use codex_protocol::items::CollabAgentToolCallStatus;
+use codex_protocol::items::SubAgentActivityItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
-use codex_protocol::protocol::CollabAgentInteractionEndEvent;
-use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
-use codex_protocol::protocol::CollabAgentSpawnEndEvent;
-use codex_protocol::protocol::CollabCloseBeginEvent;
-use codex_protocol::protocol::CollabCloseEndEvent;
-use codex_protocol::protocol::CollabWaitingBeginEvent;
-use codex_protocol::protocol::CollabWaitingEndEvent;
-use codex_protocol::user_input::UserInput;
+use codex_protocol::protocol::SubAgentActivityKind;
 use codex_tools::ToolName;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-pub(crate) use close_agent::Handler as CloseAgentHandler;
 pub(crate) use followup_task::Handler as FollowupTaskHandler;
+pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
 pub(crate) use send_message::Handler as SendMessageHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
-mod close_agent;
+mod analytics;
 mod followup_task;
+mod interrupt_agent;
 mod list_agents;
 mod message_tool;
 mod send_message;
 mod spawn;
 pub(crate) mod wait;
+
+pub(crate) async fn emit_sub_agent_activity(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    item: SubAgentActivityItem,
+) {
+    let item = TurnItem::SubAgentActivity(item);
+    session.emit_turn_item_started(turn, &item).await;
+    session.emit_turn_item_completed(turn, item).await;
+}
+
+fn agent_message_from_tool(
+    message: String,
+    source: &crate::tools::context::ToolCallSource,
+) -> AgentMessage {
+    if matches!(
+        source,
+        crate::tools::context::ToolCallSource::DirectPlaintextMessage
+            | crate::tools::context::ToolCallSource::CodeMode { .. }
+    ) {
+        AgentMessage::Plaintext(message)
+    } else {
+        AgentMessage::Encrypted(message)
+    }
+}

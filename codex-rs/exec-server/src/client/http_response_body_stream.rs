@@ -10,20 +10,44 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use codex_http_client::HttpError;
+use codex_http_client::HttpResponse;
 use futures::StreamExt;
-use reqwest::Response;
 use serde_json::Value;
 use serde_json::from_value;
 use tokio::runtime::Handle;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::client::ExecServerError;
 use crate::client::Inner;
 use crate::protocol::HTTP_REQUEST_BODY_DELTA_METHOD;
 use crate::protocol::HttpRequestBodyDeltaNotification;
+use crate::protocol::MAX_HTTP_BODY_DELTA_BYTES;
 use crate::rpc::RpcNotificationSender;
+
+pub(crate) const MAX_QUEUED_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENCODED_HTTP_BODY_DELTA_BYTES: usize = MAX_HTTP_BODY_DELTA_BYTES.div_ceil(3) * 4;
+
+pub(crate) struct QueuedHttpBodyDelta {
+    notification: HttpRequestBodyDeltaNotification,
+    _byte_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedHttpBodyDelta {
+    pub(crate) fn new(
+        notification: HttpRequestBodyDeltaNotification,
+        byte_permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        Self {
+            notification,
+            _byte_permit: byte_permit,
+        }
+    }
+}
 
 pub(super) struct HttpBodyStreamRegistration {
     inner: Arc<Inner>,
@@ -33,13 +57,13 @@ pub(super) struct HttpBodyStreamRegistration {
 
 enum HttpResponseBodyStreamInner {
     Local {
-        body: Pin<Box<dyn futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+        body: Pin<Box<dyn futures::Stream<Item = Result<Bytes, HttpError>> + Send>>,
     },
     Remote {
         inner: Arc<Inner>,
         request_id: String,
         next_seq: u64,
-        rx: mpsc::Receiver<HttpRequestBodyDeltaNotification>,
+        rx: mpsc::Receiver<QueuedHttpBodyDelta>,
         pending_eof: bool,
         closed: bool,
     },
@@ -52,21 +76,42 @@ enum HttpResponseBodyStreamInner {
 /// id until EOF or a terminal error.
 pub struct HttpResponseBodyStream {
     inner: HttpResponseBodyStreamInner,
+    cancellation: Option<CancellationToken>,
 }
 
 impl HttpResponseBodyStream {
-    pub(super) fn local(response: Response) -> Self {
+    /// Creates an in-memory response stream from pre-buffered chunks.
+    ///
+    /// This is useful for [`crate::HttpClient`] implementations that already
+    /// own the response bytes, including lightweight test clients.
+    #[doc(hidden)]
+    pub fn from_chunks(chunks: Vec<Vec<u8>>) -> Self {
+        let body = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<Bytes, HttpError>(chunk.into())),
+        );
+        Self {
+            inner: HttpResponseBodyStreamInner::Local {
+                body: Box::pin(body),
+            },
+            cancellation: None,
+        }
+    }
+
+    pub(super) fn local(response: HttpResponse) -> Self {
         Self {
             inner: HttpResponseBodyStreamInner::Local {
                 body: Box::pin(response.bytes_stream()),
             },
+            cancellation: None,
         }
     }
 
     pub(super) fn remote(
         inner: Arc<Inner>,
         request_id: String,
-        rx: mpsc::Receiver<HttpRequestBodyDeltaNotification>,
+        rx: mpsc::Receiver<QueuedHttpBodyDelta>,
     ) -> Self {
         Self {
             inner: HttpResponseBodyStreamInner::Remote {
@@ -77,7 +122,14 @@ impl HttpResponseBodyStream {
                 pending_eof: false,
                 closed: false,
             },
+            cancellation: None,
         }
+    }
+
+    /// Ends this stream when its owning request authority is revoked.
+    pub fn cancel_on(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
     }
 
     /// Receives the next response-body chunk.
@@ -85,6 +137,17 @@ impl HttpResponseBodyStream {
     /// Returns `Ok(None)` at EOF and converts sequence gaps or stream-side
     /// stream errors into protocol errors.
     pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, ExecServerError> {
+        let Some(cancellation) = self.cancellation.clone() else {
+            return self.recv_inner().await;
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Ok(None),
+            result = self.recv_inner() => result,
+        }
+    }
+
+    async fn recv_inner(&mut self) -> Result<Option<Vec<u8>>, ExecServerError> {
         match &mut self.inner {
             HttpResponseBodyStreamInner::Local { body } => match body.next().await {
                 Some(chunk) => match chunk {
@@ -107,7 +170,11 @@ impl HttpResponseBodyStream {
                     return Ok(None);
                 }
 
-                let Some(delta) = rx.recv().await else {
+                let Some(QueuedHttpBodyDelta {
+                    notification: delta,
+                    ..
+                }) = rx.recv().await
+                else {
                     finish_remote_stream(inner, request_id, closed).await;
                     if let Some(error) = inner.take_http_body_stream_failure(request_id).await {
                         return Err(ExecServerError::Protocol(format!(
@@ -220,7 +287,22 @@ impl Inner {
         &self,
         params: Option<Value>,
     ) -> Result<(), ExecServerError> {
-        let params: HttpRequestBodyDeltaNotification = from_value(params.unwrap_or(Value::Null))?;
+        let params = params.unwrap_or(Value::Null);
+        if params
+            .get("deltaBase64")
+            .and_then(Value::as_str)
+            .is_some_and(|delta| delta.len() > MAX_ENCODED_HTTP_BODY_DELTA_BYTES)
+        {
+            return Err(ExecServerError::Protocol(format!(
+                "http response body delta exceeds {MAX_HTTP_BODY_DELTA_BYTES} bytes"
+            )));
+        }
+        let params: HttpRequestBodyDeltaNotification = from_value(params)?;
+        if params.delta.0.len() > MAX_HTTP_BODY_DELTA_BYTES {
+            return Err(ExecServerError::Protocol(format!(
+                "http response body delta exceeds {MAX_HTTP_BODY_DELTA_BYTES} bytes"
+            )));
+        }
         // Unknown request ids are ignored intentionally: a stream may have already
         // reached EOF and released its route.
         if let Some(tx) = self
@@ -231,7 +313,33 @@ impl Inner {
         {
             let request_id = params.request_id.clone();
             let terminal_delta = params.done || params.error.is_some();
-            match tx.try_send(params) {
+            let queued_bytes = params
+                .delta
+                .0
+                .len()
+                .saturating_add(params.error.as_deref().map_or(0, str::len));
+            let byte_permit = if queued_bytes == 0 {
+                None
+            } else {
+                u32::try_from(queued_bytes).ok().and_then(|queued_bytes| {
+                    Arc::clone(&self.http_body_stream_byte_budget)
+                        .try_acquire_many_owned(queued_bytes)
+                        .ok()
+                })
+            };
+            if queued_bytes > 0 && byte_permit.is_none() {
+                self.record_http_body_stream_failure(
+                    &request_id,
+                    format!("queued body deltas exceed {MAX_QUEUED_HTTP_BODY_BYTES} bytes"),
+                )
+                .await;
+                self.remove_http_body_stream(&request_id).await;
+                debug!(
+                    "closing http response stream `{request_id}` after exhausting the queued byte budget"
+                );
+                return Ok(());
+            }
+            match tx.try_send(QueuedHttpBodyDelta::new(params, byte_permit)) {
                 Ok(()) => {
                     if terminal_delta {
                         self.remove_http_body_stream(&request_id).await;
@@ -265,14 +373,19 @@ impl Inner {
         let streams = streams.as_ref().clone();
         self.http_body_streams.store(Arc::new(HashMap::new()));
         for (request_id, tx) in streams {
+            // Failure notifications must wake every stream even when no
+            // byte-budget permits remain.
             if tx
-                .try_send(HttpRequestBodyDeltaNotification {
-                    request_id: request_id.clone(),
-                    seq: 1,
-                    delta: Vec::new().into(),
-                    done: true,
-                    error: Some(message.clone()),
-                })
+                .try_send(QueuedHttpBodyDelta::new(
+                    HttpRequestBodyDeltaNotification {
+                        request_id: request_id.clone(),
+                        seq: 1,
+                        delta: Vec::new().into(),
+                        done: true,
+                        error: Some(message.clone()),
+                    },
+                    /*byte_permit*/ None,
+                ))
                 .is_err()
             {
                 let mut next_failures = self.http_body_stream_failures.load().as_ref().clone();
@@ -295,7 +408,7 @@ impl Inner {
     pub(super) async fn insert_http_body_stream(
         &self,
         request_id: String,
-        tx: mpsc::Sender<HttpRequestBodyDeltaNotification>,
+        tx: mpsc::Sender<QueuedHttpBodyDelta>,
     ) -> Result<(), ExecServerError> {
         let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
         let streams = self.http_body_streams.load();
@@ -321,7 +434,7 @@ impl Inner {
     pub(super) async fn remove_http_body_stream(
         &self,
         request_id: &str,
-    ) -> Option<mpsc::Sender<HttpRequestBodyDeltaNotification>> {
+    ) -> Option<mpsc::Sender<QueuedHttpBodyDelta>> {
         let _streams_write_guard = self.http_body_streams_write_lock.lock().await;
         let streams = self.http_body_streams.load();
         let stream = streams.get(request_id).cloned();

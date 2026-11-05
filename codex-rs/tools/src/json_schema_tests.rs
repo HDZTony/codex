@@ -2,10 +2,38 @@ use super::AdditionalProperties;
 use super::JsonSchema;
 use super::JsonSchemaPrimitiveType;
 use super::JsonSchemaType;
+use super::parse_catalog_tool_parameters;
 use super::parse_tool_input_schema;
 use super::parse_tool_input_schema_without_compaction;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+
+#[test]
+fn catalog_parameters_preserve_schema_without_normalization() {
+    let parameters = serde_json::json!({
+        "type": "object",
+        "properties": {"paths": {"type": "array"}},
+        "$defs": {"unused": {"type": "string"}}
+    });
+    let parsed = parse_catalog_tool_parameters(&parameters.to_string()).expect("catalog schema");
+    assert_eq!(serde_json::to_value(parsed).unwrap(), parameters);
+}
+
+#[test]
+fn catalog_parameters_reject_invalid_shapes() {
+    for (parameters, reason) in [
+        ("", "schema is not valid JSON"),
+        ("null", "schema must declare an object type"),
+        ("{}", "schema must declare an object type"),
+        (r#"{"type":"array"}"#, "schema must declare an object type"),
+        (
+            r#"{"type":"object","properties":{"text":{"type":"unsupported"}}}"#,
+            "schema uses unsupported JSON Schema structures",
+        ),
+    ] {
+        assert_eq!(parse_catalog_tool_parameters(parameters), Err(reason));
+    }
+}
 
 // Tests in this section exercise normalization transforms that mutate badly
 // formed JSON for consumption by the Responses API.
@@ -479,11 +507,11 @@ fn parse_tool_input_schema_fills_default_properties_for_nullable_object_union() 
     assert_eq!(
         schema,
         JsonSchema {
-            schema_type: Some(JsonSchemaType::Multiple(vec![
+            schema_type: Some(JsonSchemaType::Multiple(Box::new([
                 JsonSchemaPrimitiveType::Object,
                 JsonSchemaPrimitiveType::Null,
-            ])),
-            properties: Some(BTreeMap::new()),
+            ]))),
+            properties: Some(Box::default()),
             ..Default::default()
         }
     );
@@ -507,10 +535,10 @@ fn parse_tool_input_schema_fills_default_items_for_nullable_array_union() {
     assert_eq!(
         schema,
         JsonSchema {
-            schema_type: Some(JsonSchemaType::Multiple(vec![
+            schema_type: Some(JsonSchemaType::Multiple(Box::new([
                 JsonSchemaPrimitiveType::Array,
                 JsonSchemaPrimitiveType::Null,
-            ])),
+            ]))),
             items: Some(Box::new(JsonSchema::string(/*description*/ None))),
             ..Default::default()
         }
@@ -650,11 +678,11 @@ fn parse_tool_input_schema_preserves_nested_nullable_type_union() {
             BTreeMap::from([(
                 "nickname".to_string(),
                 JsonSchema {
-                    schema_type: Some(JsonSchemaType::Multiple(vec![
+                    schema_type: Some(JsonSchemaType::Multiple(Box::new([
                         JsonSchemaPrimitiveType::String,
                         JsonSchemaPrimitiveType::Null,
-                    ])),
-                    description: Some("Optional nickname".to_string()),
+                    ]))),
+                    description: Some("Optional nickname".into()),
                     ..Default::default()
                 },
             )]),
@@ -715,6 +743,109 @@ fn parse_tool_input_schema_preserves_nested_any_of_property() {
 }
 
 #[test]
+fn parse_tool_input_schema_preserves_nested_one_of_property() {
+    // Example schema shape:
+    // {
+    //   "type": "object",
+    //   "properties": {
+    //     "query": {
+    //       "oneOf": [
+    //         { "const": "exact" },
+    //         { "type": "number" }
+    //       ]
+    //     }
+    //   }
+    // }
+    //
+    // Expected normalization behavior:
+    // - The nested `oneOf` is preserved.
+    // - Child variants are recursively sanitized, including `const` to `enum`.
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "oneOf": [
+                    { "const": "exact" },
+                    { "type": "number" }
+                ]
+            }
+        }
+    }))
+    .expect("parse schema");
+
+    assert_eq!(
+        schema,
+        JsonSchema::object(
+            BTreeMap::from([(
+                "query".to_string(),
+                JsonSchema::one_of(
+                    vec![
+                        JsonSchema::string_enum(
+                            vec![serde_json::json!("exact")],
+                            /*description*/ None,
+                        ),
+                        JsonSchema::number(/*description*/ None),
+                    ],
+                    /*description*/ None,
+                ),
+            )]),
+            /*required*/ None,
+            /*additional_properties*/ None
+        )
+    );
+}
+
+#[test]
+fn parse_tool_input_schema_preserves_nested_all_of_property() {
+    // Example schema shape:
+    // {
+    //   "type": "object",
+    //   "properties": {
+    //     "query": {
+    //       "allOf": [
+    //         { "type": "string" },
+    //         { "description": "unrecognized by itself" }
+    //       ]
+    //     }
+    //   }
+    // }
+    //
+    // Expected normalization behavior:
+    // - The nested `allOf` is preserved structurally rather than flattened.
+    // - Child variants are recursively sanitized.
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "allOf": [
+                    { "type": "string" },
+                    { "description": "unrecognized by itself" }
+                ]
+            }
+        }
+    }))
+    .expect("parse schema");
+
+    assert_eq!(
+        schema,
+        JsonSchema::object(
+            BTreeMap::from([(
+                "query".to_string(),
+                JsonSchema::all_of(
+                    vec![
+                        JsonSchema::string(/*description*/ None),
+                        JsonSchema::default(),
+                    ],
+                    /*description*/ None,
+                ),
+            )]),
+            /*required*/ None,
+            /*additional_properties*/ None
+        )
+    );
+}
+
+#[test]
 fn parse_tool_input_schema_preserves_type_unions_without_rewriting_to_any_of() {
     // Example schema shape:
     // {
@@ -734,11 +865,11 @@ fn parse_tool_input_schema_preserves_type_unions_without_rewriting_to_any_of() {
     assert_eq!(
         schema,
         JsonSchema {
-            schema_type: Some(JsonSchemaType::Multiple(vec![
+            schema_type: Some(JsonSchemaType::Multiple(Box::new([
                 JsonSchemaPrimitiveType::String,
                 JsonSchemaPrimitiveType::Null,
-            ])),
-            description: Some("optional string".to_string()),
+            ]))),
+            description: Some("optional string".into()),
             ..Default::default()
         }
     );
@@ -765,16 +896,16 @@ fn parse_tool_input_schema_preserves_explicit_enum_type_union() {
     assert_eq!(
         schema,
         JsonSchema {
-            schema_type: Some(JsonSchemaType::Multiple(vec![
+            schema_type: Some(JsonSchemaType::Multiple(Box::new([
                 JsonSchemaPrimitiveType::String,
                 JsonSchemaPrimitiveType::Null,
-            ])),
-            description: Some("optional response length".to_string()),
-            enum_values: Some(vec![
+            ]))),
+            description: Some("optional response length".into()),
+            enum_values: Some(Box::new([
                 serde_json::json!("short"),
                 serde_json::json!("medium"),
                 serde_json::json!("long"),
-            ]),
+            ])),
             ..Default::default()
         }
     );
@@ -795,7 +926,7 @@ fn many_string_properties(count: usize) -> serde_json::Map<String, serde_json::V
 fn parse_large_tool_input_schema_compacts_descriptions_only_on_default_path() {
     let input_schema = serde_json::json!({
         "type": "object",
-        "description": "x".repeat(4_500),
+        "description": "x".repeat(5_500),
         "properties": {
             "metadata": {
                 "$ref": "#/$defs/metadata"
@@ -832,7 +963,7 @@ fn parse_large_tool_input_schema_compacts_descriptions_only_on_default_path() {
         serde_json::to_value(schema).expect("serialize schema"),
         serde_json::json!({
             "type": "object",
-            "description": "x".repeat(4_500),
+            "description": "x".repeat(5_500),
             "properties": {
                 "metadata": {
                     "$ref": "#/$defs/metadata"
@@ -861,7 +992,7 @@ fn parse_large_tool_input_schema_ignores_dropped_metadata_for_budget() {
                         "type": "object",
                         "examples": [
                             {
-                                "payload": "x".repeat(4_500)
+                                "payload": "x".repeat(5_500)
                             }
                         ],
                         "properties": {
@@ -904,7 +1035,7 @@ fn parse_large_tool_input_schema_ignores_dropped_metadata_for_budget() {
 fn parse_large_tool_input_schema_stops_after_dropping_root_definitions_when_under_budget() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
-        "description": "x".repeat(4_500),
+        "description": "x".repeat(5_500),
         "properties": {
             "event": {
                 "type": "object",
@@ -964,7 +1095,7 @@ fn parse_large_tool_input_schema_stops_after_dropping_root_definitions_when_unde
 fn parse_large_tool_input_schema_strips_descriptions_without_removing_description_property() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
-        "description": "x".repeat(4_500),
+        "description": "x".repeat(5_500),
         "properties": {
             "description": {
                 "type": "string",
@@ -1057,10 +1188,81 @@ fn parse_large_tool_input_schema_strips_descriptions_without_removing_descriptio
 }
 
 #[test]
+fn parse_large_tool_input_schema_prunes_compositions_as_last_resort() {
+    for composition_key in super::COMPOSITION_SCHEMA_KEYS {
+        let variants = vec![
+            serde_json::json!({
+                "type": "string",
+                "enum": ["first ".repeat(400)]
+            }),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["second ".repeat(400)]
+            }),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["third ".repeat(400)]
+            }),
+        ];
+
+        let mut choice = serde_json::Map::new();
+        choice.insert(
+            composition_key.to_string(),
+            serde_json::Value::Array(variants),
+        );
+        let schema = parse_tool_input_schema(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "choice": choice
+            }
+        }))
+        .expect("parse schema");
+
+        assert_eq!(
+            serde_json::to_value(schema).expect("serialize schema"),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "choice": {}
+                }
+            })
+        );
+    }
+}
+
+#[test]
+fn parse_large_tool_input_schema_prunes_single_composition_variant_if_still_over_budget() {
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "choice": {
+                "anyOf": [
+                    {
+                        "type": "string",
+                        "enum": ["x".repeat(5_500)]
+                    }
+                ]
+            }
+        }
+    }))
+    .expect("parse schema");
+
+    assert_eq!(
+        serde_json::to_value(schema).expect("serialize schema"),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "choice": {}
+            }
+        })
+    );
+}
+
+#[test]
 fn parse_large_tool_input_schema_preserves_object_enum_literal_descriptions() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
-        "description": "x".repeat(4_500),
+        "description": "x".repeat(5_500),
         "properties": {
             "choice": {
                 "enum": [
@@ -1094,92 +1296,6 @@ fn parse_large_tool_input_schema_preserves_object_enum_literal_descriptions() {
                             "description": "second literal",
                             "id": 2
                         }
-                    ]
-                }
-            }
-        })
-    );
-}
-
-#[test]
-fn collapse_deep_schema_objects_traverses_schema_children() {
-    let mut schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "object_parent": {
-                "type": "object",
-                "properties": {
-                    "complex": {
-                        "type": "object",
-                        "properties": {
-                            "leaf": { "type": "string" }
-                        }
-                    },
-                    "scalar": {
-                        "type": "string"
-                    }
-                }
-            },
-            "array_parent": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "leaf": { "type": "string" }
-                    }
-                }
-            },
-            "map_parent": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": "object",
-                    "properties": {
-                        "leaf": { "type": "string" }
-                    }
-                }
-            },
-            "union_parent": {
-                "anyOf": [
-                    {
-                        "type": "object",
-                        "properties": {
-                            "leaf": { "type": "string" }
-                        }
-                    },
-                    { "type": "string" }
-                ]
-            }
-        }
-    });
-
-    super::collapse_deep_schema_objects(&mut schema, /*depth*/ 0);
-
-    assert_eq!(
-        schema,
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "object_parent": {
-                    "type": "object",
-                    "properties": {
-                        "complex": {},
-                        "scalar": {
-                            "type": "string"
-                        }
-                    }
-                },
-                "array_parent": {
-                    "type": "array",
-                    "items": {}
-                },
-                "map_parent": {
-                    "type": "object",
-                    "additionalProperties": {}
-                },
-                "union_parent": {
-                    "anyOf": [
-                        {},
-                        { "type": "string" }
                     ]
                 }
             }
@@ -1294,14 +1410,14 @@ fn parse_tool_input_schema_preserves_refs_and_prunes_unreachable_defs() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([(
+            properties: Some(Box::new(BTreeMap::from([(
                 "user".to_string(),
                 JsonSchema {
-                    schema_ref: Some("#/$defs/User".to_string()),
+                    schema_ref: Some("#/$defs/User".into()),
                     ..Default::default()
                 },
-            )])),
-            defs: Some(BTreeMap::from([(
+            )]))),
+            defs: Some(Box::new(BTreeMap::from([(
                 "User".to_string(),
                 JsonSchema::object(
                     BTreeMap::from([(
@@ -1311,7 +1427,7 @@ fn parse_tool_input_schema_preserves_refs_and_prunes_unreachable_defs() {
                     /*required*/ None,
                     /*additional_properties*/ None,
                 ),
-            )])),
+            )]))),
             ..Default::default()
         }
     );
@@ -1349,17 +1465,17 @@ fn parse_tool_input_schema_preserves_refs_from_properties_named_def_tables() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([(
+            properties: Some(Box::new(BTreeMap::from([(
                 "$defs".to_string(),
                 JsonSchema {
-                    schema_ref: Some("#/$defs/User".to_string()),
+                    schema_ref: Some("#/$defs/User".into()),
                     ..Default::default()
                 },
-            )])),
-            defs: Some(BTreeMap::from([(
+            )]))),
+            defs: Some(Box::new(BTreeMap::from([(
                 "User".to_string(),
                 JsonSchema::string(/*description*/ None),
-            )])),
+            )]))),
             ..Default::default()
         }
     );
@@ -1383,10 +1499,24 @@ fn parse_tool_input_schema_collects_refs_from_schema_child_keywords() {
                     {"$ref": "#/$defs/Choice"},
                     {"type": "string"}
                 ]
+            },
+            "exclusive_choice": {
+                "oneOf": [
+                    {"$ref": "#/$defs/ExclusiveChoice"},
+                    {"type": "integer"}
+                ]
+            },
+            "combined": {
+                "allOf": [
+                    {"$ref": "#/$defs/Combined"},
+                    {"type": "object"}
+                ]
             }
         },
         "$defs": {
+            "Combined": {"type": "object"},
             "Choice": {"type": "boolean"},
+            "ExclusiveChoice": {"type": "null"},
             "Extra": {"type": "number"},
             "Item": {"type": "string"},
             "Unused": {"type": "null"}
@@ -1405,6 +1535,18 @@ fn parse_tool_input_schema_collects_refs_from_schema_child_keywords() {
                         {"type": "string"}
                     ]
                 },
+                "combined": {
+                    "allOf": [
+                        {"$ref": "#/$defs/Combined"},
+                        {"type": "object", "properties": {}}
+                    ]
+                },
+                "exclusive_choice": {
+                    "oneOf": [
+                        {"$ref": "#/$defs/ExclusiveChoice"},
+                        {"type": "integer"}
+                    ]
+                },
                 "items_holder": {
                     "type": "array",
                     "items": {"$ref": "#/$defs/Item"}
@@ -1416,7 +1558,9 @@ fn parse_tool_input_schema_collects_refs_from_schema_child_keywords() {
                 }
             },
             "$defs": {
+                "Combined": {"type": "object", "properties": {}},
                 "Choice": {"type": "boolean"},
+                "ExclusiveChoice": {"type": "null"},
                 "Extra": {"type": "number"},
                 "Item": {"type": "string"}
             }
@@ -1462,27 +1606,27 @@ fn parse_tool_input_schema_handles_cyclic_local_refs() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([(
+            properties: Some(Box::new(BTreeMap::from([(
                 "node".to_string(),
                 JsonSchema {
-                    schema_ref: Some("#/$defs/Node".to_string()),
+                    schema_ref: Some("#/$defs/Node".into()),
                     ..Default::default()
                 },
-            )])),
-            defs: Some(BTreeMap::from([(
+            )]))),
+            defs: Some(Box::new(BTreeMap::from([(
                 "Node".to_string(),
                 JsonSchema::object(
                     BTreeMap::from([(
                         "next".to_string(),
                         JsonSchema {
-                            schema_ref: Some("#/$defs/Node".to_string()),
+                            schema_ref: Some("#/$defs/Node".into()),
                             ..Default::default()
                         },
                     )]),
                     /*required*/ None,
                     /*additional_properties*/ None,
                 ),
-            )])),
+            )]))),
             ..Default::default()
         }
     );
@@ -1531,14 +1675,14 @@ fn parse_tool_input_schema_preserves_legacy_definitions() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([(
+            properties: Some(Box::new(BTreeMap::from([(
                 "user".to_string(),
                 JsonSchema {
-                    schema_ref: Some("#/definitions/User".to_string()),
+                    schema_ref: Some("#/definitions/User".into()),
                     ..Default::default()
                 },
-            )])),
-            definitions: Some(BTreeMap::from([
+            )]))),
+            definitions: Some(Box::new(BTreeMap::from([
                 (
                     "Profile".to_string(),
                     JsonSchema::object(
@@ -1556,7 +1700,7 @@ fn parse_tool_input_schema_preserves_legacy_definitions() {
                         BTreeMap::from([(
                             "profile".to_string(),
                             JsonSchema {
-                                schema_ref: Some("#/definitions/Profile".to_string()),
+                                schema_ref: Some("#/definitions/Profile".into()),
                                 ..Default::default()
                             },
                         )]),
@@ -1564,7 +1708,7 @@ fn parse_tool_input_schema_preserves_legacy_definitions() {
                         /*additional_properties*/ None,
                     ),
                 ),
-            ])),
+            ]))),
             ..Default::default()
         }
     );
@@ -1602,22 +1746,22 @@ fn parse_tool_input_schema_preserves_unresolved_and_external_refs() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([
+            properties: Some(Box::new(BTreeMap::from([
                 (
                     "missing".to_string(),
                     JsonSchema {
-                        schema_ref: Some("#/$defs/Missing".to_string()),
+                        schema_ref: Some("#/$defs/Missing".into()),
                         ..Default::default()
                     },
                 ),
                 (
                     "remote".to_string(),
                     JsonSchema {
-                        schema_ref: Some("https://example.com/schema.json".to_string()),
+                        schema_ref: Some("https://example.com/schema.json".into()),
                         ..Default::default()
                     },
                 ),
-            ])),
+            ]))),
             ..Default::default()
         }
     );
@@ -1662,14 +1806,14 @@ fn parse_tool_input_schema_preserves_nested_defs_ref_parent() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([(
+            properties: Some(Box::new(BTreeMap::from([(
                 "name".to_string(),
                 JsonSchema {
-                    schema_ref: Some("#/$defs/User/properties/name".to_string()),
+                    schema_ref: Some("#/$defs/User/properties/name".into()),
                     ..Default::default()
                 },
-            )])),
-            defs: Some(BTreeMap::from([(
+            )]))),
+            defs: Some(Box::new(BTreeMap::from([(
                 "User".to_string(),
                 JsonSchema::object(
                     BTreeMap::from([(
@@ -1679,7 +1823,7 @@ fn parse_tool_input_schema_preserves_nested_defs_ref_parent() {
                     /*required*/ None,
                     /*additional_properties*/ None,
                 ),
-            )])),
+            )]))),
             ..Default::default()
         }
     );
@@ -1724,23 +1868,23 @@ fn parse_tool_input_schema_preserves_percent_encoded_definition_refs() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([
+            properties: Some(Box::new(BTreeMap::from([
                 (
                     "profile".to_string(),
                     JsonSchema {
-                        schema_ref: Some("#/%24defs/Profile%7E0Name".to_string()),
+                        schema_ref: Some("#/%24defs/Profile%7E0Name".into()),
                         ..Default::default()
                     },
                 ),
                 (
                     "user".to_string(),
                     JsonSchema {
-                        schema_ref: Some("#/$defs/User%20Name".to_string()),
+                        schema_ref: Some("#/$defs/User%20Name".into()),
                         ..Default::default()
                     },
                 ),
-            ])),
-            defs: Some(BTreeMap::from([
+            ]))),
+            defs: Some(Box::new(BTreeMap::from([
                 (
                     "Profile~Name".to_string(),
                     JsonSchema::string(/*description*/ None),
@@ -1749,7 +1893,7 @@ fn parse_tool_input_schema_preserves_percent_encoded_definition_refs() {
                     "User Name".to_string(),
                     JsonSchema::string(/*description*/ None),
                 ),
-            ])),
+            ]))),
             ..Default::default()
         }
     );
@@ -1780,13 +1924,13 @@ fn parse_tool_input_schema_drops_malformed_definition_tables() {
         schema,
         JsonSchema {
             schema_type: Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object)),
-            properties: Some(BTreeMap::from([(
+            properties: Some(Box::new(BTreeMap::from([(
                 "user".to_string(),
                 JsonSchema {
-                    schema_ref: Some("#/$defs/User".to_string()),
+                    schema_ref: Some("#/$defs/User".into()),
                     ..Default::default()
                 },
-            )])),
+            )]))),
             ..Default::default()
         }
     );

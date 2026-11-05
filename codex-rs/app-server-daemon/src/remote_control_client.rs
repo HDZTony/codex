@@ -8,9 +8,15 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
+use codex_app_server_protocol::RemoteControlDisableParams;
+use codex_app_server_protocol::RemoteControlDisableResponse;
+use codex_app_server_protocol::RemoteControlEnableParams;
 use codex_app_server_protocol::RemoteControlEnableResponse;
+use codex_app_server_protocol::RemoteControlPairingStartParams;
+use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol::RequestId;
+use serde::de::DeserializeOwned;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::time::Instant;
@@ -22,11 +28,69 @@ use crate::RemoteControlReadyStatus;
 use crate::client;
 
 const REMOTE_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(10);
-const REMOTE_CONTROL_ENABLE_REQUEST_ID: RequestId = RequestId::Integer(2);
+// Allow the daemon's 30-second pairing request to finish and return its response.
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(35);
+const REMOTE_CONTROL_REQUEST_ID: RequestId = RequestId::Integer(2);
+const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
+
+enum RemoteControlRpcResponse<T> {
+    Success(T),
+    InvalidParams,
+}
 
 pub(crate) async fn enable_remote_control(socket_path: &Path) -> Result<RemoteControlReadyStatus> {
     let mut websocket = client::connect(socket_path).await?;
     enable_remote_control_with_timeout(&mut websocket, REMOTE_CONTROL_READY_TIMEOUT).await
+}
+
+pub(crate) async fn disable_remote_control(socket_path: &Path) -> Result<RemoteControlReadyStatus> {
+    let mut websocket = client::connect(socket_path).await?;
+    initialize_client(&mut websocket).await?;
+    let params = serde_json::to_value(RemoteControlDisableParams { ephemeral: true })?;
+    let response: RemoteControlDisableResponse = request_remote_control_with_legacy_fallback(
+        &mut websocket,
+        "remoteControl/disable",
+        params,
+    )
+    .await?;
+    websocket.close(None).await.ok();
+    Ok(RemoteControlReadyStatus::from(response))
+}
+
+pub(crate) async fn start_pairing(socket_path: &Path) -> Result<RemoteControlPairingStartResponse> {
+    timeout(PAIRING_TIMEOUT, start_pairing_inner(socket_path))
+        .await
+        .context("timed out waiting for remoteControl/pairing/start response")?
+}
+
+async fn start_pairing_inner(socket_path: &Path) -> Result<RemoteControlPairingStartResponse> {
+    let mut websocket = client::connect(socket_path).await?;
+    initialize_client(&mut websocket).await?;
+    let params = serde_json::to_value(RemoteControlPairingStartParams { manual_code: true })?;
+    send_remote_control_request(
+        &mut websocket,
+        REMOTE_CONTROL_REQUEST_ID.clone(),
+        "remoteControl/pairing/start",
+        Some(params),
+    )
+    .await?;
+    let response = match read_remote_control_response(
+        &mut websocket,
+        &REMOTE_CONTROL_REQUEST_ID,
+        "remoteControl/pairing/start",
+        /*message_timeout*/ None,
+    )
+    .await?
+    {
+        RemoteControlRpcResponse::Success(response) => response,
+        RemoteControlRpcResponse::InvalidParams => {
+            return Err(anyhow!(
+                "remoteControl/pairing/start rejected manual pairing parameters"
+            ));
+        }
+    };
+    websocket.close(None).await.ok();
+    Ok(response)
 }
 
 pub(crate) async fn enable_remote_control_with_connect_retry(
@@ -46,6 +110,26 @@ async fn enable_remote_control_with_timeout<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    initialize_client(websocket).await?;
+
+    let response: RemoteControlEnableResponse = request_remote_control_with_legacy_fallback(
+        websocket,
+        "remoteControl/enable",
+        serde_json::to_value(RemoteControlEnableParams { ephemeral: true })?,
+    )
+    .await?;
+    let mut latest = RemoteControlReadyStatus::from(response);
+    if latest.status == RemoteControlConnectionStatus::Connecting {
+        latest = wait_for_remote_control_status(websocket, latest, ready_timeout).await?;
+    }
+    websocket.close(None).await.ok();
+    Ok(latest)
+}
+
+async fn initialize_client<S>(websocket: &mut WebSocketStream<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     client::initialize(websocket, /*experimental_api*/ true).await?;
     let initialized = JSONRPCMessage::Notification(JSONRPCNotification {
         method: "initialized".to_string(),
@@ -53,24 +137,78 @@ where
     });
     client::send_message(websocket, &initialized)
         .await
-        .context("failed to send initialized notification")?;
+        .context("failed to send initialized notification")
+}
 
-    let enable = JSONRPCMessage::Request(JSONRPCRequest {
-        id: REMOTE_CONTROL_ENABLE_REQUEST_ID,
-        method: "remoteControl/enable".to_string(),
-        params: None,
+async fn send_remote_control_request<S>(
+    websocket: &mut WebSocketStream<S>,
+    request_id: RequestId,
+    method: &str,
+    params: Option<serde_json::Value>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = JSONRPCMessage::Request(JSONRPCRequest {
+        id: request_id,
+        method: method.to_string(),
+        params,
         trace: None,
     });
-    client::send_message(websocket, &enable)
+    client::send_message(websocket, &request)
         .await
-        .context("failed to send remoteControl/enable request")?;
+        .with_context(|| format!("failed to send {method} request"))
+}
 
-    let mut latest = read_enable_response(websocket).await?;
-    if latest.status == RemoteControlConnectionStatus::Connecting {
-        latest = wait_for_remote_control_status(websocket, latest, ready_timeout).await?;
+async fn request_remote_control_with_legacy_fallback<S, T>(
+    websocket: &mut WebSocketStream<S>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: DeserializeOwned,
+{
+    send_remote_control_request(
+        websocket,
+        REMOTE_CONTROL_REQUEST_ID.clone(),
+        method,
+        Some(params),
+    )
+    .await?;
+    let message_timeout = Some(client::CONTROL_SOCKET_RESPONSE_TIMEOUT);
+    match read_remote_control_response(
+        websocket,
+        &REMOTE_CONTROL_REQUEST_ID,
+        method,
+        message_timeout,
+    )
+    .await?
+    {
+        RemoteControlRpcResponse::Success(response) => Ok(response),
+        RemoteControlRpcResponse::InvalidParams => {
+            send_remote_control_request(
+                websocket,
+                REMOTE_CONTROL_REQUEST_ID.clone(),
+                method,
+                /*params*/ None,
+            )
+            .await?;
+            match read_remote_control_response(
+                websocket,
+                &REMOTE_CONTROL_REQUEST_ID,
+                method,
+                message_timeout,
+            )
+            .await?
+            {
+                RemoteControlRpcResponse::Success(response) => Ok(response),
+                RemoteControlRpcResponse::InvalidParams => {
+                    Err(anyhow!("{method} rejected legacy params"))
+                }
+            }
+        }
     }
-    websocket.close(None).await.ok();
-    Ok(latest)
 }
 
 async fn connect_with_retry(
@@ -97,33 +235,38 @@ async fn connect_with_retry(
     }
 }
 
-async fn read_enable_response<S>(
+async fn read_remote_control_response<S, T>(
     websocket: &mut WebSocketStream<S>,
-) -> Result<RemoteControlReadyStatus>
+    request_id: &RequestId,
+    method: &str,
+    message_timeout: Option<Duration>,
+) -> Result<RemoteControlRpcResponse<T>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    T: DeserializeOwned,
 {
     loop {
-        let message = timeout(
-            client::CONTROL_SOCKET_RESPONSE_TIMEOUT,
-            client::read_message(websocket),
-        )
-        .await
-        .context("timed out waiting for remoteControl/enable response")??;
+        let read = client::read_message(websocket);
+        let message = if let Some(duration) = message_timeout {
+            timeout(duration, read)
+                .await
+                .with_context(|| format!("timed out waiting for {method} response"))??
+        } else {
+            read.await?
+        };
         match message {
-            JSONRPCMessage::Response(response)
-                if response.id == REMOTE_CONTROL_ENABLE_REQUEST_ID =>
-            {
-                let response =
-                    serde_json::from_value::<RemoteControlEnableResponse>(response.result)
-                        .context("failed to parse remoteControl/enable response")?;
-                return Ok(RemoteControlReadyStatus::from(response));
+            JSONRPCMessage::Response(response) if response.id == *request_id => {
+                let response = serde_json::from_value::<T>(response.result)
+                    .with_context(|| format!("failed to parse {method} response"))?;
+                return Ok(RemoteControlRpcResponse::Success(response));
             }
-            JSONRPCMessage::Error(err) if err.id == REMOTE_CONTROL_ENABLE_REQUEST_ID => {
-                return Err(anyhow!(
-                    "remoteControl/enable failed: {}",
-                    err.error.message
-                ));
+            JSONRPCMessage::Error(err)
+                if err.id == *request_id && err.error.code == INVALID_PARAMS_ERROR_CODE =>
+            {
+                return Ok(RemoteControlRpcResponse::InvalidParams);
+            }
+            JSONRPCMessage::Error(err) if err.id == *request_id => {
+                return Err(anyhow!("{method} failed: {}", err.error.message));
             }
             JSONRPCMessage::Notification(notification)
                 if remote_control_status_notification(&notification).is_some() =>
@@ -196,6 +339,23 @@ impl From<RemoteControlEnableResponse> for RemoteControlReadyStatus {
     }
 }
 
+impl From<RemoteControlDisableResponse> for RemoteControlReadyStatus {
+    fn from(response: RemoteControlDisableResponse) -> Self {
+        let RemoteControlDisableResponse {
+            status,
+            server_name,
+            installation_id: _,
+            environment_id,
+        } = response;
+        Self {
+            status,
+            server_name,
+            environment_id,
+            timed_out: false,
+        }
+    }
+}
+
 impl From<RemoteControlStatusChangedNotification> for RemoteControlReadyStatus {
     fn from(notification: RemoteControlStatusChangedNotification) -> Self {
         let RemoteControlStatusChangedNotification {
@@ -216,6 +376,8 @@ impl From<RemoteControlStatusChangedNotification> for RemoteControlReadyStatus {
 #[cfg(all(test, unix))]
 mod tests {
     use anyhow::Result;
+    use codex_app_server_protocol::JSONRPCError;
+    use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_uds::UnixListener;
     use pretty_assertions::assert_eq;
@@ -243,6 +405,7 @@ mod tests {
             ),
             after_enable_notification: None,
             ready_timeout: Duration::from_millis(20),
+            reject_ephemeral_params: false,
         })
         .await?;
 
@@ -271,6 +434,7 @@ mod tests {
                 Some("env_test"),
             )),
             ready_timeout: Duration::from_secs(1),
+            reject_ephemeral_params: false,
         })
         .await?;
 
@@ -296,6 +460,7 @@ mod tests {
             ),
             after_enable_notification: None,
             ready_timeout: Duration::from_millis(20),
+            reject_ephemeral_params: false,
         })
         .await?;
 
@@ -321,6 +486,7 @@ mod tests {
             ),
             after_enable_notification: None,
             ready_timeout: Duration::from_millis(20),
+            reject_ephemeral_params: false,
         })
         .await?;
 
@@ -336,11 +502,191 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn enable_remote_control_retries_without_params_for_older_servers() -> Result<()> {
+        let status = run_enable_remote_control_scenario(EnableScenario {
+            initial_notification: None,
+            enable_response: remote_control_status(
+                RemoteControlConnectionStatus::Connected,
+                Some("env_test"),
+            ),
+            after_enable_notification: None,
+            ready_timeout: Duration::from_millis(20),
+            reject_ephemeral_params: true,
+        })
+        .await?;
+
+        assert_eq!(
+            status,
+            RemoteControlReadyStatus {
+                status: RemoteControlConnectionStatus::Connected,
+                server_name: TEST_SERVER_NAME.to_string(),
+                environment_id: Some("env_test".to_string()),
+                timed_out: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disable_remote_control_retries_without_params_for_older_servers() -> Result<()> {
+        let dir = TempDir::new()?;
+        let socket_path = dir.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).await?;
+        let server_task = tokio::spawn(async move {
+            let mut websocket = accept_initialized_client(listener).await?;
+            let disable = client::read_message(&mut websocket).await?;
+            let JSONRPCMessage::Request(disable) = disable else {
+                panic!("expected remoteControl/disable request");
+            };
+            assert_eq!(disable.id, REMOTE_CONTROL_REQUEST_ID);
+            assert_eq!(disable.method, "remoteControl/disable");
+            assert_eq!(
+                disable.params,
+                Some(serde_json::json!({ "ephemeral": true }))
+            );
+            client::send_message(
+                &mut websocket,
+                &JSONRPCMessage::Error(JSONRPCError {
+                    id: REMOTE_CONTROL_REQUEST_ID,
+                    error: JSONRPCErrorError {
+                        code: INVALID_PARAMS_ERROR_CODE,
+                        message: "Invalid params".to_string(),
+                        data: None,
+                    },
+                }),
+            )
+            .await?;
+            let fallback = client::read_message(&mut websocket).await?;
+            let JSONRPCMessage::Request(fallback) = fallback else {
+                panic!("expected fallback remoteControl/disable request");
+            };
+            assert_eq!(fallback.id, REMOTE_CONTROL_REQUEST_ID);
+            assert_eq!(fallback.method, "remoteControl/disable");
+            assert_eq!(fallback.params, None);
+            client::send_message(
+                &mut websocket,
+                &JSONRPCMessage::Response(JSONRPCResponse {
+                    id: REMOTE_CONTROL_REQUEST_ID,
+                    result: serde_json::to_value(RemoteControlDisableResponse::from(
+                        remote_control_status(
+                            RemoteControlConnectionStatus::Disabled,
+                            /*environment_id*/ None,
+                        ),
+                    ))?,
+                }),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let status = disable_remote_control(&socket_path).await?;
+        server_task.await??;
+        assert_eq!(
+            status,
+            RemoteControlReadyStatus {
+                status: RemoteControlConnectionStatus::Disabled,
+                server_name: TEST_SERVER_NAME.to_string(),
+                environment_id: None,
+                timed_out: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_pairing_requests_manual_code() -> Result<()> {
+        let dir = TempDir::new()?;
+        let socket_path = dir.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).await?;
+        let server_task = tokio::spawn(async move {
+            let mut websocket = accept_initialized_client(listener).await?;
+            let pairing = client::read_message(&mut websocket).await?;
+            let JSONRPCMessage::Request(pairing) = pairing else {
+                panic!("expected remoteControl/pairing/start request");
+            };
+            assert_eq!(pairing.id, REMOTE_CONTROL_REQUEST_ID);
+            assert_eq!(pairing.method, "remoteControl/pairing/start");
+            assert_eq!(
+                pairing.params,
+                Some(serde_json::json!({ "manualCode": true }))
+            );
+            // Use virtual time only for the reply delay, after the socket handshake.
+            tokio::time::pause();
+            sleep(Duration::from_secs(3)).await;
+            tokio::time::resume();
+            client::send_message(
+                &mut websocket,
+                &JSONRPCMessage::Response(JSONRPCResponse {
+                    id: REMOTE_CONTROL_REQUEST_ID,
+                    result: serde_json::to_value(RemoteControlPairingStartResponse {
+                        pairing_code: "pairing-code".to_string(),
+                        manual_pairing_code: Some("ABCD-EFGH".to_string()),
+                        environment_id: "env_test".to_string(),
+                        expires_at: 1_700_000_000,
+                    })?,
+                }),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let response = start_pairing(&socket_path).await?;
+        server_task.await??;
+        assert_eq!(
+            response,
+            RemoteControlPairingStartResponse {
+                pairing_code: "pairing-code".to_string(),
+                manual_pairing_code: Some("ABCD-EFGH".to_string()),
+                environment_id: "env_test".to_string(),
+                expires_at: 1_700_000_000,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pairing_notification_does_not_extend_the_response_deadline() -> Result<()> {
+        let dir = TempDir::new()?;
+        let socket_path = dir.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).await?;
+        let server_task = tokio::spawn(async move {
+            let mut websocket = accept_initialized_client(listener).await?;
+            client::read_message(&mut websocket).await?;
+
+            tokio::time::pause();
+            sleep(Duration::from_secs(20)).await;
+            send_remote_control_status(
+                &mut websocket,
+                remote_control_status(
+                    RemoteControlConnectionStatus::Connecting,
+                    /*environment_id*/ None,
+                ),
+            )
+            .await?;
+            // With a fresh timeout after the notification, the client would see EOF at 40s.
+            sleep(Duration::from_secs(20)).await;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let start = Instant::now();
+        let error = start_pairing(&socket_path).await.unwrap_err();
+        let elapsed = start.elapsed();
+        server_task.await??;
+        assert!(error.is::<tokio::time::error::Elapsed>(), "{error:#}");
+        assert!(
+            (Duration::from_secs(30)..Duration::from_secs(40)).contains(&elapsed),
+            "pairing timed out after {elapsed:?}"
+        );
+        Ok(())
+    }
+
     struct EnableScenario {
         initial_notification: Option<RemoteControlStatusChangedNotification>,
         enable_response: RemoteControlStatusChangedNotification,
         after_enable_notification: Option<RemoteControlStatusChangedNotification>,
         ready_timeout: Duration,
+        reject_ephemeral_params: bool,
     }
 
     async fn run_enable_remote_control_scenario(
@@ -359,12 +705,70 @@ mod tests {
     }
 
     async fn serve_enable_remote_control_scenario(
-        mut listener: UnixListener,
+        listener: UnixListener,
         scenario: EnableScenario,
     ) -> Result<()> {
+        let mut websocket = accept_initialized_client(listener).await?;
+        if let Some(status) = scenario.initial_notification {
+            send_remote_control_status(&mut websocket, status).await?;
+        }
+
+        let enable = client::read_message(&mut websocket).await?;
+        let JSONRPCMessage::Request(enable) = enable else {
+            panic!("expected remoteControl/enable request");
+        };
+        assert_eq!(enable.id, REMOTE_CONTROL_REQUEST_ID);
+        assert_eq!(enable.method, "remoteControl/enable");
+        assert_eq!(
+            enable.params,
+            Some(serde_json::json!({ "ephemeral": true }))
+        );
+        if scenario.reject_ephemeral_params {
+            client::send_message(
+                &mut websocket,
+                &JSONRPCMessage::Error(JSONRPCError {
+                    id: REMOTE_CONTROL_REQUEST_ID,
+                    error: JSONRPCErrorError {
+                        code: INVALID_PARAMS_ERROR_CODE,
+                        message: "Invalid params".to_string(),
+                        data: None,
+                    },
+                }),
+            )
+            .await?;
+            let fallback = client::read_message(&mut websocket).await?;
+            let JSONRPCMessage::Request(fallback) = fallback else {
+                panic!("expected fallback remoteControl/enable request");
+            };
+            assert_eq!(fallback.id, REMOTE_CONTROL_REQUEST_ID);
+            assert_eq!(fallback.method, "remoteControl/enable");
+            assert_eq!(fallback.params, None);
+        }
+        client::send_message(
+            &mut websocket,
+            &JSONRPCMessage::Response(JSONRPCResponse {
+                id: REMOTE_CONTROL_REQUEST_ID,
+                result: serde_json::to_value(RemoteControlEnableResponse::from(
+                    scenario.enable_response,
+                ))?,
+            }),
+        )
+        .await?;
+
+        if let Some(status) = scenario.after_enable_notification {
+            send_remote_control_status(&mut websocket, status).await?;
+        } else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        Ok(())
+    }
+
+    async fn accept_initialized_client(
+        mut listener: UnixListener,
+    ) -> Result<WebSocketStream<codex_uds::UnixStream>> {
         let stream = listener.accept().await?;
         let mut websocket = accept_async(stream).await?;
-
         let initialize = client::read_message(&mut websocket).await?;
         let JSONRPCMessage::Request(initialize) = initialize else {
             panic!("expected initialize request");
@@ -397,35 +801,7 @@ mod tests {
             panic!("expected initialized notification");
         };
         assert_eq!(initialized.method, "initialized");
-
-        if let Some(status) = scenario.initial_notification {
-            send_remote_control_status(&mut websocket, status).await?;
-        }
-
-        let enable = client::read_message(&mut websocket).await?;
-        let JSONRPCMessage::Request(enable) = enable else {
-            panic!("expected remoteControl/enable request");
-        };
-        assert_eq!(enable.id, REMOTE_CONTROL_ENABLE_REQUEST_ID);
-        assert_eq!(enable.method, "remoteControl/enable");
-        client::send_message(
-            &mut websocket,
-            &JSONRPCMessage::Response(JSONRPCResponse {
-                id: REMOTE_CONTROL_ENABLE_REQUEST_ID,
-                result: serde_json::to_value(RemoteControlEnableResponse::from(
-                    scenario.enable_response,
-                ))?,
-            }),
-        )
-        .await?;
-
-        if let Some(status) = scenario.after_enable_notification {
-            send_remote_control_status(&mut websocket, status).await?;
-        } else {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        Ok(())
+        Ok(websocket)
     }
 
     async fn send_remote_control_status<S>(

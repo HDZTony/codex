@@ -2,6 +2,7 @@
 """Format repository sources or check that they are already formatted."""
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -11,14 +12,12 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CODEX_RS_ROOT = REPO_ROOT / "codex-rs"
 
 
 @dataclass(frozen=True)
 class Command:
     args: tuple[str, ...]
     cwd: Path = REPO_ROOT
-    discard_stderr: bool = False
 
 
 @dataclass(frozen=True)
@@ -34,114 +33,162 @@ class FormatterResult:
     returncode: int
 
 
-def formatter_groups(*, check: bool) -> tuple[FormatterGroup, ...]:
-    just_args = ["just", "--unstable", "--fmt"]
-    cargo_args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
-    # Use an unpinned overlay so Ruff is available without syncing project
-    # dependencies. Each `--project` still retains its local configuration context.
-    sdk_uv_run_args = [
+def just_formatter_group(*, check: bool) -> FormatterGroup:
+    args = ["just", "--unstable", "--fmt"]
+    if check:
+        args.append("--check")
+    return FormatterGroup("Just", (Command(tuple(args)),))
+
+
+def rust_formatter_group(*, check: bool) -> FormatterGroup:
+    rust_workspace = REPO_ROOT / "codex-rs"
+    repository_files = subprocess.check_output(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.rs",
+        ],
+        cwd=REPO_ROOT,
+    ).split(b"\0")
+    rust_files = sorted(
+        os.path.relpath(REPO_ROOT / os.fsdecode(encoded_path), rust_workspace)
+        for encoded_path in repository_files
+        if encoded_path and (REPO_ROOT / os.fsdecode(encoded_path)).is_file()
+    )
+    # Git supplies every source file, including files Cargo cannot discover.
+    # Do not recursively format child modules again or include ignored files.
+    args = [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--config-path",
+        str(rust_workspace / "rustfmt.toml"),
+        "--config",
+        "imports_granularity=Item,skip_children=true",
+    ]
+    if check:
+        args.append("--check")
+    # Batch relative paths to stay below Windows command-line limits.
+    commands = tuple(
+        Command(tuple(args + rust_files[start : start + 64]), rust_workspace)
+        for start in range(0, len(rust_files), 64)
+    )
+    return FormatterGroup("Rust", commands)
+
+
+def buildifier_formatter_group(*, check: bool) -> FormatterGroup:
+    repository_files = subprocess.check_output(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=REPO_ROOT,
+    ).split(b"\0")
+    buildifier_files: list[str] = []
+    for encoded_path in repository_files:
+        if not encoded_path:
+            continue
+        path = Path(os.fsdecode(encoded_path))
+        name = path.name
+        if (
+            name in {"BUILD", "WORKSPACE", "MODULE.bazel"}
+            or name.startswith(("BUILD.", "WORKSPACE."))
+            or name.endswith((".BUILD.bazel", ".MODULE.bazel", ".bzl", ".sky"))
+            or ".bzl." in name
+            or ".sky." in name
+        ):
+            buildifier_files.append(path.as_posix())
+    buildifier_files.sort()
+
+    # Invoke DotSlash explicitly because Windows does not honor shebangs.
+    buildifier_args = [
+        "dotslash",
+        str(REPO_ROOT / "tools" / "buildifier"),
+        "-mode=check" if check else "-mode=fix",
+        "-lint=off",
+        *buildifier_files,
+    ]
+    return FormatterGroup("Bazel/Starlark", (Command(tuple(buildifier_args)),))
+
+
+def python_sdk_formatter_group(*, check: bool) -> FormatterGroup:
+    # Each `--project` retains its local dependency and Ruff configuration context.
+    uv_run_args = [
         "uv",
         "run",
         "--frozen",
         "--project",
         "sdk/python",
-        "--no-sync",
-        "--with",
-        "ruff",
+        "--only-group",
+        "format",
     ]
-    scripts_uv_run_args = [
-        "uv",
-        "run",
-        "--frozen",
-        "--project",
-        "scripts",
-        "--no-sync",
-        "--with",
-        "ruff",
-    ]
-    sdk_format_args = [
-        *sdk_uv_run_args,
+    format_args = [
+        *uv_run_args,
         "ruff",
         "format",
     ]
-    scripts_format_args = [
-        *scripts_uv_run_args,
-        "ruff",
-        "format",
-    ]
-
     if check:
-        just_args.append("--check")
-        cargo_args.append("--check")
-        sdk_format_args.append("--check")
-        scripts_format_args.append("--check")
+        format_args.append("--check")
         # `ruff check --diff` reports lint-driven rewrites without changing files.
         # It is the check-mode counterpart of `--fix --fix-only`, not a full lint gate.
-        sdk_lint_args = ["ruff", "check", "--diff"]
+        lint_args = ["ruff", "check", "--diff"]
     else:
         # Ruff's lint fixer and formatter are separate passes: the first applies
         # fixable lint rewrites, while the second formats source layout.
-        sdk_lint_args = ["ruff", "check", "--fix", "--fix-only"]
+        lint_args = ["ruff", "check", "--fix", "--fix-only"]
 
+    return FormatterGroup(
+        "Python SDK",
+        (
+            Command((*uv_run_args, *lint_args, "sdk/python")),
+            Command((*format_args, "sdk/python")),
+        ),
+    )
+
+
+def python_scripts_formatter_group(*, check: bool) -> FormatterGroup:
+    args = ["uv", "run", "--frozen", "--project", "scripts", "ruff", "format"]
+    if check:
+        args.append("--check")
+    args.append(".")
+    return FormatterGroup("Python scripts", (Command(tuple(args)),))
+
+
+def formatter_groups(*, check: bool) -> tuple[FormatterGroup, ...]:
     return (
-        FormatterGroup("Just", (Command(tuple(just_args)),)),
-        FormatterGroup(
-            "Rust",
-            # Stable rustfmt repeats a nightly-only `imports_granularity` warning
-            # for each crate, so suppress that expected stderr noise.
-            (Command(tuple(cargo_args), CODEX_RS_ROOT, discard_stderr=True),),
-        ),
-        FormatterGroup(
-            "Python SDK",
-            (
-                Command(
-                    (
-                        *sdk_uv_run_args,
-                        *sdk_lint_args,
-                        "sdk/python",
-                    )
-                ),
-                Command((*sdk_format_args, "sdk/python")),
-            ),
-        ),
-        FormatterGroup(
-            "Python scripts",
-            (
-                # The SDK and internal scripts intentionally use separate project
-                # roots so uv and Ruff retain each project's configuration context.
-                Command((*scripts_format_args, "scripts")),
-            ),
-        ),
+        just_formatter_group(check=check),
+        rust_formatter_group(check=check),
+        buildifier_formatter_group(check=check),
+        python_sdk_formatter_group(check=check),
+        python_scripts_formatter_group(check=check),
     )
 
 
 def run_formatter_group(group: FormatterGroup) -> FormatterResult:
     """Run one formatter group sequentially and return its buffered output."""
-    output: list[str] = []
     for command in group.commands:
-        output.append(f"$ {shlex.join(command.args)}\n")
         try:
             process = subprocess.run(
                 command.args,
                 cwd=command.cwd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-                if command.discard_stderr
-                else subprocess.STDOUT,
+                stderr=subprocess.STDOUT,
                 text=True,
                 check=False,
             )
         except OSError as error:
-            output.append(f"{error}\n")
-            return FormatterResult(group.name, "".join(output), 1)
+            output = f"$ {shlex.join(command.args)}\n{error}\n"
+            return FormatterResult(group.name, output, 1)
 
-        output.append(process.stdout)
-        if process.stdout and not process.stdout.endswith("\n"):
-            output.append("\n")
         if process.returncode != 0:
-            return FormatterResult(group.name, "".join(output), process.returncode)
+            output = f"$ {shlex.join(command.args)}\n{process.stdout}"
+            if process.stdout and not process.stdout.endswith("\n"):
+                output += "\n"
+            return FormatterResult(group.name, output, process.returncode)
 
-    return FormatterResult(group.name, "".join(output), 0)
+    return FormatterResult(group.name, "", 0)
 
 
 def main() -> int:
@@ -156,16 +203,13 @@ def main() -> int:
 
     failures: list[str] = []
     with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-        futures = {}
-        for group in groups:
-            print(f"Starting {group.name} formatter...", flush=True)
-            futures[executor.submit(run_formatter_group, group)] = group.name
+        futures = [executor.submit(run_formatter_group, group) for group in groups]
         for future in as_completed(futures):
             result = future.result()
-            print(f"==> {result.name} formatter finished")
-            print(result.output, end="")
             if result.returncode != 0:
                 failures.append(result.name)
+                print(f"==> {result.name} formatter failed", file=sys.stderr)
+                print(result.output, end="", file=sys.stderr)
 
     if failures:
         print(f"Formatting failed: {', '.join(failures)}", file=sys.stderr)

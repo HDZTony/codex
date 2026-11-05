@@ -1,10 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
-    "AbsolutePathBuf": {
-      "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
-      "type": "string"
-    },
     "AdditionalFileSystemPermissions": {
       "properties": {
         "entries": {
@@ -27,7 +23,7 @@
         "read": {
           "description": "This will be removed in favor of `entries`.",
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/LegacyAppPathString"
           },
           "type": [
             "array",
@@ -37,7 +33,7 @@
         "write": {
           "description": "This will be removed in favor of `entries`.",
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/LegacyAppPathString"
           },
           "type": [
             "array",
@@ -164,7 +160,7 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "type": {
               "enum": [
@@ -342,10 +338,29 @@
         }
       ]
     },
+    "CommandExecutionApprovalKind": {
+      "description": "Distinguishes a command approval from input sent to an existing terminal.",
+      "oneOf": [
+        {
+          "enum": [
+            "command",
+            "writeStdin"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A managed checkpoint requiring a fresh human decision. Only `accept`, `decline`, and `cancel` are valid. Requires the `requiredHumanApproval` initialize capability. This prompt does not itself start a command execution item.",
+          "enum": [
+            "humanCommand"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "CommandExecutionRequestApprovalParams": {
       "properties": {
         "approvalId": {
-          "description": "Unique identifier for this specific approval callback.\n\nFor regular shell/unified_exec approvals, this is null.\n\nFor zsh-exec-bridge subcommand approvals, multiple callbacks can belong to one parent `itemId`, so `approvalId` is a distinct opaque callback id (a UUID) used to disambiguate routing.",
+          "description": "Unique identifier for this specific approval callback.\n\nFor regular shell/unified_exec approvals, this is null.\n\nFor zsh-exec-bridge subcommand approvals, multiple callbacks can belong to one parent `itemId`, so `approvalId` is a distinct opaque callback id (a UUID) used to disambiguate routing. Stdin approvals also use a distinct callback id; inspect `kind` to distinguish them.",
           "type": [
             "string",
             "null"
@@ -371,7 +386,7 @@
         "cwd": {
           "anyOf": [
             {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             {
               "type": "null"
@@ -379,8 +394,25 @@
           ],
           "description": "The command's working directory."
         },
+        "environmentId": {
+          "default": null,
+          "description": "Environment in which the command will run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "itemId": {
           "type": "string"
+        },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CommandExecutionApprovalKind"
+            }
+          ],
+          "default": "command",
+          "description": "Kind of action under review. Defaults to `command` for older servers."
         },
         "networkApprovalContext": {
           "anyOf": [
@@ -640,7 +672,7 @@
         {
           "properties": {
             "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "type": {
               "enum": [
@@ -755,9 +787,13 @@
               "type": "string"
             },
             "subpath": {
-              "type": [
-                "string",
-                "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           },
@@ -809,9 +845,13 @@
               "type": "string"
             },
             "subpath": {
-              "type": [
-                "string",
-                "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           },
@@ -822,6 +862,9 @@
           "type": "object"
         }
       ]
+    },
+    "LegacyAppPathString": {
+      "type": "string"
     },
     "McpElicitationArrayType": {
       "enum": [
@@ -1382,6 +1425,48 @@
         {
           "properties": {
             "_meta": true,
+            "message": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "openai/form"
+              ],
+              "type": "string"
+            },
+            "requestedSchema": true
+          },
+          "required": [
+            "message",
+            "mode",
+            "requestedSchema"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "_meta": true,
+            "message": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "openaiForm"
+              ],
+              "type": "string"
+            },
+            "requestedSchema": true
+          },
+          "required": [
+            "message",
+            "mode",
+            "requestedSchema"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "_meta": true,
             "elicitationId": {
               "type": "string"
             },
@@ -1588,13 +1673,13 @@
     "PermissionsRequestApprovalParams": {
       "properties": {
         "cwd": {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "$ref": "#/definitions/LegacyAppPathString"
         },
         "environmentId": {
           "default": null,
           "type": [
-            "null",
-            "string"
+            "string",
+            "null"
           ]
         },
         "itemId": {
@@ -1690,6 +1775,19 @@
     "ToolRequestUserInputParams": {
       "description": "EXPERIMENTAL. Params sent with a request_user_input event.",
       "properties": {
+        "autoResolutionMs": {
+          "default": null,
+          "description": "@deprecated Use `isBlocking` to decide whether the request should block.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "isBlocking": {
+          "type": "boolean"
+        },
         "itemId": {
           "type": "string"
         },
@@ -1707,6 +1805,7 @@
         }
       },
       "required": [
+        "isBlocking",
         "itemId",
         "questions",
         "threadId",

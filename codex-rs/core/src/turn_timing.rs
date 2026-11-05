@@ -1,9 +1,15 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use codex_analytics::TurnProfile;
+use codex_direct_tool_timing::DirectToolTimings;
 use codex_otel::TURN_TTFM_DURATION_METRIC;
+use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use tokio::sync::Mutex;
@@ -11,6 +17,49 @@ use tokio::sync::Mutex;
 use crate::ResponseEvent;
 use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
+use codex_direct_tool_timing::ToolBatchTiming;
+use codex_utils_critical_path::CriticalPath;
+use codex_utils_critical_path::WorkKind;
+
+// Reuse the finalized analytics counters instead of counting sampled child spans.
+// Recovery can complete the same turn ID again, so consumers must retain the
+// completion event's trace and timestamp rather than deduplicating by turn alone.
+pub(crate) fn record_terminal_turn_profile(
+    thread_id: ThreadId,
+    turn: &TurnContext,
+    profile: &TurnProfile,
+) {
+    if !matches!(
+        profile.critical_path,
+        codex_analytics::TurnCriticalPath::Disabled
+    ) {
+        turn.turn_timing_state
+            .critical_path_metrics
+            .get_or_init(|| {
+                report::record_turn_profile_metrics(turn, profile);
+            });
+    }
+    let times = profile.critical_path.durations();
+    let turn_id = turn.sub_id.as_str();
+    tracing::event!(
+        name: "codex.turn_profile",
+        target: "codex_otel.trace_safe",
+        tracing::Level::INFO,
+        event.name = "codex.turn_profile",
+        conversation.id = %thread_id,
+        turn_id,
+        critical_path_status = profile.critical_path.status(),
+        critical_path_duration_ms = times.map(|t| t.duration_ms),
+        critical_path_inference_ms = times.map(|t| t.inference_ms),
+        critical_path_tools_ms = times.map(|t| t.tools_ms),
+        critical_path_auto_review_ms = times.map(|t| t.auto_review_ms),
+        critical_path_user_wait_ms = times.map(|t| t.user_wait_ms),
+        critical_path_overhead_ms = times.map(|t| t.overhead_ms),
+        critical_path_unknown_ms = times.map(|t| t.unknown_ms),
+        sampling_request_count = profile.sampling_request_count,
+        sampling_retry_count = profile.sampling_retry_count,
+    );
+}
 
 pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent) {
     let Some(duration) = turn_context
@@ -38,25 +87,104 @@ pub(crate) async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &T
 
 #[derive(Debug, Default)]
 pub(crate) struct TurnTimingState {
+    pub(crate) direct_tool_timings: DirectToolTimings,
     state: Mutex<TurnTimingStateInner>,
+    profile: StdMutex<TurnProfileState>,
+    critical_path_metrics: std::sync::OnceLock<()>,
 }
 
 #[derive(Debug, Default)]
 struct TurnTimingStateInner {
+    review_execution: Option<codex_direct_tool_timing::ReviewExecution>,
     started_at: Option<Instant>,
     started_at_unix_secs: Option<i64>,
+    completed_at: Option<(Instant, i64)>,
+    item_started_at_ms: HashMap<String, i64>,
     first_token_at: Option<Instant>,
     first_message_at: Option<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct TurnProfileState {
+    capture_enabled: bool,
+    path: Option<CriticalPath>,
+    tool_dependency: Option<CriticalPath>,
+    started_at: Option<Instant>,
+    last_transition_at: Option<Instant>,
+    active_phase: Option<TurnProfilePhase>,
+    seen_sampling: bool,
+    before_first_sampling: Duration,
+    sampling: Duration,
+    compaction: Duration,
+    between_sampling_overhead: Duration,
+    tool_blocking: Duration,
+    pending_idle_after_sampling: Duration,
+    sampling_request_count: u32,
+    sampling_retry_count: u32,
+    tools_change_count: u32,
+    completed_profile: Option<TurnProfile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnProfilePhase {
+    Sampling,
+    Compaction,
+    ToolBlocking,
+}
+
+#[must_use]
+pub(crate) struct TurnProfileTimingGuard {
+    timing: Arc<TurnTimingState>,
+    phase: TurnProfilePhase,
+    active: bool,
+    tool_batch: Option<ToolBatchTiming>,
+}
+
 impl TurnTimingState {
+    pub(crate) fn enable_critical_path(&self) {
+        let mut state = self.profile_state();
+        if state.completed_profile.is_none() {
+            state.capture_enabled = true;
+            state.path = Some(CriticalPath::default());
+        }
+    }
+
+    pub(crate) fn invalidate_critical_path(&self) {
+        let mut state = self.profile_state();
+        if state.completed_profile.is_none() {
+            state.path = None;
+        }
+    }
+
+    pub(crate) fn snapshot_path(&self, now: Instant) -> Option<CriticalPath> {
+        let state = self.profile_state();
+        if state.completed_profile.is_some() {
+            state.path.clone()
+        } else {
+            state.path_at(now)
+        }
+    }
+
+    pub(crate) async fn observe_review_execution(
+        &self,
+        execution: codex_direct_tool_timing::ReviewExecution,
+    ) {
+        self.state.lock().await.review_execution = Some(execution);
+    }
+
     pub(crate) async fn mark_turn_started(&self, started_at: Instant) -> i64 {
         let started_at_unix_ms = now_unix_timestamp_ms();
         let mut state = self.state.lock().await;
+        if let Some(execution) = &state.review_execution {
+            execution.started(started_at);
+        }
         state.started_at = Some(started_at);
+        state.completed_at = None;
         state.started_at_unix_secs = Some(started_at_unix_ms / 1000);
+        state.item_started_at_ms.clear();
         state.first_token_at = None;
         state.first_message_at = None;
+        self.profile_state().start(started_at);
         started_at_unix_ms
     }
 
@@ -64,13 +192,41 @@ impl TurnTimingState {
         self.state.lock().await.started_at_unix_secs
     }
 
-    pub(crate) async fn completed_at_and_duration_ms(&self) -> (Option<i64>, Option<i64>) {
-        let state = self.state.lock().await;
-        let completed_at = Some(now_unix_timestamp_secs());
-        let duration_ms = state
-            .started_at
-            .map(|started_at| i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
-        (completed_at, duration_ms)
+    pub(crate) async fn record_item_started(&self, item_id: String, started_at_ms: i64) -> i64 {
+        *self
+            .state
+            .lock()
+            .await
+            .item_started_at_ms
+            .entry(item_id)
+            .or_insert(started_at_ms)
+    }
+
+    pub(crate) async fn take_item_started(&self, item_id: &str) -> Option<i64> {
+        self.state.lock().await.item_started_at_ms.remove(item_id)
+    }
+
+    pub(crate) async fn complete_profile_and_duration_ms(
+        &self,
+    ) -> (Option<i64>, Option<i64>, TurnProfile) {
+        let mut state = self.state.lock().await;
+        // Repeated terminal notifications must retain the original measurement window.
+        let (completed_at_instant, completed_at) = *state
+            .completed_at
+            .get_or_insert_with(|| (Instant::now(), now_unix_timestamp_secs()));
+        let duration_ms = state.started_at.map(|started_at| {
+            i64::try_from(
+                completed_at_instant
+                    .saturating_duration_since(started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(i64::MAX)
+        });
+        if let (Some(execution), Some(started_at)) = (&state.review_execution, state.started_at) {
+            execution.completed(started_at, completed_at_instant);
+        }
+        let profile = self.profile_state().complete(completed_at_instant);
+        (Some(completed_at), duration_ms, profile)
     }
 
     pub(crate) async fn time_to_first_token_ms(&self) -> Option<i64> {
@@ -78,6 +234,50 @@ impl TurnTimingState {
         state
             .time_to_first_token()
             .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+    }
+
+    pub(crate) fn begin_sampling(self: &Arc<Self>) -> TurnProfileTimingGuard {
+        let active = self.profile_state().begin_sampling(Instant::now());
+        TurnProfileTimingGuard {
+            timing: Arc::clone(self),
+            phase: TurnProfilePhase::Sampling,
+            active,
+            tool_batch: None,
+        }
+    }
+
+    pub(crate) fn record_sampling_retry(&self) {
+        self.profile_state().record_sampling_retry();
+    }
+
+    pub(crate) fn record_tools_change(&self) {
+        let mut profile = self.profile_state();
+        if profile.completed_profile.is_none() && profile.started_at.is_some() {
+            profile.tools_change_count = profile.tools_change_count.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn begin_compaction(self: &Arc<Self>) -> TurnProfileTimingGuard {
+        let active = self.profile_state().begin_compaction(Instant::now());
+        TurnProfileTimingGuard {
+            timing: Arc::clone(self),
+            phase: TurnProfilePhase::Compaction,
+            active,
+            tool_batch: None,
+        }
+    }
+
+    pub(crate) fn begin_tool_blocking(
+        self: &Arc<Self>,
+        batch: Option<ToolBatchTiming>,
+    ) -> TurnProfileTimingGuard {
+        let active = self.profile_state().begin_tool_blocking(Instant::now());
+        TurnProfileTimingGuard {
+            timing: Arc::clone(self),
+            phase: TurnProfilePhase::ToolBlocking,
+            active,
+            tool_batch: batch,
+        }
     }
 
     pub(crate) async fn record_ttft_for_response_event(
@@ -98,6 +298,27 @@ impl TurnTimingState {
         let mut state = self.state.lock().await;
         state.record_turn_ttfm()
     }
+
+    fn profile_state(&self) -> std::sync::MutexGuard<'_, TurnProfileState> {
+        self.profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for TurnProfileTimingGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.timing.profile_state();
+            if state.completed_profile.is_some() {
+                return;
+            }
+            if let Some(batch) = &self.tool_batch {
+                state.tool_dependency = batch.completed().and_then(|work| work.path);
+            }
+            state.end_phase(Instant::now(), self.phase);
+        }
+    }
 }
 
 fn now_unix_timestamp_secs() -> i64 {
@@ -109,6 +330,166 @@ pub(crate) fn now_unix_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn duration_to_u64_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+impl TurnProfileState {
+    fn start(&mut self, started_at: Instant) {
+        let path = self.path.clone();
+        *self = Self {
+            path,
+            capture_enabled: self.capture_enabled,
+            started_at: Some(started_at),
+            last_transition_at: Some(started_at),
+            ..Self::default()
+        };
+    }
+
+    fn begin_sampling(&mut self, now: Instant) -> bool {
+        if self.completed_profile.is_some()
+            || self.started_at.is_none()
+            || self.active_phase.is_some()
+        {
+            return false;
+        }
+        self.advance(now);
+        if self.seen_sampling {
+            self.between_sampling_overhead += std::mem::take(&mut self.pending_idle_after_sampling);
+        }
+        self.seen_sampling = true;
+        self.active_phase = Some(TurnProfilePhase::Sampling);
+        self.sampling_request_count = self.sampling_request_count.saturating_add(1);
+        true
+    }
+
+    fn record_sampling_retry(&mut self) {
+        if self.completed_profile.is_none() && self.started_at.is_some() {
+            self.sampling_retry_count = self.sampling_retry_count.saturating_add(1);
+        }
+    }
+
+    fn begin_tool_blocking(&mut self, now: Instant) -> bool {
+        if self.completed_profile.is_some()
+            || self.started_at.is_none()
+            || self.active_phase.is_some()
+        {
+            return false;
+        }
+        self.advance(now);
+        self.active_phase = Some(TurnProfilePhase::ToolBlocking);
+        true
+    }
+
+    fn begin_compaction(&mut self, now: Instant) -> bool {
+        if self.completed_profile.is_some()
+            || self.started_at.is_none()
+            || self.active_phase.is_some()
+        {
+            return false;
+        }
+        self.advance(now);
+        self.active_phase = Some(TurnProfilePhase::Compaction);
+        true
+    }
+
+    fn end_phase(&mut self, now: Instant, phase: TurnProfilePhase) {
+        if self.completed_profile.is_some() || self.active_phase != Some(phase) {
+            return;
+        }
+        self.advance(now);
+        self.active_phase = None;
+    }
+
+    fn advance(&mut self, now: Instant) {
+        let Some(previous) = self.last_transition_at.replace(now) else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(previous);
+        self.path = self
+            .path
+            .as_ref()
+            .map(|path| self.extend_path(path.clone(), previous, now));
+        self.tool_dependency = None;
+        match self.active_phase {
+            Some(TurnProfilePhase::Sampling) => self.sampling += elapsed,
+            Some(TurnProfilePhase::Compaction) => self.compaction += elapsed,
+            Some(TurnProfilePhase::ToolBlocking) => self.tool_blocking += elapsed,
+            None if self.seen_sampling => self.pending_idle_after_sampling += elapsed,
+            None => self.before_first_sampling += elapsed,
+        }
+    }
+
+    fn path_at(&self, now: Instant) -> Option<CriticalPath> {
+        let path = self.path.clone()?;
+        Some(self.extend_path(path, self.last_transition_at?, now))
+    }
+
+    fn extend_path(&self, path: CriticalPath, previous: Instant, now: Instant) -> CriticalPath {
+        match self.active_phase {
+            Some(TurnProfilePhase::Sampling) => path.work(previous, now, WorkKind::Sampling),
+            Some(TurnProfilePhase::Compaction) => path.work(previous, now, WorkKind::Compaction),
+            Some(TurnProfilePhase::ToolBlocking) => {
+                let dependency = self
+                    .tool_dependency
+                    .clone()
+                    .unwrap_or_else(|| path.clone().work(previous, now, WorkKind::Unknown));
+                path.join(previous, now, dependency)
+            }
+            None => path.work(previous, now, WorkKind::Overhead),
+        }
+    }
+
+    fn complete(&mut self, now: Instant) -> TurnProfile {
+        if let Some(profile) = self.completed_profile.as_ref() {
+            return profile.clone();
+        }
+        let final_phase = self.active_phase;
+        self.advance(now);
+        let after_last_sampling = if self.seen_sampling {
+            std::mem::take(&mut self.pending_idle_after_sampling)
+        } else {
+            Duration::ZERO
+        };
+
+        let mut profile = TurnProfile {
+            critical_path: report::completed_critical_path(self, now),
+            before_first_sampling_ms: duration_to_u64_ms(self.before_first_sampling),
+            sampling_ms: duration_to_u64_ms(self.sampling),
+            compaction_ms: duration_to_u64_ms(self.compaction),
+            between_sampling_overhead_ms: duration_to_u64_ms(self.between_sampling_overhead),
+            tool_blocking_ms: duration_to_u64_ms(self.tool_blocking),
+            after_last_sampling_ms: duration_to_u64_ms(after_last_sampling),
+            sampling_request_count: self.sampling_request_count,
+            sampling_retry_count: self.sampling_retry_count,
+            tools_change_count: self.tools_change_count,
+        };
+        let total_ms = self
+            .started_at
+            .map(|started_at| duration_to_u64_ms(now.saturating_duration_since(started_at)))
+            .unwrap_or_default();
+        let classified_ms = profile
+            .before_first_sampling_ms
+            .saturating_add(profile.sampling_ms)
+            .saturating_add(profile.compaction_ms)
+            .saturating_add(profile.between_sampling_overhead_ms)
+            .saturating_add(profile.tool_blocking_ms)
+            .saturating_add(profile.after_last_sampling_ms);
+        let rounding_ms = total_ms.saturating_sub(classified_ms);
+        match final_phase {
+            Some(TurnProfilePhase::Sampling) => profile.sampling_ms += rounding_ms,
+            Some(TurnProfilePhase::Compaction) => profile.compaction_ms += rounding_ms,
+            Some(TurnProfilePhase::ToolBlocking) => profile.tool_blocking_ms += rounding_ms,
+            None if self.seen_sampling => profile.after_last_sampling_ms += rounding_ms,
+            None => profile.before_first_sampling_ms += rounding_ms,
+        }
+
+        self.active_phase = None;
+        self.completed_profile = Some(profile.clone());
+        profile
+    }
 }
 
 impl TurnTimingStateInner {
@@ -143,10 +524,14 @@ fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool {
         }
         ResponseEvent::OutputTextDelta(_)
         | ResponseEvent::ReasoningSummaryDelta { .. }
+        | ResponseEvent::ReasoningSummaryDone { .. }
         | ResponseEvent::ReasoningContentDelta { .. } => true,
-        ResponseEvent::Created
+        ResponseEvent::Created { .. }
         | ResponseEvent::ServerModel(_)
         | ResponseEvent::ModelVerifications(_)
+        | ResponseEvent::TurnModerationMetadata(_)
+        | ResponseEvent::GuardianAssessment(_)
+        | ResponseEvent::SafetyBuffering(_)
         | ResponseEvent::ServerReasoningIncluded(_)
         | ResponseEvent::ToolCallInputDelta { .. }
         | ResponseEvent::Completed { .. }
@@ -177,6 +562,7 @@ fn response_item_records_turn_ttft(item: &ResponseItem) -> bool {
                 })
             })
         }
+        ResponseItem::AgentMessage { .. } => false,
         ResponseItem::LocalShellCall { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::CustomToolCall { .. }
@@ -185,13 +571,17 @@ fn response_item_records_turn_ttft(item: &ResponseItem) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::ContextCompaction { .. } => true,
-        ResponseItem::CompactionTrigger => false,
-        ResponseItem::FunctionCallOutput { .. }
+        ResponseItem::ConfigurationUpdate { .. } | ResponseItem::CompactionTrigger { .. } => false,
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::Other => false,
     }
 }
+
+mod report;
+pub(crate) mod review_execution;
 
 #[cfg(test)]
 #[path = "turn_timing_tests.rs"]

@@ -3,6 +3,7 @@ use serde::Serialize;
 
 use crate::payload::RawPayloadId;
 
+use super::AgentPath;
 use super::AgentThreadId;
 use super::CodeCellId;
 use super::CodexTurnId;
@@ -24,6 +25,10 @@ use super::session::ExecutionWindow;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationItem {
     pub item_id: ConversationItemId,
+    /// Original Responses item ID, scoped to this thread. Retained for joining
+    /// history acceptance and exact inference without matching rendered text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_item_id: Option<String>,
     pub thread_id: AgentThreadId,
     /// Runtime activation that first introduced this item locally, when known.
     pub codex_turn_id: Option<CodexTurnId>,
@@ -32,11 +37,23 @@ pub struct ConversationItem {
     /// Codex channel for assistant/tool content, when the item is channel-specific.
     pub channel: Option<ConversationChannel>,
     pub kind: ConversationItemKind,
+    /// Routing metadata carried by a Responses `agent_message` item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_message: Option<AgentMessageMetadata>,
     pub body: ConversationBody,
     /// Protocol/model `call_id` for function/custom tool call and output items.
     pub call_id: Option<ModelVisibleCallId>,
     /// Runtime or control-plane objects that caused this conversation item to exist.
     pub produced_by: Vec<ProducerRef>,
+}
+
+/// Sender and destination identities attached to a model-visible agent message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessageMetadata {
+    /// Agent path that authored the message.
+    pub author: AgentPath,
+    /// Agent path that received the message.
+    pub recipient: AgentPath,
 }
 
 /// Model-visible role assigned to a conversation item.
@@ -121,6 +138,9 @@ pub enum ConversationPart {
     PayloadRef {
         label: String,
         raw_payload_id: RawPayloadId,
+        /// Content identity across snapshots, independent of the containing payload file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_sha256: Option<String>,
     },
 }
 
@@ -173,6 +193,8 @@ pub struct InferenceCall {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
 }

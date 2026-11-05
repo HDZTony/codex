@@ -2,9 +2,10 @@
 
 use std::path::Path;
 
-use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::load_auth_dot_json;
+use codex_protocol::auth::AuthMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalChatgptAuth {
@@ -18,9 +19,13 @@ pub(crate) fn load_local_chatgpt_auth(
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     forced_chatgpt_workspace_id: Option<&[String]>,
 ) -> Result<LocalChatgptAuth, String> {
-    let auth = load_auth_dot_json(codex_home, auth_credentials_store_mode)
-        .map_err(|err| format!("failed to load local auth: {err}"))?
-        .ok_or_else(|| "no local auth available".to_string())?;
+    let auth = load_auth_dot_json(
+        codex_home,
+        auth_credentials_store_mode,
+        AuthKeyringBackendKind::default(),
+    )
+    .map_err(|err| format!("failed to load local auth: {err}"))?
+    .ok_or_else(|| "no local auth available".to_string())?;
     if matches!(auth.auth_mode, Some(AuthMode::ApiKey)) || auth.openai_api_key.is_some() {
         return Err("local auth is not a ChatGPT login".to_string());
     }
@@ -59,11 +64,11 @@ mod tests {
 
     use base64::Engine;
     use chrono::Utc;
-    use codex_app_server_protocol::AuthMode;
     use codex_login::AuthDotJson;
     use codex_login::auth::login_with_chatgpt_auth_tokens;
     use codex_login::save_auth;
     use codex_login::token_data::TokenData;
+    use codex_protocol::auth::AuthMode;
     use pretty_assertions::assert_eq;
     use serde::Serialize;
     use serde_json::json;
@@ -105,13 +110,23 @@ mod tests {
                     .expect("id token should parse"),
                 access_token,
                 refresh_token: "refresh-token".to_string(),
+                oauth_provenance: None,
+                login_owner_id: None,
                 account_id: Some("workspace-1".to_string()),
             }),
             last_refresh: Some(Utc::now()),
             agent_identity: None,
+            personal_access_token: None,
+            bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
-        save_auth(codex_home, &auth, AuthCredentialsStoreMode::File)
-            .expect("chatgpt auth should save");
+        save_auth(
+            codex_home,
+            &auth,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .expect("chatgpt auth should save");
     }
 
     #[test]
@@ -156,8 +171,12 @@ mod tests {
                 tokens: None,
                 last_refresh: None,
                 agent_identity: None,
+                personal_access_token: None,
+                bedrock_api_key: None,
+                bedrock_access_keys: None,
             },
             AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
         )
         .expect("api key auth should save");
 

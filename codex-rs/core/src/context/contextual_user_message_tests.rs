@@ -5,7 +5,9 @@ use crate::context::InternalModelContextFragment;
 use crate::context::SubagentNotification;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -16,11 +18,53 @@ fn detects_environment_context_fragment() {
 }
 
 #[test]
+fn detects_skill_instructions_fragment_case_insensitively() {
+    for text in [
+        "<skill>\n<name>demo</name>\n</skill>",
+        "  <SKILL>\n<name>demo</name>\n</SKILL>  ",
+    ] {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: text.to_string(),
+        }));
+    }
+}
+
+#[test]
 fn detects_agents_instructions_fragment() {
-    assert!(is_contextual_user_fragment(&ContentItem::InputText {
-        text: "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
-            .to_string(),
-    }));
+    for text in [
+        "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",
+    ] {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: text.to_string(),
+        }));
+    }
+}
+
+#[test]
+fn renders_agents_instructions_with_legacy_directory_header() {
+    assert_eq!(
+        UserInstructions {
+            directory: Some("/tmp".to_string()),
+            text: "body".to_string(),
+        }
+        .render()
+        .expect_text(),
+        "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
+    );
+}
+
+#[test]
+fn renders_agents_instructions_without_directory_header() {
+    assert_eq!(
+        UserInstructions {
+            directory: None,
+            text: "body".to_string(),
+        }
+        .render()
+        .expect_text(),
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
+    );
 }
 
 #[test]
@@ -32,18 +76,30 @@ fn detects_subagent_notification_fragment_case_insensitively() {
 
 #[test]
 fn detects_internal_model_context_fragment() {
-    let text = InternalModelContextFragment::new(
-        InternalContextSource::from_static("goal"),
-        "Continue working toward the active thread goal.",
-    )
-    .render();
+    let fragment = InternalModelContextFragment::new(
+        InternalContextSource::from_static("extension"),
+        "Internal steering.",
+    );
+    let text = fragment.render().expect_text();
 
     assert_eq!(
+        fragment.content_kind(),
+        ContentItemKind("extension.internal_context".to_string())
+    );
+    assert_eq!(
         text,
-        "<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"
+        "<codex_internal_context source=\"extension\">\nInternal steering.\n</codex_internal_context>"
     );
     assert!(is_contextual_user_fragment(&ContentItem::InputText {
         text
+    }));
+}
+
+#[test]
+fn detects_recommended_plugins_fragment() {
+    assert!(is_contextual_user_fragment(&ContentItem::InputText {
+        text: "<recommended_plugins>\n- Google Drive (google-drive@openai-curated-remote)\n</recommended_plugins>"
+            .to_string(),
     }));
 }
 
@@ -65,7 +121,7 @@ fn does_not_hide_arbitrary_context_tags() {
 #[test]
 fn rejects_invalid_internal_model_context_source() {
     assert!(!is_contextual_user_fragment(&ContentItem::InputText {
-        text: "<codex_internal_context source=\"Goal\">\nbody\n</codex_internal_context>"
+        text: "<codex_internal_context source=\"Extension\">\nbody\n</codex_internal_context>"
             .to_string(),
     }));
 }
@@ -73,13 +129,13 @@ fn rejects_invalid_internal_model_context_source() {
 #[test]
 fn contextual_user_fragment_is_dyn_compatible() {
     let fragment: Box<dyn ContextualUserFragment> = Box::new(InternalModelContextFragment::new(
-        InternalContextSource::from_static("goal"),
-        "Continue working toward the active thread goal.",
+        InternalContextSource::from_static("extension"),
+        "Internal steering.",
     ));
 
     assert_eq!(
-        fragment.render(),
-        "<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"
+        fragment.render().expect_text(),
+        "<codex_internal_context source=\"extension\">\nInternal steering.\n</codex_internal_context>"
     );
 }
 
@@ -92,10 +148,13 @@ fn ignores_regular_user_text() {
 
 #[test]
 fn detects_hook_prompt_fragment_and_roundtrips_escaping() {
-    let message = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
-        r#"Retry with "waves" & <tides>"#,
-        "hook-run-1",
-    )])
+    let message = build_hook_prompt_message(
+        &[HookPromptFragment::from_single_hook(
+            r#"Retry with "waves" & <tides>"#,
+            "hook-run-1",
+        )],
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+    )
     .expect("hook prompt message");
 
     let ResponseItem::Message { content, .. } = message else {
@@ -118,6 +177,7 @@ fn detects_hook_prompt_fragment_and_roundtrips_escaping() {
         vec![HookPromptFragment {
             text: r#"Retry with "waves" & <tides>"#.to_string(),
             hook_run_id: "hook-run-1".to_string(),
+            metadata: Default::default(),
         }],
     );
     assert!(!text.contains("&quot;waves&quot; & <tides>"));

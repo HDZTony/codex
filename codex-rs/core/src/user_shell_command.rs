@@ -1,5 +1,7 @@
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::ResponseItem;
+#[cfg(test)]
+use codex_protocol_test_support::ContentItemTestExt;
 
 use crate::context::ContextualUserFragment;
 use crate::context::UserShellCommand;
@@ -11,7 +13,10 @@ fn user_shell_command_fragment(
     exec_output: &ExecToolCallOutput,
     turn_context: &TurnContext,
 ) -> UserShellCommand {
-    let output = format_exec_output_str(exec_output, turn_context.truncation_policy);
+    let output = format_exec_output_str(
+        exec_output,
+        turn_context.model_info().truncation_policy.into(),
+    );
     UserShellCommand::new(command, exec_output.exit_code, exec_output.duration, output)
 }
 
@@ -21,7 +26,9 @@ pub fn format_user_shell_command_record(
     exec_output: &ExecToolCallOutput,
     turn_context: &TurnContext,
 ) -> String {
-    user_shell_command_fragment(command, exec_output, turn_context).render()
+    user_shell_command_fragment(command, exec_output, turn_context)
+        .render()
+        .expect_text()
 }
 
 pub fn user_shell_command_record_item(

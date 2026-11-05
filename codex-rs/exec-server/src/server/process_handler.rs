@@ -1,15 +1,22 @@
-use codex_app_server_protocol::JSONRPCErrorError;
+use std::time::Duration;
 
+use crate::process_telemetry::ProcessTelemetry;
+use codex_exec_server_protocol::JSONRPCErrorError;
+
+use crate::ExecServerRuntimeOptions;
 use crate::local_process::LocalProcess;
 use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
+use crate::protocol::SignalParams;
+use crate::protocol::SignalResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
 use crate::protocol::WriteParams;
 use crate::protocol::WriteResponse;
 use crate::rpc::RpcNotificationSender;
+use crate::telemetry::ExecServerTelemetry;
 
 #[derive(Clone)]
 pub(crate) struct ProcessHandler {
@@ -17,9 +24,14 @@ pub(crate) struct ProcessHandler {
 }
 
 impl ProcessHandler {
-    pub(crate) fn new(notifications: RpcNotificationSender) -> Self {
+    pub(crate) fn new(
+        notifications: RpcNotificationSender,
+        telemetry: ExecServerTelemetry,
+        runtime_paths: ExecServerRuntimeOptions,
+        output_retention: Duration,
+    ) -> Self {
         Self {
-            process: LocalProcess::new(notifications),
+            process: LocalProcess::new(notifications, telemetry, runtime_paths, output_retention),
         }
     }
 
@@ -31,8 +43,12 @@ impl ProcessHandler {
         self.process.set_notification_sender(notifications);
     }
 
-    pub(crate) async fn exec(&self, params: ExecParams) -> Result<ExecResponse, JSONRPCErrorError> {
-        self.process.exec(params).await
+    pub(crate) async fn exec(
+        &self,
+        params: ExecParams,
+        telemetry: ProcessTelemetry,
+    ) -> Result<ExecResponse, JSONRPCErrorError> {
+        self.process.exec(params, telemetry).await
     }
 
     pub(crate) async fn exec_read(
@@ -47,6 +63,13 @@ impl ProcessHandler {
         params: WriteParams,
     ) -> Result<WriteResponse, JSONRPCErrorError> {
         self.process.exec_write(params).await
+    }
+
+    pub(crate) async fn signal(
+        &self,
+        params: SignalParams,
+    ) -> Result<SignalResponse, JSONRPCErrorError> {
+        self.process.signal_process(params).await
     }
 
     pub(crate) async fn terminate(

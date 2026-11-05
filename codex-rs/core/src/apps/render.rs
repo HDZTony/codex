@@ -1,11 +1,15 @@
+use crate::connectors::AppInfo;
 use crate::context::AppsInstructions;
 use crate::context::ContextualUserFragment;
-use codex_app_server_protocol::AppInfo;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol_test_support::ContentItemTestExt;
 
 pub(crate) fn render_apps_section(connectors: &[AppInfo]) -> Option<String> {
-    AppsInstructions::from_connectors(connectors).map(|instructions| instructions.render())
+    connectors
+        .iter()
+        .any(|connector| connector.is_accessible && connector.is_enabled)
+        .then(|| AppsInstructions.render().expect_text())
 }
 
 #[cfg(test)]
@@ -19,6 +23,8 @@ mod tests {
             description: None,
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,

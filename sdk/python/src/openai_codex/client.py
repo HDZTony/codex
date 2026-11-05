@@ -1,18 +1,24 @@
 import json
 import os
+import re
 import subprocess
 import threading
 import uuid
+from _thread import LockType
 from collections import deque
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
 from pydantic import BaseModel
 
-from ._message_router import MessageRouter
+from ._goal import _GoalOperationState
+from ._initialize_metadata import _split_user_agent
+from ._message_router import MessageRouter, _TurnSubscription
+from ._runtime_requirements import CheckoutCapabilities, require_runtime_version
 from ._version import __version__ as SDK_VERSION
-from .errors import CodexError, TransportClosedError
+from .errors import CodexError, InvalidRequestError, TransportClosedError
 from .generated.notification_registry import NOTIFICATION_MODELS
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
@@ -22,6 +28,7 @@ from .generated.v2_all import (
     ChatgptLoginAccountResponse,
     GetAccountParams as V2GetAccountParams,
     GetAccountResponse,
+    IdleThreadStatus,
     LoginAccountParams as V2LoginAccountParams,
     LoginAccountResponse,
     LogoutAccountResponse,
@@ -30,6 +37,9 @@ from .generated.v2_all import (
     ThreadCompactStartResponse,
     ThreadForkParams as V2ThreadForkParams,
     ThreadForkResponse,
+    ThreadGoalClearResponse,
+    ThreadGoalSetResponse,
+    ThreadGoalStatus,
     ThreadListParams as V2ThreadListParams,
     ThreadListResponse,
     ThreadReadResponse,
@@ -57,6 +67,18 @@ from .retry import retry_on_overload
 ModelT = TypeVar("ModelT", bound=BaseModel)
 ApprovalHandler = Callable[[str, JsonObject | None], JsonObject]
 RUNTIME_PKG_NAME = "openai-codex-cli-bin"
+_GOAL_START_TIMEOUT_S = 30.0
+
+
+@dataclass(slots=True)
+class _ThreadStartLock:
+    lock: LockType = field(default_factory=threading.Lock)
+    users: int = 0
+
+
+def _active_turn_id_from_error(exc: InvalidRequestError) -> str | None:
+    match = re.search(r" but found `?([^`]+)`?$", exc.message)
+    return match.group(1) if match is not None else None
 
 
 def _params_dict(
@@ -201,10 +223,14 @@ class CodexClient:
         self._approval_handler = approval_handler or self._default_approval_handler
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
+        self._thread_start_locks_guard = threading.Lock()
+        self._thread_start_locks: dict[str, _ThreadStartLock] = {}
         self._router = MessageRouter()
         self._stderr_lines: deque[str] = deque(maxlen=400)
         self._stderr_thread: threading.Thread | None = None
         self._reader_thread: threading.Thread | None = None
+        self._runtime_version: str | None = None
+        self._checkout_capabilities: CheckoutCapabilities | None = None
 
     def __enter__(self) -> "CodexClient":
         self.start()
@@ -234,6 +260,11 @@ class CodexClient:
             env.update(self.config.env)
         _prepend_path_dirs(env, path_dirs)
 
+        if self.config.launch_args_override is None:
+            self._checkout_capabilities = CheckoutCapabilities(
+                command=tuple(args[:-2]), cwd=self.config.cwd, env=env.copy()
+            )
+
         self._proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
@@ -250,6 +281,8 @@ class CodexClient:
         self._start_reader_thread()
 
     def close(self) -> None:
+        self._runtime_version = None
+        self._checkout_capabilities = None
         if self._proc is None:
             return
         proc = self._proc
@@ -269,6 +302,7 @@ class CodexClient:
             self._reader_thread.join(timeout=0.5)
 
     def initialize(self) -> InitializeResponse:
+        self._runtime_version = None
         result = self.request(
             "initialize",
             {
@@ -283,6 +317,10 @@ class CodexClient:
             },
             response_model=InitializeResponse,
         )
+        version = result.serverInfo.version if result.serverInfo is not None else None
+        if not version or not version.strip():
+            _, version = _split_user_agent(result.userAgent or "")
+        self._runtime_version = version.split()[0] if version and version.strip() else None
         self.notify("initialized", None)
         return result
 
@@ -293,6 +331,35 @@ class CodexClient:
         *,
         response_model: type[ModelT],
     ) -> ModelT:
+        runtime_fields = {
+            "turn/start": ("toolOutput", "turnTrigger", "serviceTierForTurn"),
+            "thread/resume": ("excludeTurns",),
+            "thread/fork": ("excludeTurns",),
+        }
+        supplied_fields = [
+            field
+            for field in runtime_fields.get(method, ())
+            if (params or {}).get(field) is not None
+        ]
+        if supplied_fields:
+            try:
+                if self._runtime_version == "0.0.0":
+                    if self._checkout_capabilities is None:
+                        raise ValueError(
+                            "Cannot verify an unversioned CLI with a custom launch command"
+                        )
+                    supported = self._checkout_capabilities.fields[method]
+                    if missing := set(supplied_fields) - supported:
+                        raise ValueError(
+                            f"The checkout does not support {', '.join(sorted(missing))}"
+                        )
+                else:
+                    require_runtime_version(self._runtime_version)
+            except ValueError as exc:
+                raise CodexError(
+                    f"{method} with {', '.join(supplied_fields)}: {exc}. "
+                    "Configure CodexConfig.codex_bin with a supported CLI."
+                ) from exc
         result = self._request_raw(method, params)
         if not isinstance(result, dict):
             raise CodexError(f"{method} response must be a JSON object")
@@ -340,6 +407,9 @@ class CodexClient:
         """Return the next routed notification for the requested login id."""
         return self._router.next_login_notification(login_id)
 
+    def _subscribe_turn_notifications(self, turn_id: str) -> _TurnSubscription:
+        return self._router.subscribe_turn(turn_id)
+
     def register_turn_notifications(self, turn_id: str) -> None:
         """Start routing notifications for one turn into its dedicated queue."""
         self._router.register_turn(turn_id)
@@ -351,6 +421,22 @@ class CodexClient:
     def next_turn_notification(self, turn_id: str) -> Notification:
         """Return the next routed notification for the requested turn id."""
         return self._router.next_turn_notification(turn_id)
+
+    def register_goal_operation(self, thread_id: str) -> _GoalOperationState:
+        """Register a private thread-scoped route for a logical goal turn."""
+        return self._router.register_goal(thread_id)
+
+    def reserve_goal_operation(self, thread_id: str) -> _GoalOperationState:
+        """Reserve a private thread route before replacing its stored goal."""
+        return self._router.reserve_goal(thread_id)
+
+    def unregister_goal_operation(self, state: _GoalOperationState) -> None:
+        """Release routing state for one logical goal turn."""
+        self._router.unregister_goal(state)
+
+    def next_goal_notification(self, state: _GoalOperationState) -> Notification:
+        """Wait for the next notification in a logical goal turn."""
+        return state.next_notification()
 
     def account_login_start(
         self,
@@ -452,6 +538,115 @@ class CodexClient:
             response_model=ThreadCompactStartResponse,
         )
 
+    def thread_goal_clear(self, thread_id: str) -> ThreadGoalClearResponse:
+        """Clear the persisted goal for a thread before replacing it."""
+        return self.request(
+            "thread/goal/clear",
+            {"threadId": thread_id},
+            response_model=ThreadGoalClearResponse,
+        )
+
+    def thread_goal_set(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None = None,
+        status: ThreadGoalStatus | None = None,
+    ) -> ThreadGoalSetResponse:
+        """Create or update the persisted goal for a thread."""
+        payload: JsonObject = {"threadId": thread_id}
+        if objective is not None:
+            payload["objective"] = objective
+        if status is not None:
+            payload["status"] = status.value
+        return self.request(
+            "thread/goal/set",
+            payload,
+            response_model=ThreadGoalSetResponse,
+        )
+
+    def pause_goal(self, thread_id: str) -> ThreadGoalSetResponse:
+        """Pause the active goal used by a logical goal turn."""
+        return self.thread_goal_set(thread_id, status=ThreadGoalStatus.paused)
+
+    def cancel_goal_operation(self, state: _GoalOperationState) -> None:
+        """Best-effort cleanup after a logical goal operation is cancelled."""
+        try:
+            self.pause_goal(state.thread_id)
+        except Exception:
+            pass
+        self._interrupt_goal_operation(state)
+
+    def _interrupt_goal_operation(self, state: _GoalOperationState) -> None:
+        turn_id = state.turn_for_interrupt()
+        if turn_id is None:
+            return
+        try:
+            self.turn_interrupt(state.thread_id, turn_id)
+        except InvalidRequestError as exc:
+            if not exc.message.startswith("expected active turn id"):
+                return
+            next_turn_id = _active_turn_id_from_error(exc) or state.current_turn()
+            if next_turn_id is None or next_turn_id == turn_id:
+                return
+            try:
+                self.turn_interrupt(state.thread_id, next_turn_id)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def start_goal_operation(
+        self,
+        thread_id: str,
+        objective: str,
+    ) -> tuple[_GoalOperationState, str]:
+        """Start a logical goal and wait for its runtime-generated first turn."""
+        with self._thread_start_lock(thread_id):
+            return self._start_goal_operation(thread_id, objective)
+
+    def _start_goal_operation(
+        self,
+        thread_id: str,
+        objective: str,
+    ) -> tuple[_GoalOperationState, str]:
+        thread = self.thread_read(thread_id).thread
+        if not isinstance(thread.status.root, IdleThreadStatus):
+            raise InvalidRequestError(
+                -32600,
+                f"thread must be idle before starting a goal: {thread_id}",
+            )
+        if thread.ephemeral or thread.path is None:
+            raise InvalidRequestError(
+                -32600,
+                f"thread must be persisted before starting a goal: {thread_id}",
+            )
+
+        state = self.reserve_goal_operation(thread_id)
+        activated = False
+        try:
+            self.thread_goal_clear(thread_id)
+            state.activate_turn_routing()
+            self.thread_goal_set(
+                thread_id,
+                objective=objective,
+                status=ThreadGoalStatus.active,
+            )
+            activated = True
+            turn_id = state.wait_for_start(_GOAL_START_TIMEOUT_S)
+            if turn_id is None:
+                raise CodexError(
+                    "timed out waiting for goal turn to start after "
+                    f"{int(_GOAL_START_TIMEOUT_S)} seconds"
+                )
+            return state, turn_id
+        except BaseException as exc:
+            if activated or not isinstance(exc, InvalidRequestError):
+                self.cancel_goal_operation(state)
+            state.finish()
+            self.unregister_goal_operation(state)
+            raise
+
     def turn_start(
         self,
         thread_id: str,
@@ -459,14 +654,49 @@ class CodexClient:
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> TurnStartResponse:
         """Start a turn and register its notification queue as early as possible."""
-        payload = {
-            **_params_dict(params),
-            "threadId": thread_id,
-            "input": self._normalize_input_items(input_items),
-        }
-        started = self.request("turn/start", payload, response_model=TurnStartResponse)
-        self.register_turn_notifications(started.turn.id)
-        return started
+        return self._start_turn(thread_id, input_items, params, for_handle=False)[0]
+
+    def _start_turn(
+        self,
+        thread_id: str,
+        input_items: list[JsonObject] | JsonObject | str,
+        params: V2TurnStartParams | JsonObject | None,
+        for_handle: bool,
+    ) -> tuple[TurnStartResponse, _TurnSubscription | None]:
+        with self._thread_start_lock(thread_id):
+            if self._router.has_goal(thread_id):
+                raise InvalidRequestError(
+                    -32600,
+                    f"thread has an active goal operation: {thread_id}",
+                )
+            payload = {
+                **_params_dict(params),
+                "threadId": thread_id,
+                "input": self._normalize_input_items(input_items),
+            }
+            with self._router.pending_turn(thread_id) as cursors:
+                started = self.request("turn/start", payload, response_model=TurnStartResponse)
+                subscription = self._router.prepare_turn(
+                    started.turn.id, thread_id, cursors, for_handle=for_handle
+                )
+                return started, subscription
+
+    @contextmanager
+    def _thread_start_lock(self, thread_id: str) -> Iterator[None]:
+        with self._thread_start_locks_guard:
+            entry = self._thread_start_locks.get(thread_id)
+            if entry is None:
+                entry = _ThreadStartLock()
+                self._thread_start_locks[thread_id] = entry
+            entry.users += 1
+        try:
+            with entry.lock:
+                yield
+        finally:
+            with self._thread_start_locks_guard:
+                entry.users -= 1
+                if entry.users == 0:
+                    self._thread_start_locks.pop(thread_id, None)
 
     def turn_interrupt(self, thread_id: str, turn_id: str) -> TurnInterruptResponse:
         return self.request(

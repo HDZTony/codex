@@ -1,3 +1,6 @@
+use super::ThreadUsage;
+use crate::JsonSchema;
+use crate::TS;
 use crate::protocol::common::AuthMode;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::account::PlanType;
@@ -7,11 +10,10 @@ use codex_protocol::protocol::RateLimitReachedType as CoreRateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
 use codex_protocol::protocol::SpendControlLimitSnapshot as CoreSpendControlLimitSnapshot;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use ts_rs::TS;
+use std::fmt;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -24,19 +26,45 @@ pub enum Account {
 
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
-    Chatgpt { email: String, plan_type: PlanType },
+    Chatgpt {
+        #[schemars(
+            required,
+            schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+        )]
+        email: Option<String>,
+        plan_type: PlanType,
+        /// Display name of the selected ChatGPT workspace, when available.
+        workspace_name: Option<String>,
+    },
 
     #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
     #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
-    AmazonBedrock {},
+    AmazonBedrock {
+        #[serde(default)]
+        uses_codex_managed_credentials: bool,
+    },
+
+    /// Google Cloud Vertex AI with externally managed credentials.
+    #[serde(rename = "gcp", rename_all = "camelCase")]
+    #[ts(rename = "gcp", rename_all = "camelCase")]
+    Gcp {},
 }
 
 impl From<ProviderAccount> for Account {
     fn from(account: ProviderAccount) -> Self {
         match account {
             ProviderAccount::ApiKey => Self::ApiKey {},
-            ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt { email, plan_type },
-            ProviderAccount::AmazonBedrock => Self::AmazonBedrock {},
+            ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt {
+                email,
+                plan_type,
+                workspace_name: None,
+            },
+            ProviderAccount::AmazonBedrock {
+                uses_codex_managed_credentials,
+            } => Self::AmazonBedrock {
+                uses_codex_managed_credentials,
+            },
+            ProviderAccount::Gcp => Self::Gcp {},
         }
     }
 }
@@ -58,6 +86,11 @@ pub enum LoginAccountParams {
     Chatgpt {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         codex_streamlined_login: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        use_hosted_login_success_page: bool,
+        #[serde(default)]
+        #[ts(optional = nullable)]
+        app_brand: Option<LoginAppBrand>,
     },
     #[serde(rename = "chatgptDeviceCode")]
     #[ts(rename = "chatgptDeviceCode")]
@@ -80,6 +113,32 @@ pub enum LoginAccountParams {
         #[ts(optional = nullable)]
         chatgpt_plan_type: Option<String>,
     },
+    /// [UNSTABLE] Managed Amazon Bedrock login is experimental.
+    #[experimental("account/login/start.amazonBedrock")]
+    #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
+    #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
+    AmazonBedrock { api_key: String, region: String },
+    /// [UNSTABLE] Managed Amazon Bedrock AWS access key login is experimental.
+    #[experimental("account/login/start.amazonBedrockAccessKeys")]
+    #[serde(rename = "amazonBedrockAccessKeys", rename_all = "camelCase")]
+    #[ts(rename = "amazonBedrockAccessKeys", rename_all = "camelCase")]
+    AmazonBedrockAccessKeys {
+        access_key_id: String,
+        secret_access_key: String,
+        #[ts(optional = nullable)]
+        session_token: Option<String>,
+        region: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(rename_all = "lowercase")]
+#[ts(export_to = "v2/")]
+pub enum LoginAppBrand {
+    #[default]
+    Codex,
+    Chatgpt,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -113,6 +172,9 @@ pub enum LoginAccountResponse {
     #[serde(rename = "chatgptAuthTokens", rename_all = "camelCase")]
     #[ts(rename = "chatgptAuthTokens", rename_all = "camelCase")]
     ChatgptAuthTokens {},
+    #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
+    #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
+    AmazonBedrock {},
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -165,8 +227,26 @@ pub struct AccountSessionsLogoutParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AccountSessionsSwitchParams {
+    /// Opaque active-login identifier returned by accountSession/list.
     pub session_id: String,
+    /// Workspace to select within that login; this is not a user identifier.
     pub account_id: String,
+    /// Allow Core to start browser sign-in if this session needs SSO for the workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<bool>")]
+    pub allow_browser_login: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(untagged, rename_all_fields = "camelCase")]
+#[ts(untagged, rename_all_fields = "camelCase", export_to = "v2/")]
+pub enum AccountSessionsSwitchResponse {
+    Switched {
+        #[serde(flatten)]
+        sessions: AccountSessionsResponse,
+    },
+    /// Open the URL and await account/login/completed for this login ID.
+    BrowserLogin { login_id: String, auth_url: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -239,7 +319,7 @@ pub struct ChatgptAuthTokensRefreshParams {
     pub previous_account_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ChatgptAuthTokensRefreshResponse {
@@ -248,14 +328,214 @@ pub struct ChatgptAuthTokensRefreshResponse {
     pub chatgpt_plan_type: Option<String>,
 }
 
+impl fmt::Debug for ChatgptAuthTokensRefreshResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatgptAuthTokensRefreshResponse")
+            .field("access_token", &"<redacted>")
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field("chatgpt_plan_type", &self.chatgpt_plan_type)
+            .finish()
+    }
+}
+
+/// Usage-read capabilities of the requesting client, never inferred from its experiment arm.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GetAccountRateLimitsParams {
+    /// The client supports automatic Luna Reserve fallback. For eligible ChatGPT CLI users,
+    /// allow the backend to record experiment exposure after ordinary usage is blocked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_luna_reserve: bool,
+    /// Skip the separate reset-credit detail lookup for background usage polls. The usage
+    /// response still includes the available count; omitted/false preserves detailed reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclude_reset_credit_details: bool,
+}
+
+pub type NullableGetAccountRateLimitsParams = Option<GetAccountRateLimitsParams>;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GetAccountRateLimitsResponse {
+    /// Backend permission for ordinary included usage, validated against the active account.
+    /// Null means unavailable; clients must not infer recovery from percentages or reset times.
+    pub ordinary_usage_allowed: Option<bool>,
     /// Backward-compatible single-bucket view; mirrors the historical payload.
     pub rate_limits: RateLimitSnapshot,
     /// Multi-bucket view keyed by metered `limit_id` (for example, `codex`).
     pub rate_limits_by_limit_id: Option<HashMap<String, RateLimitSnapshot>>,
+    pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    /// Account associated with this usage snapshot, when supplied by the backend.
+    pub account_id: Option<String>,
+    /// Optional backend-owned banner from the same usage read. Its nested keys retain the
+    /// backend's snake_case contract; an absent banner leaves the client's existing UI unchanged.
+    pub rate_limit_upsell: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct RateLimitResetCreditsSummary {
+    pub available_count: i64,
+    /// Detail rows for available reset credits, when the backend provides them.
+    ///
+    /// `null` means only `availableCount` is known, while an empty array means details were fetched
+    /// and no available credits were returned. The backend may cap this list, so its length can be
+    /// less than `availableCount`.
+    pub credits: Option<Vec<RateLimitResetCredit>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct RateLimitResetCredit {
+    /// Opaque backend identifier for this reset credit.
+    pub id: String,
+    pub reset_type: RateLimitResetType,
+    pub status: RateLimitResetCreditStatus,
+    /// Unix timestamp in seconds when the credit was granted.
+    #[ts(type = "number")]
+    pub granted_at: i64,
+    /// Unix timestamp in seconds when the credit expires, or `null` if it does not expire.
+    #[ts(type = "number | null")]
+    pub expires_at: Option<i64>,
+    /// Backend-provided display title for this credit, or `null` when unavailable.
+    pub title: Option<String>,
+    /// Backend-provided display description for this credit, or `null` when unavailable.
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/", rename_all = "camelCase")]
+pub enum RateLimitResetType {
+    CodexRateLimits,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/", rename_all = "camelCase")]
+pub enum RateLimitResetCreditStatus {
+    Available,
+    Redeeming,
+    Redeemed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ConsumeAccountRateLimitResetCreditParams {
+    /// Identifies one logical reset attempt. A UUID is recommended; reuse the same value when
+    /// retrying that attempt.
+    pub idempotency_key: String,
+    /// Opaque reset-credit identifier to redeem. When omitted, the backend selects the next
+    /// available credit.
+    #[ts(optional = nullable)]
+    pub credit_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ConsumeAccountRateLimitResetCreditResponse {
+    pub outcome: ConsumeAccountRateLimitResetCreditOutcome,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/", rename_all = "camelCase")]
+pub enum ConsumeAccountRateLimitResetCreditOutcome {
+    /// A reset credit was consumed and the eligible rate-limit windows were reset.
+    Reset,
+    /// No current rate-limit window is eligible for a reset.
+    NothingToReset,
+    /// The account has no earned reset credits available.
+    NoCredit,
+    /// The same idempotency key already completed a reset successfully.
+    AlreadyRedeemed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GetAccountTokenUsageParams {
+    /// When present, read estimated usage for this thread instead of account-wide token activity.
+    #[ts(optional = nullable)]
+    pub thread_id: Option<String>,
+}
+
+pub type NullableGetAccountTokenUsageParams = Option<GetAccountTokenUsageParams>;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GetAccountTokenUsageResponse {
+    pub summary: AccountTokenUsageSummary,
+    pub daily_usage_buckets: Option<Vec<AccountTokenUsageDailyBucket>>,
+    /// Estimated usage when a thread was requested and its billing route is available.
+    #[serde(default)]
+    #[ts(optional, as = "Option<Option<ThreadUsage>>")]
+    pub thread_usage: Option<ThreadUsage>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GetWorkspaceMessagesResponse {
+    /// Whether the workspace-message backend route is available for this client.
+    pub feature_enabled: bool,
+    /// Active workspace messages returned by the backend.
+    pub messages: Vec<WorkspaceMessage>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WorkspaceMessage {
+    pub message_id: String,
+    pub message_type: WorkspaceMessageType,
+    pub message_body: String,
+    /// Unix timestamp (in seconds) when the message was created.
+    #[ts(type = "number | null")]
+    pub created_at: Option<i64>,
+    /// Unix timestamp (in seconds) when the message was archived.
+    #[ts(type = "number | null")]
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/", rename_all = "snake_case")]
+pub enum WorkspaceMessageType {
+    Headline,
+    Announcement,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountTokenUsageSummary {
+    pub lifetime_tokens: Option<i64>,
+    pub peak_daily_tokens: Option<i64>,
+    pub longest_running_turn_sec: Option<i64>,
+    pub current_streak_days: Option<i64>,
+    pub longest_streak_days: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountTokenUsageDailyBucket {
+    pub start_date: String,
+    pub tokens: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -301,12 +581,35 @@ pub struct GetAccountParams {
     pub refresh_token: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GetAccountResponse {
     pub account: Option<Account>,
     pub requires_openai_auth: bool,
+    #[experimental("account/read.workspaceRouting")]
+    pub workspace_routing: Option<WorkspaceRouting>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WorkspaceRouting {
+    pub chatgpt_account_id: String,
+    pub backend_origin: String,
+    pub account_routing_override: AccountRoutingOverride,
+}
+
+/// Backend routing policy. Wire values match the accounts/check contract.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/", rename_all = "snake_case")]
+pub enum AccountRoutingOverride {
+    #[serde(rename = "NO_CONSTRAINT")]
+    #[ts(rename = "NO_CONSTRAINT")]
+    NoConstraint,
+    Us,
+    UsCr,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -316,6 +619,62 @@ pub struct AccountUpdatedNotification {
     pub auth_mode: Option<AuthMode>,
     pub plan_type: Option<PlanType>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/", rename_all = "camelCase")]
+pub enum GatewayOAuthStatus {
+    NotReady,
+    Started,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthChangedNotification {
+    /// Authorization handoff, sent only to the connection that started login.
+    pub auth_url: Option<String>,
+    pub provider_id: String,
+    pub status: GatewayOAuthStatus,
+    pub error: Option<String>,
+}
+
+impl std::fmt::Debug for GatewayOAuthChangedNotification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayOAuthChangedNotification")
+            .field("auth_url", &self.auth_url.as_ref().map(|_| "[REDACTED]"))
+            .field("provider_id", &self.provider_id)
+            .field("status", &self.status)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// Current effective gateway policy and credential readiness; never contains credentials.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthReadResponse {
+    pub provider_id: String,
+    pub provider_name: String,
+    /// Whether the selected provider uses gateway OAuth, even when already signed in.
+    pub required: bool,
+    /// Null when the effective provider does not use gateway OAuth.
+    pub status: Option<GatewayOAuthStatus>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthLoginResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthCancelResponse {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -335,10 +694,14 @@ pub struct AccountRateLimitsUpdatedNotification {
 pub struct RateLimitSnapshot {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
+    /// Normal model whose display name and reasoning options describe this quota alias.
+    pub normal_model_slug: Option<String>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
     pub individual_limit: Option<SpendControlLimitSnapshot>,
+    /// Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.
+    pub spend_control_reached: Option<bool>,
     pub plan_type: Option<PlanType>,
     pub rate_limit_reached_type: Option<RateLimitReachedType>,
 }
@@ -348,10 +711,12 @@ impl From<CoreRateLimitSnapshot> for RateLimitSnapshot {
         Self {
             limit_id: value.limit_id,
             limit_name: value.limit_name,
+            normal_model_slug: value.normal_model_slug,
             primary: value.primary.map(RateLimitWindow::from),
             secondary: value.secondary.map(RateLimitWindow::from),
             credits: value.credits.map(CreditsSnapshot::from),
             individual_limit: value.individual_limit.map(SpendControlLimitSnapshot::from),
+            spend_control_reached: value.spend_control_reached,
             plan_type: value.plan_type,
             rate_limit_reached_type: value
                 .rate_limit_reached_type
@@ -482,4 +847,13 @@ pub struct AccountLoginCompletedNotification {
     pub login_id: Option<String>,
     pub success: bool,
     pub error: Option<String>,
+    pub onboarding_entrypoint: Option<DesktopOnboardingEntrypoint>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum DesktopOnboardingEntrypoint {
+    LifeSciences,
 }

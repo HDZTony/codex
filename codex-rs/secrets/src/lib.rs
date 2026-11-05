@@ -17,6 +17,7 @@ mod local;
 mod sanitizer;
 
 pub use local::LocalSecretsBackend;
+pub use local::LocalSecretsNamespace;
 pub use sanitizer::redact_secrets;
 
 const KEYRING_SERVICE: &str = "codex";
@@ -122,6 +123,22 @@ impl SecretsManager {
         Self { backend }
     }
 
+    pub fn new_with_keyring_store_and_namespace(
+        codex_home: PathBuf,
+        backend_kind: SecretsBackendKind,
+        keyring_store: Arc<dyn KeyringStore>,
+        namespace: LocalSecretsNamespace,
+    ) -> Self {
+        let backend: Arc<dyn SecretsBackend> = match backend_kind {
+            SecretsBackendKind::Local => Arc::new(LocalSecretsBackend::new_with_namespace(
+                codex_home,
+                keyring_store,
+                namespace,
+            )),
+        };
+        Self { backend }
+    }
+
     pub fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
         self.backend.set(scope, name, value)
     }
@@ -162,7 +179,9 @@ pub fn environment_id_from_cwd(cwd: &Path) -> String {
     format!("cwd-{short}")
 }
 
-pub(crate) fn compute_keyring_account(codex_home: &Path) -> String {
+/// Computes the OS keyring account name used to store a local namespace's passphrase.
+/// Existing namespaces retain their shared key; gateway credentials use an independent key.
+pub fn compute_keyring_account(codex_home: &Path, namespace: LocalSecretsNamespace) -> String {
     let canonical = codex_home
         .canonicalize()
         .unwrap_or_else(|_| codex_home.to_path_buf())
@@ -173,7 +192,15 @@ pub(crate) fn compute_keyring_account(codex_home: &Path) -> String {
     let digest = hasher.finalize();
     let hex = format!("{digest:x}");
     let short = hex.get(..16).unwrap_or(hex.as_str());
-    format!("secrets|{short}")
+    let home_account = format!("secrets|{short}");
+    // Separate keys also prevent concurrent first writes to the gateway and primary
+    // stores from overwriting each other's newly generated encryption key.
+    match namespace {
+        LocalSecretsNamespace::GatewayOAuth => format!("{home_account}|gateway-oauth"),
+        LocalSecretsNamespace::ManagedSecrets
+        | LocalSecretsNamespace::CodexAuth
+        | LocalSecretsNamespace::McpOAuth => home_account,
+    }
 }
 
 pub(crate) fn keyring_service() -> &'static str {
@@ -183,8 +210,10 @@ pub(crate) fn keyring_service() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local::SECRETS_CACHE_TEST_LOCK;
     use codex_keyring_store::tests::MockKeyringStore;
     use pretty_assertions::assert_eq;
+    use std::sync::PoisonError;
 
     #[test]
     fn environment_id_fallback_has_cwd_prefix() {
@@ -206,6 +235,9 @@ mod tests {
 
     #[test]
     fn manager_round_trips_local_backend() -> Result<()> {
+        let _cache_lock = SECRETS_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
         let manager = SecretsManager::new_with_keyring_store(

@@ -10,6 +10,7 @@ use crate::tools::handlers::tokenjuice_retrieve_spec::create_tokenjuice_retrieve
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolExposure;
+use codex_tools::ToolExecutorFuture;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -63,7 +64,6 @@ impl TokenjuiceRetrieveHandler {
     }
 }
 
-#[async_trait::async_trait]
 impl ToolExecutor<ToolInvocation> for TokenjuiceRetrieveHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(self.name)
@@ -77,7 +77,16 @@ impl ToolExecutor<ToolInvocation> for TokenjuiceRetrieveHandler {
         self.exposure
     }
 
-    async fn handle(
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(async move { self.retrieve(invocation).await })
+    }
+}
+
+impl TokenjuiceRetrieveHandler {
+    async fn retrieve(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {

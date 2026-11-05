@@ -5,12 +5,12 @@ use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::requests::Compression;
-use crate::requests::attach_item_ids;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
 use crate::sse::spawn_response_stream;
 use crate::telemetry::SseTelemetry;
+use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestCompression;
 use codex_client::RequestTelemetry;
@@ -64,7 +64,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         fields(
             transport = "responses_http",
             http.method = "POST",
-            api.path = "responses"
+            api.path = "/responses"
         )
     )]
     pub async fn stream_request(
@@ -80,12 +80,8 @@ impl<T: HttpTransport> ResponsesClient<T> {
             compression,
             turn_state,
         } = options;
-
-        let mut body = serde_json::to_value(&request)
+        let body = EncodedJsonBody::encode(&request)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
-        if request.store && self.session.provider().is_azure_responses_endpoint() {
-            attach_item_ids(&mut body, &request.input);
-        }
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
@@ -96,11 +92,8 @@ impl<T: HttpTransport> ResponsesClient<T> {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
 
-        self.stream(body, headers, compression, turn_state).await
-    }
-
-    fn path() -> &'static str {
-        "responses"
+        self.stream_encoded(body, headers, compression, turn_state)
+            .await
     }
 
     #[instrument(
@@ -110,13 +103,26 @@ impl<T: HttpTransport> ResponsesClient<T> {
         fields(
             transport = "responses_http",
             http.method = "POST",
-            api.path = "responses",
+            api.path = "/responses",
             turn.has_state = turn_state.is_some()
         )
     )]
     pub async fn stream(
         &self,
         body: Value,
+        extra_headers: HeaderMap,
+        compression: Compression,
+        turn_state: Option<Arc<OnceLock<String>>>,
+    ) -> Result<ResponseStream, ApiError> {
+        let body = EncodedJsonBody::encode(&body)
+            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        self.stream_encoded(body, extra_headers, compression, turn_state)
+            .await
+    }
+
+    async fn stream_encoded(
+        &self,
+        body: EncodedJsonBody,
         extra_headers: HeaderMap,
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
@@ -128,9 +134,9 @@ impl<T: HttpTransport> ResponsesClient<T> {
 
         let stream_response = self
             .session
-            .stream_with(
+            .stream_encoded_json_with(
                 Method::POST,
-                Self::path(),
+                "/responses",
                 extra_headers,
                 Some(body),
                 |req| {

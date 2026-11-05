@@ -1,5 +1,4 @@
-use super::enroll::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
-use super::enroll::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
+use super::auth::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::load_persisted_remote_control_enrollment;
 use super::enroll::update_persisted_remote_control_enrollment;
@@ -8,7 +7,10 @@ use super::protocol::ClientEvent;
 use super::protocol::ClientId;
 use super::protocol::StreamId;
 use super::protocol::normalize_remote_control_url;
+use super::server_api::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::websocket::REMOTE_CONTROL_PROTOCOL_VERSION;
+use super::websocket::RemoteControlWebsocket;
+use super::websocket::RemoteControlWebsocketConfig;
 use super::*;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::QueuedOutgoingMessage;
@@ -16,23 +18,28 @@ use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionOrigin;
 use crate::transport::TransportEvent;
 use base64::Engine;
-use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlPairingStartParams;
+use codex_app_server_protocol::RemoteControlPairingStatusParams;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_core::test_support::auth_manager_from_auth_with_home;
 use codex_login::AuthDotJson;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::save_auth;
 use codex_login::token_data::TokenData;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
+use codex_protocol::auth::AuthMode;
+use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
+use codex_utils_absolute_path::test_support::PathExt;
 use futures::SinkExt;
 use futures::StreamExt;
 use gethostname::gethostname;
@@ -40,7 +47,6 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::io::AsyncBufReadExt;
@@ -62,6 +68,8 @@ use tokio_util::sync::CancellationToken;
 
 mod clients_tests;
 mod pairing_tests;
+#[path = "tests/retry_tests.rs"]
+mod retry_tests;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const TEST_REMOTE_CONTROL_URL: &str = "http://127.0.0.1:1/backend-api/wham/remote/control";
@@ -111,17 +119,305 @@ fn remote_control_auth_dot_json(account_id: Option<&str>) -> AuthDotJson {
             id_token: parse_chatgpt_jwt_claims(&fake_jwt).expect("fake jwt should parse"),
             access_token: "Access Token".to_string(),
             refresh_token: "refresh-token".to_string(),
+            oauth_provenance: None,
+            login_owner_id: None,
             account_id: account_id.map(str::to_string),
         }),
         last_refresh: Some(chrono::Utc::now()),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
     }
 }
 
 async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
-    StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+    StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state runtime should initialize")
+}
+
+#[tokio::test]
+async fn committed_disable_prevents_later_enrollment_from_restoring_preference() {
+    let home = TempDir::new().expect("temp dir");
+    let state_db = remote_control_state_runtime(&home).await;
+    let session = remote_control_handle_with_current_enrollment(
+        TEST_REMOTE_CONTROL_URL,
+        remote_control_auth_manager(),
+    );
+    let enrollment = session.current_enrollment.snapshot().expect("enrollment");
+    session
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true),
+        });
+    session
+        .set_preference(
+            &state_db,
+            &enrollment.remote_control_target,
+            &enrollment.account_id,
+            /*client_name*/ None,
+            /*enabled*/ false,
+            Some(&enrollment),
+        )
         .await
-        .expect("state runtime should initialize")
+        .expect("disable commits");
+    // This is the window before the disable RPC resumes and publishes its status.
+    let error = persistence::save_enrollment(
+        &session.auth_manager,
+        &session.persistence,
+        &state_db,
+        &enrollment,
+        /*client_name*/ None,
+        &session.desired_state_tx,
+    )
+    .await
+    .expect_err("enrollment cannot re-enable a committed disable");
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    let saved = state_db
+        .get_remote_control_enrollment(
+            &enrollment.remote_control_target.websocket_url,
+            &enrollment.account_id,
+            /*app_server_client_name*/ None,
+        )
+        .await
+        .expect("read preference")
+        .expect("saved enrollment");
+    assert_eq!(saved.remote_control_enabled, Some(false));
+}
+
+#[tokio::test]
+async fn plain_start_resolves_persisted_remote_control_preference() {
+    let cases = [
+        ("enabled", Some(Some(true))),
+        ("disabled", Some(Some(false))),
+        ("unset", Some(None)),
+        ("missing", None),
+    ];
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let remote_control_target = normalize_remote_control_url(TEST_REMOTE_CONTROL_URL)
+        .expect("remote control target should normalize");
+    for (name, stored_preference) in cases {
+        let Some(remote_control_enabled) = stored_preference else {
+            continue;
+        };
+        state_db
+            .upsert_remote_control_enrollment(&RemoteControlEnrollmentRecord {
+                websocket_url: remote_control_target.websocket_url.clone(),
+                account_id: "account_id".to_string(),
+                app_server_client_name: Some(name.to_string()),
+                server_id: format!("server-{name}"),
+                environment_id: format!("environment-{name}"),
+                server_name: format!("server-name-{name}"),
+                remote_control_enabled,
+            })
+            .await
+            .expect("enrollment should persist");
+    }
+    let (transport_event_tx, _transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (status_tx, _status_rx) = watch::channel(RemoteControlStatusChangedNotification {
+        status: RemoteControlConnectionStatus::Disabled,
+        server_name: test_server_name(),
+        installation_id: TEST_INSTALLATION_ID.to_string(),
+        environment_id: None,
+    });
+    let (desired_state_tx, _desired_state_rx) = watch::channel(RemoteControlDesiredState::Unknown);
+    let desired_state_tx = Arc::new(desired_state_tx);
+    let mut websocket = RemoteControlWebsocket::new(
+        RemoteControlWebsocketConfig {
+            remote_control_url: TEST_REMOTE_CONTROL_URL.to_string(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            remote_control_target: None,
+            server_name: test_server_name(),
+        },
+        Some(state_db),
+        auth::RemoteControlAuth::capture(remote_control_auth_manager()).0,
+        RemoteControlChannels {
+            transport_event_tx,
+            status_publisher: RemoteControlStatusPublisher::new(status_tx),
+            current_enrollment: Arc::new(RemoteControlEnrollmentState::new(
+                /*enrollment*/ None,
+            )),
+            pairing_persistence_key: watch::channel(None).0,
+            persistence: RemoteControlPersistence::default(),
+        },
+        CancellationToken::new(),
+        desired_state_tx.clone(),
+    );
+
+    for (name, stored_preference) in cases {
+        desired_state_tx.send_replace(RemoteControlDesiredState::Unknown);
+        assert!(websocket.resolve_unknown_desired_state(Some(name)).await);
+        let expected = if stored_preference == Some(Some(true)) {
+            RemoteControlDesiredState::Enabled {
+                persistence_preference: Some(true),
+            }
+        } else {
+            RemoteControlDesiredState::Disabled
+        };
+        assert_eq!(*desired_state_tx.borrow(), expected, "case {name}");
+    }
+}
+
+#[tokio::test]
+async fn explicit_disabled_start_ignores_persisted_enable() {
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let remote_control_target = normalize_remote_control_url(TEST_REMOTE_CONTROL_URL)
+        .expect("remote control target should normalize");
+    let enrollment = RemoteControlEnrollmentRecord {
+        websocket_url: remote_control_target.websocket_url,
+        account_id: "account_id".to_string(),
+        app_server_client_name: None,
+        server_id: "server-id".to_string(),
+        environment_id: "environment-id".to_string(),
+        server_name: "server-name".to_string(),
+        remote_control_enabled: Some(true),
+    };
+    state_db
+        .upsert_remote_control_enrollment(&enrollment)
+        .await
+        .expect("enrollment should persist");
+    let (transport_event_tx, _transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+
+    let (remote_task, remote_handle) = start_remote_control(
+        RemoteControlStartConfig {
+            remote_control_url: TEST_REMOTE_CONTROL_URL.to_string(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
+        },
+        Some(state_db.clone()),
+        remote_control_auth_manager(),
+        transport_event_tx,
+        shutdown_token.clone(),
+        /*app_server_client_name_rx*/ None,
+        RemoteControlStartupMode::DisabledEphemeral,
+    )
+    .await
+    .expect("remote control should start disabled");
+
+    assert_eq!(
+        remote_handle.status().status,
+        RemoteControlConnectionStatus::Disabled
+    );
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &enrollment.websocket_url,
+                &enrollment.account_id,
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("enrollment should load"),
+        Some(enrollment)
+    );
+
+    shutdown_token.cancel();
+    remote_task.await.expect("remote control task should join");
+}
+
+#[tokio::test]
+async fn managed_disable_overrides_startup_and_persisted_enablement() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let remote_control_url = remote_control_url_for_listener(&listener);
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let remote_control_target = normalize_remote_control_url(&remote_control_url)
+        .expect("remote control target should normalize");
+    let enrollment = RemoteControlEnrollmentRecord {
+        websocket_url: remote_control_target.websocket_url,
+        account_id: "account_id".to_string(),
+        app_server_client_name: None,
+        server_id: "server-id".to_string(),
+        environment_id: "environment-id".to_string(),
+        server_name: "server-name".to_string(),
+        remote_control_enabled: Some(true),
+    };
+    state_db
+        .upsert_remote_control_enrollment(&enrollment)
+        .await
+        .expect("enrollment should persist");
+    let (transport_event_tx, _transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+
+    let (remote_task, remote_handle) = start_remote_control(
+        RemoteControlStartConfig {
+            remote_control_url,
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::DisabledByRequirements,
+        },
+        Some(state_db.clone()),
+        remote_control_auth_manager(),
+        transport_event_tx,
+        shutdown_token.clone(),
+        /*app_server_client_name_rx*/ None,
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await
+    .expect("remote control should start disabled");
+
+    assert_eq!(
+        remote_handle.status().status,
+        RemoteControlConnectionStatus::Disabled
+    );
+    assert_eq!(
+        remote_handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+    assert!(
+        !remote_handle
+            .resolve_persisted_preference(/*app_server_client_name*/ None)
+            .await
+            .expect("managed disable should resolve without loading persistence")
+    );
+    assert_eq!(
+        remote_handle
+            .enable_ephemeral()
+            .expect_err("managed requirements should reject ephemeral enable"),
+        RemoteControlEnableError::DisabledByRequirements(RemoteControlDisabledByRequirements)
+    );
+    let enable_error = remote_handle
+        .enable(/*app_server_client_name*/ None)
+        .await
+        .expect_err("managed requirements should reject durable enable");
+    assert_eq!(enable_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        enable_error.to_string(),
+        "remote control is disabled by managed requirements"
+    );
+    let disable_error = remote_handle
+        .disable(/*app_server_client_name*/ None)
+        .await
+        .expect_err("managed requirements should reject durable disable");
+    assert_eq!(disable_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        disable_error.to_string(),
+        "remote control is disabled by managed requirements"
+    );
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &enrollment.websocket_url,
+                &enrollment.account_id,
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("enrollment should load"),
+        Some(enrollment)
+    );
+    timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .expect_err("managed requirements should prevent backend contact");
+
+    shutdown_token.cancel();
+    remote_task.await.expect("remote control task should join");
 }
 
 fn remote_control_url_for_listener(listener: &TcpListener) -> String {
@@ -135,11 +431,14 @@ fn test_server_name() -> String {
     gethostname().to_string_lossy().trim().to_string()
 }
 
-fn remote_control_handle_with_current_enrollment(
+pub(super) fn remote_control_handle_with_current_enrollment(
     remote_control_url: &str,
     auth_manager: Arc<AuthManager>,
-) -> RemoteControlHandle {
-    let (enabled_tx, _enabled_rx) = watch::channel(/*init*/ true);
+) -> RemoteControlSession {
+    let (desired_state_tx, _desired_state_rx) =
+        watch::channel(RemoteControlDesiredState::Enabled {
+            persistence_preference: None,
+        });
     let (status_tx, _status_rx) = watch::channel(RemoteControlStatusChangedNotification {
         status: RemoteControlConnectionStatus::Connecting,
         server_name: test_server_name(),
@@ -148,26 +447,283 @@ fn remote_control_handle_with_current_enrollment(
     });
     let remote_control_target = normalize_remote_control_url(remote_control_url)
         .expect("remote control target should normalize");
-    let current_enrollment = Arc::new(StdMutex::new(Some(RemoteControlEnrollment {
-        remote_control_target,
-        account_id: "account_id".to_string(),
-        environment_id: "env_test".to_string(),
-        server_id: "srv_e_test".to_string(),
-        server_name: test_server_name(),
-        remote_control_token: Some(TEST_REMOTE_CONTROL_SERVER_TOKEN.to_string()),
-        expires_at: Some(
-            OffsetDateTime::from_unix_timestamp(33_336_362_096)
-                .expect("future timestamp should parse"),
-        ),
-    })));
-    RemoteControlHandle {
-        enabled_tx: Arc::new(enabled_tx),
+    let current_enrollment = Arc::new(RemoteControlEnrollmentState::new(Some(
+        RemoteControlEnrollment {
+            remote_control_target,
+            account_id: "account_id".to_string(),
+            environment_id: "env_test".to_string(),
+            server_id: "srv_e_test".to_string(),
+            server_name: test_server_name(),
+            remote_control_token: Some(TEST_REMOTE_CONTROL_SERVER_TOKEN.to_string()),
+            expires_at: Some(
+                OffsetDateTime::from_unix_timestamp(33_336_362_096)
+                    .expect("future timestamp should parse"),
+            ),
+            next_refresh_at: None,
+        },
+    )));
+    RemoteControlSession {
+        policy: RemoteControlPolicy::Allowed,
+        shutdown_token: CancellationToken::new(),
+        desired_state_tx: Arc::new(desired_state_tx),
+        desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
+        persistence: RemoteControlPersistence::default(),
         status_tx: Arc::new(status_tx),
-        state_db_available: true,
+        state_db: None,
         remote_control_url: remote_control_url.to_string(),
         current_enrollment,
-        auth_manager,
+        pairing_persistence_key: watch::channel(None).0,
+        pairing_persistence_key_required: false,
+        auth_manager: auth::RemoteControlAuth::capture(auth_manager).0,
     }
+}
+
+#[tokio::test]
+async fn durable_enable_reuses_in_memory_enrollment_after_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let remote_control_url = remote_control_url_for_listener(&listener);
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let mut remote_handle = remote_control_handle_with_current_enrollment(
+        &remote_control_url,
+        remote_control_auth_manager(),
+    );
+    remote_handle.state_db = Some(state_db.clone());
+    remote_handle
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Disabled);
+    let enrollment = remote_handle
+        .current_enrollment
+        .snapshot()
+        .expect("in-memory enrollment should exist");
+    let expected_record = RemoteControlEnrollmentRecord {
+        websocket_url: enrollment.remote_control_target.websocket_url.clone(),
+        account_id: enrollment.account_id.clone(),
+        app_server_client_name: None,
+        server_id: enrollment.server_id.clone(),
+        environment_id: enrollment.environment_id.clone(),
+        server_name: enrollment.server_name.clone(),
+        remote_control_enabled: Some(true),
+    };
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &expected_record.websocket_url,
+                &expected_record.account_id,
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("enrollment should load"),
+        None
+    );
+    remote_handle.shutdown_token.cancel();
+
+    let status = timeout(
+        Duration::from_secs(5),
+        remote_handle.enable(/*app_server_client_name*/ None),
+    )
+    .await
+    .expect("cached enable should complete without network I/O")
+    .expect("shutdown should not cancel durable enable using in-memory enrollment");
+
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &expected_record.websocket_url,
+                &expected_record.account_id,
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("enabled enrollment should load"),
+        Some(expected_record)
+    );
+    assert_eq!(
+        *remote_handle.desired_state_tx.borrow(),
+        RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true),
+        }
+    );
+    assert_eq!(
+        status.environment_id.as_deref(),
+        Some(enrollment.environment_id.as_str())
+    );
+    assert_eq!(
+        remote_handle.current_enrollment.snapshot(),
+        Some(enrollment)
+    );
+    timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .expect_err("in-memory enrollment should prevent backend contact");
+}
+
+#[tokio::test]
+async fn durable_enable_reuses_persisted_enrollment_after_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let remote_control_url = remote_control_url_for_listener(&listener);
+    let remote_control_target = normalize_remote_control_url(&remote_control_url)
+        .expect("remote control target should normalize");
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let persisted_enrollment = RemoteControlEnrollmentRecord {
+        websocket_url: remote_control_target.websocket_url,
+        account_id: "account_id".to_string(),
+        app_server_client_name: None,
+        server_id: "persisted-server-id".to_string(),
+        environment_id: "persisted-environment-id".to_string(),
+        server_name: format!("{}-persisted", test_server_name()),
+        remote_control_enabled: Some(false),
+    };
+    state_db
+        .upsert_remote_control_enrollment(&persisted_enrollment)
+        .await
+        .expect("disabled enrollment should persist");
+    let mut remote_handle = remote_control_handle_with_current_enrollment(
+        &remote_control_url,
+        remote_control_auth_manager(),
+    );
+    remote_handle.state_db = Some(state_db.clone());
+    *remote_handle.current_enrollment.lock().await = None;
+    remote_handle
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Disabled);
+    remote_handle.shutdown_token.cancel();
+
+    let status = timeout(
+        Duration::from_secs(5),
+        remote_handle.enable(/*app_server_client_name*/ None),
+    )
+    .await
+    .expect("cached enable should complete without network I/O")
+    .expect("shutdown should not cancel durable enable using persisted enrollment");
+
+    assert_eq!(
+        status.environment_id.as_deref(),
+        Some(persisted_enrollment.environment_id.as_str())
+    );
+    assert_eq!(
+        remote_handle
+            .current_enrollment
+            .snapshot()
+            .map(|enrollment| enrollment.server_id),
+        Some(persisted_enrollment.server_id.clone())
+    );
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &persisted_enrollment.websocket_url,
+                &persisted_enrollment.account_id,
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("enabled enrollment should load"),
+        Some(RemoteControlEnrollmentRecord {
+            remote_control_enabled: Some(true),
+            ..persisted_enrollment
+        })
+    );
+    assert_eq!(
+        *remote_handle.desired_state_tx.borrow(),
+        RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true),
+        }
+    );
+    timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .expect_err("persisted enrollment should prevent backend contact");
+}
+
+#[tokio::test]
+async fn durable_enable_without_cached_enrollment_is_cancelled_after_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let remote_control_url = remote_control_url_for_listener(&listener);
+    let remote_control_target = normalize_remote_control_url(&remote_control_url)
+        .expect("remote control target should normalize");
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let mut remote_handle = remote_control_handle_with_current_enrollment(
+        &remote_control_url,
+        remote_control_auth_manager(),
+    );
+    remote_handle.state_db = Some(state_db.clone());
+    *remote_handle.current_enrollment.lock().await = None;
+    remote_handle
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Disabled);
+    remote_handle.shutdown_token.cancel();
+
+    let error = timeout(
+        Duration::from_secs(5),
+        remote_handle.enable(/*app_server_client_name*/ None),
+    )
+    .await
+    .expect("shutdown should cancel network enrollment promptly")
+    .expect_err("enable without cached enrollment should be cancelled");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(error.to_string(), "remote control is shutting down");
+    assert_eq!(remote_handle.current_enrollment.snapshot(), None);
+    assert_eq!(
+        *remote_handle.desired_state_tx.borrow(),
+        RemoteControlDesiredState::Disabled
+    );
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &remote_control_target.websocket_url,
+                "account_id",
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("enrollment should load"),
+        None
+    );
+    timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .expect_err("cancelled enrollment should prevent backend contact");
+}
+
+#[tokio::test]
+async fn ephemeral_enable_preserves_durable_preference() {
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let mut remote_handle = remote_control_handle_with_current_enrollment(
+        TEST_REMOTE_CONTROL_URL,
+        remote_control_auth_manager(),
+    );
+    remote_handle.state_db = Some(remote_control_state_runtime(&codex_home).await);
+    remote_handle
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true),
+        });
+
+    remote_handle
+        .enable_ephemeral()
+        .expect("ephemeral enable should succeed");
+    assert_eq!(
+        *remote_handle.desired_state_tx.borrow(),
+        RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true),
+        }
+    );
+
+    remote_handle
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Disabled);
+    remote_handle
+        .enable_ephemeral()
+        .expect("ephemeral enable should succeed");
+    assert_eq!(
+        *remote_handle.desired_state_tx.borrow(),
+        RemoteControlDesiredState::Enabled {
+            persistence_preference: None,
+        }
+    );
 }
 
 fn remote_control_server_token_response(
@@ -235,7 +791,10 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
         .await
         .expect("listener should bind");
     let remote_control_url = remote_control_url_for_listener(&listener);
+    let remote_control_target = normalize_remote_control_url(&remote_control_url)
+        .expect("remote control target should normalize");
     let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
@@ -243,13 +802,14 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
-        Some(remote_control_state_runtime(&codex_home).await),
+        Some(state_db.clone()),
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -269,6 +829,16 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
     )
     .await;
     let mut websocket = accept_remote_control_connection(&listener).await;
+    let enrollment = state_db
+        .get_remote_control_enrollment(
+            &remote_control_target.websocket_url,
+            "account_id",
+            /*app_server_client_name*/ None,
+        )
+        .await
+        .expect("new enrollment should load")
+        .expect("new enrollment should exist");
+    assert_eq!(enrollment.remote_control_enabled, None);
     expect_remote_control_status(
         &mut status_rx,
         /*expected_status*/ None,
@@ -436,14 +1006,15 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "test".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -458,7 +1029,8 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
                 "params": {
                     "summary": "test",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -526,13 +1098,14 @@ async fn remote_control_transport_reconnects_after_disconnect() {
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -565,7 +1138,8 @@ async fn remote_control_transport_reconnects_after_disconnect() {
     drop(first_websocket);
 
     let (second_handshake_request, mut second_websocket) =
-        accept_remote_control_backend_connection(&listener).await;
+        accept_remote_control_backend_connection_with_timeout(&listener, Duration::from_secs(45))
+            .await;
     assert_eq!(
         second_handshake_request.headers.get("authorization"),
         Some(&format!("Bearer {TEST_REMOTE_CONTROL_SERVER_TOKEN}"))
@@ -627,13 +1201,14 @@ async fn remote_control_transport_refreshes_server_token_after_websocket_unautho
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -665,7 +1240,8 @@ async fn remote_control_transport_refreshes_server_token_after_websocket_unautho
     );
     respond_with_status(websocket_request.stream, "401 Unauthorized", "").await;
 
-    let refresh_request = accept_http_request(&listener).await;
+    let refresh_request =
+        accept_http_request_with_timeout(&listener, Duration::from_secs(45)).await;
     assert_eq!(
         refresh_request.request_line,
         "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
@@ -707,13 +1283,14 @@ async fn remote_control_start_allows_remote_control_invalid_url_when_disabled() 
         RemoteControlStartConfig {
             remote_control_url: "https://internal.example.com/backend-api/".to_string(),
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         /*state_db*/ None,
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ false,
+        RemoteControlStartupMode::ResolvePersisted,
     )
     .await
     .expect("disabled remote control should not validate the URL at startup");
@@ -736,7 +1313,10 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let (transport_event_tx, _transport_event_rx) =
@@ -746,13 +1326,14 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(remote_control_state_runtime(&codex_home).await),
         auth_manager,
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start before ChatGPT auth is available");
@@ -781,13 +1362,14 @@ async fn remote_control_start_reports_missing_state_db_as_disabled_when_enabled(
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         /*state_db*/ None,
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start disabled without sqlite state db");
@@ -807,8 +1389,10 @@ async fn remote_control_start_reports_missing_state_db_as_disabled_when_enabled(
         .expect_err("remote control should not connect without sqlite state db");
 
     assert_eq!(
-        remote_handle.enable().expect_err("enable should fail"),
-        super::RemoteControlUnavailable
+        remote_handle
+            .enable_ephemeral()
+            .expect_err("enable should fail"),
+        RemoteControlEnableError::Unavailable(super::RemoteControlUnavailable)
     );
     timeout(Duration::from_millis(100), listener.accept())
         .await
@@ -838,13 +1422,14 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -877,7 +1462,10 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
     .await;
 
     assert_eq!(
-        remote_handle.disable(),
+        remote_handle
+            .disable(Some("rpc-client"))
+            .await
+            .expect("disable should succeed"),
         RemoteControlStatusChangedNotification {
             status: RemoteControlConnectionStatus::Disabled,
             server_name: test_server_name(),
@@ -903,12 +1491,15 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
         .expect_err("disabled remote control should not reconnect");
 
     assert_eq!(
-        remote_handle.enable().expect("enable should succeed"),
+        remote_handle
+            .enable(Some("rpc-client"))
+            .await
+            .expect("enable should succeed"),
         RemoteControlStatusChangedNotification {
             status: RemoteControlConnectionStatus::Connecting,
             server_name: test_server_name(),
             installation_id: TEST_INSTALLATION_ID.to_string(),
-            environment_id: None,
+            environment_id: Some("env_test".to_string()),
         }
     );
     expect_remote_control_status_snapshot(
@@ -917,7 +1508,7 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
             status: RemoteControlConnectionStatus::Connecting,
             server_name: test_server_name(),
             installation_id: TEST_INSTALLATION_ID.to_string(),
-            environment_id: None,
+            environment_id: Some("env_test".to_string()),
         },
     )
     .await;
@@ -951,13 +1542,14 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -1026,14 +1618,15 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "stale".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -1049,7 +1642,8 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
                 "params": {
                     "summary": "stale",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1092,7 +1686,8 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
         .expect("first websocket should close");
     drop(first_websocket);
 
-    let mut second_websocket = accept_remote_control_connection(&listener).await;
+    let mut second_websocket =
+        accept_remote_control_connection_with_timeout(&listener, Duration::from_secs(45)).await;
     send_client_event(
         &mut second_websocket,
         ClientEnvelope {
@@ -1133,13 +1728,14 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -1155,14 +1751,16 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         Some(&"Bearer Access Token".to_string())
     );
     assert_eq!(
-        enroll_request.headers.get(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
-        Some(&"account_id".to_string())
+        enroll_request
+            .headers
+            .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+        vec!["account_id"]
     );
     assert_eq!(
         enroll_request
             .headers
-            .get(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
-        Some(&TEST_INSTALLATION_ID.to_string())
+            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
+        vec![TEST_INSTALLATION_ID]
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&enroll_request.body)
@@ -1289,9 +1887,16 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         .send(QueuedOutgoingMessage::new(OutgoingMessage::Response(
             crate::outgoing_message::OutgoingResponse {
                 id: codex_app_server_protocol::RequestId::Integer(11),
-                result: json!({
-                    "userAgent": "codex-test-agent"
-                }),
+                result: Box::new(
+                    codex_app_server_protocol::ClientResponsePayload::Initialize(
+                        codex_app_server_protocol::InitializeResponse {
+                            user_agent: "codex-test-agent".to_string(),
+                            codex_home: codex_home.path().abs(),
+                            platform_family: "test-family".to_string(),
+                            platform_os: "test-os".to_string(),
+                        },
+                    ),
+                ),
             },
         )))
         .await
@@ -1306,6 +1911,9 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
                 "id": 11,
                 "result": {
                     "userAgent": "codex-test-agent",
+                    "codexHome": codex_home.path(),
+                    "platformFamily": "test-family",
+                    "platformOs": "test-os",
                 }
             }
         })
@@ -1313,14 +1921,15 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "backend".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -1335,7 +1944,8 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
                 "params": {
                     "summary": "backend",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1362,6 +1972,7 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
         server_name: "persisted-server".to_string(),
         remote_control_token: None,
         expires_at: None,
+        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -1369,6 +1980,7 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
         "account_id",
         /*app_server_client_name*/ None,
         Some(&persisted_enrollment),
+        /*remote_control_enabled*/ None,
     )
     .await
     .expect("persisted enrollment should save");
@@ -1380,13 +1992,14 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -1399,6 +2012,18 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
     assert_eq!(
         refresh_request.headers.get("authorization"),
         Some(&"Bearer Access Token".to_string())
+    );
+    assert_eq!(
+        refresh_request
+            .headers
+            .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+        vec!["account_id"]
+    );
+    assert_eq!(
+        refresh_request
+            .headers
+            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
+        vec![TEST_INSTALLATION_ID]
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&refresh_request.body)
@@ -1468,6 +2093,7 @@ async fn remote_control_stdio_mode_waits_for_client_name_before_connecting() {
         server_name: "persisted-server".to_string(),
         remote_control_token: None,
         expires_at: None,
+        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -1475,6 +2101,7 @@ async fn remote_control_stdio_mode_waits_for_client_name_before_connecting() {
         "account_id",
         Some(app_server_client_name),
         Some(&persisted_enrollment),
+        /*remote_control_enabled*/ None,
     )
     .await
     .expect("persisted enrollment should save");
@@ -1487,13 +2114,14 @@ async fn remote_control_stdio_mode_waits_for_client_name_before_connecting() {
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
         transport_event_tx,
         shutdown_token.clone(),
         Some(app_server_client_name_rx),
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start");
@@ -1538,6 +2166,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         codex_home.path(),
         &remote_control_auth_dot_json(/*account_id*/ None),
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )
     .expect("auth without account id should save");
     let state_db = remote_control_state_runtime(&codex_home).await;
@@ -1545,7 +2174,10 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let expected_server_name = gethostname().to_string_lossy().trim().to_string();
@@ -1559,6 +2191,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         server_name: expected_server_name,
         remote_control_token: None,
         expires_at: None,
+        next_refresh_at: None,
     };
 
     let (transport_event_tx, _transport_event_rx) =
@@ -1568,13 +2201,14 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(state_db.clone()),
         auth_manager.clone(),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
     .expect("remote control should start before account id is available");
@@ -1587,6 +2221,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         codex_home.path(),
         &remote_control_auth_dot_json(Some("account_id")),
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )
     .expect("auth with account id should save");
     auth_manager.reload().await;
@@ -1619,6 +2254,133 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
 }
 
 #[tokio::test]
+async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preference() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let remote_control_url = remote_control_url_for_listener(&listener);
+    let codex_home = TempDir::new().expect("temp dir should create");
+    save_auth(
+        codex_home.path(),
+        &remote_control_auth_dot_json(Some("account_a")),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("account A auth should save");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let auth_manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let remote_control_target =
+        normalize_remote_control_url(&remote_control_url).expect("target should parse");
+    let enrollment = RemoteControlEnrollment {
+        remote_control_target: remote_control_target.clone(),
+        account_id: "account_a".to_string(),
+        environment_id: "env_a".to_string(),
+        server_id: "srv_e_a".to_string(),
+        server_name: "server-a".to_string(),
+        remote_control_token: None,
+        expires_at: None,
+        next_refresh_at: None,
+    };
+    update_persisted_remote_control_enrollment(
+        Some(state_db.as_ref()),
+        &remote_control_target,
+        "account_a",
+        /*app_server_client_name*/ None,
+        Some(&enrollment),
+        /*remote_control_enabled*/ Some(true),
+    )
+    .await
+    .expect("account A enrollment should save");
+
+    let (transport_event_tx, _transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let (remote_task, remote_handle) = start_remote_control(
+        RemoteControlStartConfig {
+            remote_control_url,
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
+        },
+        Some(state_db.clone()),
+        auth_manager.clone(),
+        transport_event_tx,
+        shutdown_token.clone(),
+        /*app_server_client_name_rx*/ None,
+        RemoteControlStartupMode::ResolvePersisted,
+    )
+    .await
+    .expect("remote control should start");
+
+    let refresh_request = accept_http_request(&listener).await;
+    assert_eq!(
+        refresh_request.request_line,
+        "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
+    );
+    respond_with_json(
+        refresh_request.stream,
+        remote_control_server_token_response(
+            &enrollment.server_id,
+            &enrollment.environment_id,
+            TEST_REFRESHED_REMOTE_CONTROL_SERVER_TOKEN,
+        ),
+    )
+    .await;
+    let (_handshake_request, mut websocket) =
+        accept_remote_control_backend_connection(&listener).await;
+
+    save_auth(
+        codex_home.path(),
+        &remote_control_auth_dot_json(Some("account_b")),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("account B auth should save");
+    auth_manager.reload().await;
+    let closed = timeout(Duration::from_secs(1), websocket.next())
+        .await
+        .expect("account switch should close the backend websocket");
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))
+    ));
+
+    let mut desired_state_rx = remote_handle.status_receiver();
+    timeout(
+        Duration::from_secs(1),
+        desired_state_rx.wait_for(|state| state.status == RemoteControlConnectionStatus::Disabled),
+    )
+    .await
+    .expect("account B missing preference should disable remote control")
+    .expect("desired state channel should stay open");
+    timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .expect_err("disabled account B should not enroll");
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &remote_control_target.websocket_url,
+                "account_b",
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("account B enrollment should load"),
+        None
+    );
+
+    shutdown_token.cancel();
+    let _ = remote_task.await;
+}
+
+#[tokio::test]
 async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollment() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1637,6 +2399,7 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
         server_name: "stale-server".to_string(),
         remote_control_token: None,
         expires_at: None,
+        next_refresh_at: None,
     };
     let refreshed_enrollment = RemoteControlEnrollment {
         remote_control_target: remote_control_target.clone(),
@@ -1646,6 +2409,7 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
         server_name: expected_server_name,
         remote_control_token: None,
         expires_at: None,
+        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -1653,6 +2417,7 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
         "account_id",
         /*app_server_client_name*/ None,
         Some(&stale_enrollment),
+        /*remote_control_enabled*/ Some(true),
     )
     .await
     .expect("stale enrollment should save");
@@ -1664,13 +2429,14 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::ResolvePersisted,
     )
     .await
     .expect("remote control should start");
@@ -1688,12 +2454,6 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
     )
     .await;
     respond_with_status(refresh_request.stream, "404 Not Found", "").await;
-    expect_remote_control_status(
-        &mut status_rx,
-        /*expected_status*/ None,
-        /*expected_environment_id*/ None,
-    )
-    .await;
 
     let enroll_request = accept_http_request(&listener).await;
     assert_eq!(
@@ -1722,15 +2482,23 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
         Some(&refreshed_enrollment.server_id)
     );
     assert_eq!(
-        load_persisted_remote_control_enrollment(
-            Some(state_db.as_ref()),
-            &remote_control_target,
-            "account_id",
-            /*app_server_client_name*/ None,
-        )
-        .await
-        .expect("refreshed enrollment should load"),
-        Some(refreshed_enrollment)
+        state_db
+            .get_remote_control_enrollment(
+                &remote_control_target.websocket_url,
+                "account_id",
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("refreshed enrollment should load"),
+        Some(RemoteControlEnrollmentRecord {
+            websocket_url: remote_control_target.websocket_url.clone(),
+            account_id: "account_id".to_string(),
+            app_server_client_name: None,
+            server_id: refreshed_enrollment.server_id.clone(),
+            environment_id: refreshed_enrollment.environment_id.clone(),
+            server_name: refreshed_enrollment.server_name.clone(),
+            remote_control_enabled: Some(true),
+        })
     );
 
     shutdown_token.cancel();
@@ -1738,7 +2506,7 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
 }
 
 #[tokio::test]
-async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() {
+async fn remote_control_http_mode_reenrolls_after_explicit_missing_server_404() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -1756,6 +2524,7 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
         server_name: "stale-server".to_string(),
         remote_control_token: None,
         expires_at: None,
+        next_refresh_at: None,
     };
     let refreshed_enrollment = RemoteControlEnrollment {
         remote_control_target: remote_control_target.clone(),
@@ -1765,6 +2534,7 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
         server_name: expected_server_name,
         remote_control_token: None,
         expires_at: None,
+        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -1772,6 +2542,7 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
         "account_id",
         /*app_server_client_name*/ None,
         Some(&stale_enrollment),
+        /*remote_control_enabled*/ Some(true),
     )
     .await
     .expect("stale enrollment should save");
@@ -1783,13 +2554,14 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
-        /*initial_enabled*/ true,
+        RemoteControlStartupMode::ResolvePersisted,
     )
     .await
     .expect("remote control should start");
@@ -1825,11 +2597,10 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
         Some("env_stale"),
     )
     .await;
-    respond_with_status(websocket_request.stream, "404 Not Found", "").await;
-    expect_remote_control_status(
-        &mut status_rx,
-        /*expected_status*/ None,
-        /*expected_environment_id*/ None,
+    respond_with_status(
+        websocket_request.stream,
+        "404 Not Found",
+        &json!({"detail": "Remote app server not found"}).to_string(),
     )
     .await;
 
@@ -1848,7 +2619,10 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
     )
     .await;
 
-    let (handshake_request, _websocket) = accept_remote_control_backend_connection(&listener).await;
+    // Re-enrollment is followed by reconnect backoff, so allow time for that delay.
+    let (handshake_request, _websocket) =
+        accept_remote_control_backend_connection_with_timeout(&listener, Duration::from_secs(45))
+            .await;
     expect_remote_control_status(
         &mut status_rx,
         /*expected_status*/ None,
@@ -1860,6 +2634,250 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
         Some(&refreshed_enrollment.server_id)
     );
     assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &remote_control_target.websocket_url,
+                "account_id",
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("refreshed enrollment should load"),
+        Some(RemoteControlEnrollmentRecord {
+            websocket_url: remote_control_target.websocket_url.clone(),
+            account_id: "account_id".to_string(),
+            app_server_client_name: None,
+            server_id: refreshed_enrollment.server_id.clone(),
+            environment_id: refreshed_enrollment.environment_id.clone(),
+            server_name: refreshed_enrollment.server_name.clone(),
+            remote_control_enabled: Some(true),
+        })
+    );
+
+    shutdown_token.cancel();
+    let _ = remote_task.await;
+}
+
+#[tokio::test]
+async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_fails() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let remote_control_url = remote_control_url_for_listener(&listener);
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let remote_control_target =
+        normalize_remote_control_url(&remote_control_url).expect("target should parse");
+    let stale_enrollment = RemoteControlEnrollment {
+        remote_control_target: remote_control_target.clone(),
+        account_id: "account_id".to_string(),
+        environment_id: "env_stale".to_string(),
+        server_id: "srv_e_stale".to_string(),
+        server_name: test_server_name(),
+        remote_control_token: None,
+        expires_at: None,
+        next_refresh_at: None,
+    };
+    update_persisted_remote_control_enrollment(
+        Some(state_db.as_ref()),
+        &remote_control_target,
+        "account_id",
+        /*app_server_client_name*/ None,
+        Some(&stale_enrollment),
+        /*remote_control_enabled*/ Some(true),
+    )
+    .await
+    .expect("stale enrollment should save");
+
+    let (transport_event_tx, _transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let (remote_task, remote_handle) = start_remote_control(
+        RemoteControlStartConfig {
+            remote_control_url,
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
+        },
+        Some(state_db.clone()),
+        remote_control_auth_manager_with_home(&codex_home),
+        transport_event_tx,
+        shutdown_token.clone(),
+        /*app_server_client_name_rx*/ None,
+        RemoteControlStartupMode::ResolvePersisted,
+    )
+    .await
+    .expect("remote control should start");
+
+    let refresh_request = accept_http_request(&listener).await;
+    assert_eq!(
+        refresh_request.request_line,
+        "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
+    );
+    respond_with_status(refresh_request.stream, "404 Not Found", "").await;
+
+    let enroll_request = accept_http_request(&listener).await;
+    assert_eq!(
+        enroll_request.request_line,
+        "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
+    );
+    respond_with_status(enroll_request.stream, "500 Internal Server Error", "failed").await;
+
+    let retry_refresh_request =
+        accept_http_request_with_timeout(&listener, Duration::from_secs(45)).await;
+    assert_eq!(
+        retry_refresh_request.request_line,
+        "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
+    );
+    let refresh_failed_at = OffsetDateTime::now_utc();
+    respond_with_status(
+        retry_refresh_request.stream,
+        "500 Internal Server Error",
+        "failed",
+    )
+    .await;
+
+    let current_enrollment = remote_handle
+        .inner
+        .session()
+        .current_enrollment
+        .lock()
+        .await
+        .clone()
+        .expect("stale enrollment should remain available");
+    let next_refresh_at = current_enrollment
+        .next_refresh_at
+        .expect("required refresh failure should set a retry deadline");
+    assert!(
+        (refresh_failed_at + time::Duration::seconds(24)
+            ..=OffsetDateTime::now_utc() + time::Duration::seconds(36))
+            .contains(&next_refresh_at)
+    );
+    assert_eq!(
+        current_enrollment,
+        RemoteControlEnrollment {
+            next_refresh_at: Some(next_refresh_at),
+            ..stale_enrollment.clone()
+        }
+    );
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                &remote_control_target.websocket_url,
+                "account_id",
+                /*app_server_client_name*/ None,
+            )
+            .await
+            .expect("stale enrollment should load"),
+        Some(RemoteControlEnrollmentRecord {
+            websocket_url: remote_control_target.websocket_url,
+            account_id: "account_id".to_string(),
+            app_server_client_name: None,
+            server_id: stale_enrollment.server_id,
+            environment_id: stale_enrollment.environment_id,
+            server_name: stale_enrollment.server_name,
+            remote_control_enabled: Some(true),
+        })
+    );
+
+    shutdown_token.cancel();
+    let _ = remote_task.await;
+}
+
+#[tokio::test]
+async fn remote_control_http_mode_preserves_enrollment_after_generic_websocket_404() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let remote_control_url = remote_control_url_for_listener(&listener);
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let state_db = remote_control_state_runtime(&codex_home).await;
+    let remote_control_target =
+        normalize_remote_control_url(&remote_control_url).expect("target should parse");
+    let stale_enrollment = RemoteControlEnrollment {
+        remote_control_target: remote_control_target.clone(),
+        account_id: "account_id".to_string(),
+        environment_id: "env_stale".to_string(),
+        server_id: "srv_e_stale".to_string(),
+        server_name: "stale-server".to_string(),
+        remote_control_token: None,
+        expires_at: None,
+        next_refresh_at: None,
+    };
+    update_persisted_remote_control_enrollment(
+        Some(state_db.as_ref()),
+        &remote_control_target,
+        "account_id",
+        /*app_server_client_name*/ None,
+        Some(&stale_enrollment),
+        /*remote_control_enabled*/ None,
+    )
+    .await
+    .expect("stale enrollment should save");
+
+    let (transport_event_tx, _transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let (remote_task, remote_handle) = start_remote_control(
+        RemoteControlStartConfig {
+            remote_control_url,
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            policy: RemoteControlPolicy::Allowed,
+        },
+        Some(state_db.clone()),
+        remote_control_auth_manager_with_home(&codex_home),
+        transport_event_tx,
+        shutdown_token.clone(),
+        /*app_server_client_name_rx*/ None,
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await
+    .expect("remote control should start");
+    let mut status_rx = remote_handle.status_receiver();
+
+    let refresh_request = accept_http_request(&listener).await;
+    assert_eq!(
+        refresh_request.request_line,
+        "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
+    );
+    respond_with_json(
+        refresh_request.stream,
+        remote_control_server_token_response(
+            &stale_enrollment.server_id,
+            &stale_enrollment.environment_id,
+            TEST_REFRESHED_REMOTE_CONTROL_SERVER_TOKEN,
+        ),
+    )
+    .await;
+
+    let websocket_request = accept_http_request(&listener).await;
+    assert_eq!(
+        websocket_request.request_line,
+        "GET /backend-api/wham/remote/control/server HTTP/1.1"
+    );
+    assert_eq!(
+        websocket_request.headers.get("x-codex-server-id"),
+        Some(&stale_enrollment.server_id)
+    );
+    assert_eq!(
+        websocket_request.headers.get("authorization"),
+        Some(&format!(
+            "Bearer {TEST_REFRESHED_REMOTE_CONTROL_SERVER_TOKEN}"
+        ))
+    );
+    expect_remote_control_status(
+        &mut status_rx,
+        /*expected_status*/ None,
+        Some("env_stale"),
+    )
+    .await;
+    respond_with_status_and_headers(
+        websocket_request.stream,
+        "404 Not Found",
+        &[("x-request-id", "request-404"), ("cf-ray", "ray-404")],
+        "Not Found",
+    )
+    .await;
+
+    assert_eq!(
         load_persisted_remote_control_enrollment(
             Some(state_db.as_ref()),
             &remote_control_target,
@@ -1867,9 +2885,33 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
             /*app_server_client_name*/ None,
         )
         .await
-        .expect("refreshed enrollment should load"),
-        Some(refreshed_enrollment)
+        .expect("stale enrollment should load"),
+        Some(stale_enrollment.clone())
     );
+
+    let (handshake_request, _websocket) =
+        accept_remote_control_backend_connection_with_timeout(&listener, Duration::from_secs(45))
+            .await;
+    assert_eq!(
+        handshake_request.headers.get("x-codex-server-id"),
+        Some(&stale_enrollment.server_id)
+    );
+    assert_eq!(
+        handshake_request.headers.get("authorization"),
+        Some(&format!(
+            "Bearer {TEST_REFRESHED_REMOTE_CONTROL_SERVER_TOKEN}"
+        ))
+    );
+    expect_remote_control_status_snapshot(
+        &mut status_rx,
+        RemoteControlStatusChangedNotification {
+            status: RemoteControlConnectionStatus::Connected,
+            server_name: test_server_name(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            environment_id: Some("env_stale".to_string()),
+        },
+    )
+    .await;
 
     shutdown_token.cancel();
     let _ = remote_task.await;
@@ -1879,8 +2921,33 @@ async fn remote_control_http_mode_clears_stale_persisted_enrollment_after_404() 
 struct CapturedHttpRequest {
     stream: TcpStream,
     request_line: String,
-    headers: BTreeMap<String, String>,
+    headers: CapturedHttpHeaders,
     body: String,
+}
+
+#[derive(Debug, Default)]
+struct CapturedHttpHeaders(Vec<(String, String)>);
+
+impl CapturedHttpHeaders {
+    fn append(&mut self, name: String, value: String) {
+        self.0.push((name, value));
+    }
+
+    fn get(&self, name: &str) -> Option<&String> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_name, value)| value)
+    }
+
+    fn get_all(&self, name: &str) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_name, value)| value.as_str())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1890,7 +2957,14 @@ struct CapturedWebSocketRequest {
 }
 
 async fn accept_remote_control_connection(listener: &TcpListener) -> WebSocketStream<TcpStream> {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+    accept_remote_control_connection_with_timeout(listener, Duration::from_secs(5)).await
+}
+
+async fn accept_remote_control_connection_with_timeout(
+    listener: &TcpListener,
+    accept_timeout: Duration,
+) -> WebSocketStream<TcpStream> {
+    let (stream, _) = timeout(accept_timeout, listener.accept())
         .await
         .expect("remote control should connect in time")
         .expect("listener accept should succeed");
@@ -1900,7 +2974,14 @@ async fn accept_remote_control_connection(listener: &TcpListener) -> WebSocketSt
 }
 
 async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+    accept_http_request_with_timeout(listener, Duration::from_secs(5)).await
+}
+
+async fn accept_http_request_with_timeout(
+    listener: &TcpListener,
+    accept_timeout: Duration,
+) -> CapturedHttpRequest {
+    let (stream, _) = timeout(accept_timeout, listener.accept())
         .await
         .expect("HTTP request should arrive in time")
         .expect("listener accept should succeed");
@@ -1913,7 +2994,7 @@ async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
         .expect("request line should read");
     let request_line = request_line.trim_end_matches("\r\n").to_string();
 
-    let mut headers = BTreeMap::new();
+    let mut headers = CapturedHttpHeaders::default();
     loop {
         let mut line = String::new();
         reader
@@ -1925,7 +3006,7 @@ async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
         }
         let line = line.trim_end_matches("\r\n");
         let (name, value) = line.split_once(':').expect("header should contain colon");
-        headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+        headers.append(name.to_ascii_lowercase(), value.trim().to_string());
     }
 
     let content_length = headers
@@ -1987,7 +3068,14 @@ async fn respond_with_status_and_headers(
 async fn accept_remote_control_backend_connection(
     listener: &TcpListener,
 ) -> (CapturedWebSocketRequest, WebSocketStream<TcpStream>) {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+    accept_remote_control_backend_connection_with_timeout(listener, Duration::from_secs(5)).await
+}
+
+async fn accept_remote_control_backend_connection_with_timeout(
+    listener: &TcpListener,
+    accept_timeout: Duration,
+) -> (CapturedWebSocketRequest, WebSocketStream<TcpStream>) {
+    let (stream, _) = timeout(accept_timeout, listener.accept())
         .await
         .expect("websocket request should arrive in time")
         .expect("listener accept should succeed");

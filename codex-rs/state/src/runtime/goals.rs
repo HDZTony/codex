@@ -1,5 +1,7 @@
 use super::*;
 use crate::model::ThreadGoalRow;
+use crate::sqlite::SqlitePoolWriteExt;
+use crate::sqlite::SqliteWriteQueryExt;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -10,6 +12,10 @@ pub struct GoalStore {
 impl GoalStore {
     pub(crate) fn new(pool: Arc<SqlitePool>) -> Self {
         Self { pool }
+    }
+
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
     }
 }
 
@@ -59,6 +65,94 @@ WHERE thread_id = ?
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
+    }
+
+    pub async fn replace_thread_goal_snapshot(
+        &self,
+        goal: &crate::ThreadGoal,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin_immediate().await?;
+        sqlx::query(
+            r#"
+INSERT INTO thread_goals (
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(thread_id) DO UPDATE SET
+    goal_id = excluded.goal_id,
+    objective = excluded.objective,
+    status = excluded.status,
+    token_budget = excluded.token_budget,
+    tokens_used = excluded.tokens_used,
+    time_used_seconds = excluded.time_used_seconds,
+    created_at_ms = excluded.created_at_ms,
+    updated_at_ms = excluded.updated_at_ms
+            "#,
+        )
+        .bind(goal.thread_id.to_string())
+        .bind(&goal.goal_id)
+        .bind(&goal.objective)
+        .bind(goal.status.as_str())
+        .bind(goal.token_budget)
+        .bind(goal.tokens_used)
+        .bind(goal.time_used_seconds)
+        .bind(datetime_to_epoch_millis(goal.created_at))
+        .bind(datetime_to_epoch_millis(goal.updated_at))
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r#"
+INSERT INTO thread_goal_continuation_deferrals (thread_id)
+VALUES (?)
+ON CONFLICT(thread_id) DO NOTHING
+            "#,
+        )
+        .bind(goal.thread_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    pub async fn has_thread_goal_continuation_deferral(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<bool> {
+        sqlx::query_scalar(
+            r#"
+SELECT EXISTS(
+    SELECT 1
+    FROM thread_goal_continuation_deferrals
+    WHERE thread_id = ?
+)
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn clear_thread_goal_continuation_deferral(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?")
+            .bind(thread_id.to_string())
+            .execute_with_busy_retry(self.pool.as_ref())
+            .await?;
+
+        Ok(())
     }
 
     pub async fn replace_thread_goal(
@@ -112,7 +206,7 @@ RETURNING
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_one(self.pool.as_ref())
+        .fetch_one_write(self.pool.as_ref())
         .await?;
 
         thread_goal_from_row(&row)
@@ -141,7 +235,16 @@ INSERT INTO thread_goals (
     created_at_ms,
     updated_at_ms
 ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
-ON CONFLICT(thread_id) DO NOTHING
+ON CONFLICT(thread_id) DO UPDATE SET
+    goal_id = excluded.goal_id,
+    objective = excluded.objective,
+    status = excluded.status,
+    token_budget = excluded.token_budget,
+    tokens_used = 0,
+    time_used_seconds = 0,
+    created_at_ms = excluded.created_at_ms,
+    updated_at_ms = excluded.updated_at_ms
+WHERE thread_goals.status = 'complete'
 RETURNING
     thread_id,
     goal_id,
@@ -161,7 +264,7 @@ RETURNING
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional_write(self.pool.as_ref())
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
@@ -214,7 +317,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?
             }
             (Some(status), None) => {
@@ -245,7 +348,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?
             }
             (None, Some(token_budget)) => {
@@ -273,7 +376,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?
             }
             (None, None) => {
@@ -293,7 +396,7 @@ WHERE thread_id = ?
                     .bind(thread_id.to_string())
                     .bind(expected_goal_id)
                     .bind(expected_goal_id)
-                    .execute(self.pool.as_ref())
+                    .execute_with_busy_retry(self.pool.as_ref())
                     .await?
                 } else {
                     let goal = self.get_thread_goal(thread_id).await?;
@@ -358,7 +461,7 @@ WHERE thread_id = ?
         .bind(now_ms)
         .bind(thread_id.to_string())
         .bind(status.as_str())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
 
         if result.rows_affected() == 0 {
@@ -368,18 +471,31 @@ WHERE thread_id = ?
         self.get_thread_goal(thread_id).await
     }
 
-    pub async fn delete_thread_goal(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
-        let result = sqlx::query(
+    pub async fn delete_thread_goal(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let row = sqlx::query(
             r#"
 DELETE FROM thread_goals
 WHERE thread_id = ?
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
             "#,
         )
         .bind(thread_id.to_string())
-        .execute(self.pool.as_ref())
+        .fetch_optional_write(self.pool.as_ref())
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        row.map(|row| thread_goal_from_row(&row)).transpose()
     }
 
     pub async fn account_thread_goal_usage(
@@ -484,7 +600,10 @@ RETURNING
             "#,
         );
 
-        let row = builder.build().fetch_optional(self.pool.as_ref()).await?;
+        let row = builder
+            .build()
+            .fetch_optional_write(self.pool.as_ref())
+            .await?;
 
         let Some(row) = row else {
             return Ok(GoalAccountingOutcome::Unchanged(
@@ -520,12 +639,16 @@ mod tests {
     use super::*;
     use crate::runtime::test_support::test_thread_metadata;
     use crate::runtime::test_support::unique_temp_dir;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
-        StateRuntime::init(unique_temp_dir(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize")
+        StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(unique_temp_dir().as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize")
     }
 
     fn test_thread_id() -> ThreadId {
@@ -533,11 +656,8 @@ mod tests {
     }
 
     async fn upsert_test_thread(runtime: &StateRuntime, thread_id: ThreadId) {
-        let metadata = test_thread_metadata(
-            runtime.codex_home(),
-            thread_id,
-            runtime.codex_home().join("workspace"),
-        );
+        let sqlite_home = runtime.sqlite().home();
+        let metadata = test_thread_metadata(sqlite_home, thread_id, sqlite_home.join("workspace"));
         runtime
             .upsert_thread(&metadata)
             .await
@@ -613,7 +733,8 @@ mod tests {
         assert_eq!(0, replaced.tokens_used);
         assert_eq!(0, replaced.time_used_seconds);
 
-        assert!(
+        assert_eq!(
+            Some(replaced),
             runtime
                 .thread_goals()
                 .delete_thread_goal(thread_id)
@@ -628,8 +749,9 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(
-            !runtime
+        assert_eq!(
+            None,
+            runtime
                 .thread_goals()
                 .delete_thread_goal(thread_id)
                 .await

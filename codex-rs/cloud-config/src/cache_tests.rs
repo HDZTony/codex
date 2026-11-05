@@ -67,12 +67,18 @@ async fn save_writes_signed_payload_and_loads_for_matching_identity() {
     let cache = create_test_cache(codex_home.path());
     let bundle = test_bundle();
 
+    let revision = codex_config::CloudConfigBundlePolicy::default()
+        .observe_remote_bundle(&bundle)
+        .expect("cache revision");
     cache
-        .save(
+        .prepare(
             Some("user-12345".to_string()),
             Some("account-12345".to_string()),
             bundle.clone(),
         )
+        .await
+        .expect("stage cache")
+        .publish_if_current(revision)
         .await
         .expect("save cache");
 
@@ -81,7 +87,7 @@ async fn save_writes_signed_payload_and_loads_for_matching_identity() {
             .expect("parse cache");
     assert!(
         cache_file.signed_payload.expires_at
-            <= cache_file.signed_payload.cached_at + ChronoDuration::minutes(30)
+            <= cache_file.signed_payload.cached_at + ChronoDuration::minutes(60)
     );
     assert!(cache_file.signed_payload.expires_at > cache_file.signed_payload.cached_at);
     assert_eq!(

@@ -7,6 +7,7 @@ use app_test_support::to_response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -18,11 +19,20 @@ use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_core::config::set_project_trust_level;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpResponse;
+use codex_protocol::config_types::TrustLevel;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::sse;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use futures::SinkExt;
 use futures::StreamExt;
 use hmac::Hmac;
 use hmac::Mac;
-use reqwest::StatusCode;
+use http::StatusCode;
 use serde_json::json;
 use sha2::Sha256;
 use std::net::SocketAddr;
@@ -105,13 +115,113 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
 }
 
 #[tokio::test]
+async fn thread_start_routes_project_exec_policy_warning_to_requester() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let project = TempDir::new()?;
+    std::fs::create_dir(project.path().join(".git"))?;
+    let rules_dir = project.path().join(".codex/rules");
+    std::fs::create_dir_all(&rules_dir)?;
+    let rules_path = rules_dir.join("broken.rules");
+    std::fs::write(&rules_path, "prefix_rule(")?;
+    set_project_trust_level(codex_home.path(), project.path(), TrustLevel::Trusted)?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut requester = connect_websocket(bind_addr).await?;
+    let mut other_client = connect_websocket(bind_addr).await?;
+
+    send_initialize_request(&mut requester, /*id*/ 1, "requester").await?;
+    read_response_for_id(&mut requester, /*id*/ 1).await?;
+    send_initialize_request(&mut other_client, /*id*/ 2, "other_client").await?;
+    read_response_for_id(&mut other_client, /*id*/ 2).await?;
+
+    send_request(
+        &mut requester,
+        "thread/start",
+        /*id*/ 3,
+        Some(serde_json::to_value(ThreadStartParams {
+            cwd: Some(project.path().display().to_string()),
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+
+    let target_id = RequestId::Integer(3);
+    let warning_summary = "Error parsing rules; custom rules not applied.";
+    let is_exec_policy_warning = |notification: &JSONRPCNotification| {
+        notification.method == "configWarning"
+            && notification
+                .params
+                .as_ref()
+                .and_then(|params| params.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                == Some(warning_summary)
+    };
+    let mut response = None;
+    let mut warning = None;
+    while response.is_none() || warning.is_none() {
+        match read_jsonrpc_message(&mut requester).await? {
+            JSONRPCMessage::Response(candidate) if candidate.id == target_id => {
+                response = Some(candidate);
+            }
+            JSONRPCMessage::Notification(candidate) if is_exec_policy_warning(&candidate) => {
+                warning = Some(candidate);
+            }
+            _ => {}
+        }
+    }
+
+    let _: ThreadStartResponse = to_response(response.context("missing thread/start response")?)?;
+    let warning: ConfigWarningNotification = serde_json::from_value(
+        warning
+            .context("missing exec-policy configWarning")?
+            .params
+            .context("configWarning should include params")?,
+    )?;
+    assert_eq!(
+        warning
+            .path
+            .as_deref()
+            .map(Path::new)
+            .and_then(Path::file_name),
+        Some(std::ffi::OsStr::new("broken.rules"))
+    );
+
+    match timeout(Duration::from_millis(250), async {
+        loop {
+            let message = read_jsonrpc_message(&mut other_client).await?;
+            if let JSONRPCMessage::Notification(notification) = message
+                && is_exec_policy_warning(&notification)
+            {
+                return Ok::<_, anyhow::Error>(notification);
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(_)) => bail!("exec-policy configWarning leaked to another connection"),
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {}
+    }
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn websocket_transport_serves_health_endpoints_on_same_listener() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
 
     let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
-    let client = reqwest::Client::new();
+    let client = HttpClientBuilder::new().build_direct()?;
 
     let readyz = http_get(&client, bind_addr, "/readyz").await?;
     assert_eq!(readyz.status(), StatusCode::OK);
@@ -344,13 +454,86 @@ async fn websocket_transport_rejects_unauthenticated_non_loopback_startup() -> R
 }
 
 #[tokio::test]
+async fn websocket_disconnect_cancels_guardian_review_and_releases_thread() -> Result<()> {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (guardian, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+        gate: Some(gate),
+        body: sse(vec![ev_completed("review")]),
+    }]])
+    .await;
+    let home = TempDir::new()?;
+    app_test_support::MockResponsesConfig::new(guardian.uri())
+        .with_approval_policy("on-request")
+        .with_root_config("approvals_reviewer = \"auto_review\"")
+        .with_extra_config("[auto_review]\ntimeout_ms = 0")
+        .write(home.path())?;
+    let (mut process, addr) = spawn_websocket_server(home.path()).await?;
+    let mut owner = connect_websocket(addr).await?;
+    let mut observer = connect_websocket(addr).await?;
+    for client in [&mut owner, &mut observer] {
+        send_request(
+            client,
+            "initialize",
+            /*id*/ 1,
+            Some(json!({
+                "clientInfo": {"name":"guardian-test","version":"1"},
+                "capabilities": {"experimentalApi":true}
+            })),
+        )
+        .await?;
+        read_response_for_id(client, /*id*/ 1).await?;
+    }
+    let thread_id = start_thread(&mut owner, /*id*/ 2).await?;
+    send_request(&mut owner, "thread/inject_items", /*id*/ 3, Some(json!({
+        "threadId":thread_id, "items":[{
+            "type":"function_call","name":"exec_command","call_id":"review",
+            "arguments":r#"{"cmd":"touch marker","sandbox_permissions":"require_escalated","justification":"create the marker"}"#
+        }]
+    }))).await?;
+    read_response_for_id(&mut owner, /*id*/ 3).await?;
+    send_request(
+        &mut owner,
+        "thread/guardianReview",
+        /*id*/ 4,
+        Some(json!({"threadId":thread_id})),
+    )
+    .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        guardian.wait_for_request_count(/*count*/ 1),
+    )
+    .await?;
+    owner.close(None).await?;
+    drop(owner);
+
+    send_request(&mut observer, "thread/inject_items", /*id*/ 5, Some(json!({
+        "threadId":thread_id, "items":[{"type":"function_call_output","call_id":"review","output":"recorded"}]
+    }))).await?;
+    // Disconnect must release the thread before the 30-second connection drain timeout.
+    let response = timeout(
+        Duration::from_secs(10),
+        read_response_for_id(&mut observer, /*id*/ 5),
+    )
+    .await??;
+    assert_eq!(response.result, json!({}));
+    drop(release);
+    process.kill().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout() -> Result<()>
 {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
 
-    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let (mut process, bind_addr) = spawn_websocket_server_with_args(
+        codex_home.path(),
+        "ws://127.0.0.1:0",
+        &["-c".to_string(), "thread_unload_delay_secs=2".to_string()],
+    )
+    .await?;
 
     let mut ws1 = connect_websocket(bind_addr).await?;
     send_initialize_request(&mut ws1, /*id*/ 1, "ws_thread_owner").await?;
@@ -359,14 +542,15 @@ async fn websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_tim
     let thread_id = start_thread(&mut ws1, /*id*/ 2).await?;
     assert_loaded_threads(&mut ws1, /*id*/ 3, &[thread_id.as_str()]).await?;
 
-    ws1.close(None).await.context("failed to close websocket")?;
-    drop(ws1);
-
     let mut ws2 = connect_websocket(bind_addr).await?;
     send_initialize_request(&mut ws2, /*id*/ 4, "ws_reconnect_client").await?;
     read_response_for_id(&mut ws2, /*id*/ 4).await?;
 
+    ws1.close(None).await.context("failed to close websocket")?;
+    drop(ws1);
+
     wait_for_loaded_threads(&mut ws2, /*first_id*/ 5, &[thread_id.as_str()]).await?;
+    wait_for_loaded_threads(&mut ws2, /*first_id*/ 100, &[]).await?;
 
     process
         .kill()
@@ -395,7 +579,9 @@ pub(super) async fn spawn_websocket_server_with_args(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .env("CODEX_HOME", codex_home)
-        .env("RUST_LOG", "warn");
+        .env("RUST_LOG", "warn")
+        .env("OTEL_METRIC_EXPORT_INTERVAL", "200");
+
     let mut process = cmd
         .kill_on_drop(true)
         .spawn()
@@ -538,11 +724,7 @@ async fn run_websocket_server_to_completion_with_args(
         .context("failed to run websocket app-server")
 }
 
-async fn http_get(
-    client: &reqwest::Client,
-    bind_addr: SocketAddr,
-    path: &str,
-) -> Result<reqwest::Response> {
+async fn http_get(client: &HttpClient, bind_addr: SocketAddr, path: &str) -> Result<HttpResponse> {
     let connectable_bind_addr = connectable_bind_addr(bind_addr);
     let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
@@ -609,7 +791,7 @@ pub(super) async fn send_initialize_request(
     .await
 }
 
-async fn start_thread(stream: &mut WsClient, id: i64) -> Result<String> {
+pub(super) async fn start_thread(stream: &mut WsClient, id: i64) -> Result<String> {
     send_request(
         stream,
         "thread/start",
@@ -706,7 +888,7 @@ pub(super) async fn send_request(
     send_jsonrpc(stream, message).await
 }
 
-async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage) -> Result<()> {
+pub(super) async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage) -> Result<()> {
     let payload = serde_json::to_string(&message)?;
     stream
         .send(WebSocketMessage::Text(payload.into()))

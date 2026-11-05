@@ -1,15 +1,10 @@
 name: rust-ci
 on:
-  pull_request: {}
+  workflow_call:
   workflow_dispatch:
 
-# Cargo's libgit2 transport has been flaky when fetching git dependencies with
-# nested submodules. Prefer the system git CLI across every Cargo invocation.
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
 jobs:
-  # --- Detect what changed so the fast PR workflow only runs relevant jobs ----
+  # --- Detect changed paths so the fast PR workflow only runs relevant jobs ---
   changed:
     name: Detect changed areas
     runs-on: ubuntu-24.04
@@ -21,7 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Detect changed paths (no external action)
@@ -58,6 +52,10 @@ jobs:
           echo "codex=$codex" >> "$GITHUB_OUTPUT"
           echo "workflows=$workflows" >> "$GITHUB_OUTPUT"
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   # --- Fast Cargo-native PR checks -------------------------------------------
   general:
     name: Format / etc
@@ -70,18 +68,19 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: rustfmt
-      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
-        with:
-          tool: just
       - name: cargo fmt
         run: cargo fmt -- --config imports_granularity=Item --check
       - name: Rust benchmark smoke test
         run: just bench-smoke
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
 
   cargo_shear:
     name: cargo shear
@@ -94,8 +93,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
@@ -103,30 +102,34 @@ jobs:
       - name: cargo shear
         run: cargo shear --deny-warnings
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   argument_comment_lint_package:
     name: Argument comment lint package
     runs-on: ubuntu-24.04
     needs: changed
     if: ${{ needs.changed.outputs.argument_comment_lint_package == 'true' }}
     env:
-      CARGO_DYLINT_VERSION: 5.0.0
-      DYLINT_LINK_VERSION: 5.0.0
+      CARGO_DYLINT_VERSION: 6.3.0
+      DYLINT_LINK_VERSION: 6.3.0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - name: Install nightly argument-comment-lint toolchain
         shell: bash
         run: |
-          rustup toolchain install nightly-2025-09-18 \
+          rustup toolchain install nightly-2026-08-20 \
             --profile minimal \
             --component llvm-tools-preview \
             --component rustc-dev \
             --component rust-src \
             --no-self-update
-          rustup default nightly-2025-09-18
+          rustup default nightly-2026-08-20
       - name: Cache cargo-dylint tooling
         id: cargo_dylint_cache
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
@@ -150,15 +153,25 @@ jobs:
         run: python3 -m unittest discover -s tools/argument-comment-lint -p 'test_*.py'
       - name: Test argument comment lint package
         working-directory: tools/argument-comment-lint
-        run: cargo test
+        run: cargo test --locked
         env:
           RUST_MIN_STACK: "8388608" # 8 MiB
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   argument_comment_lint_prebuilt:
     name: Argument comment lint - ${{ matrix.name }}
+    # This job runs through Bazel and is advisory while the BuildBuddy key is
+    # revoked. Restore blocking behavior once it can run without BuildBuddy.
+    continue-on-error: true
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     needs: changed
+    environment:
+      name: bazel
+      deployment: false
     strategy:
       fail-fast: false
       matrix:
@@ -173,8 +186,8 @@ jobs:
             runner: windows-x64
             timeout_minutes: 30
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
     steps:
       - name: Check whether argument comment lint should run
         id: argument_comment_lint_gate
@@ -193,14 +206,16 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: ${{ steps.argument_comment_lint_gate.outputs.run == 'true' }}
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Run argument comment lint on codex-rs via Bazel
         if: ${{ steps.argument_comment_lint_gate.outputs.run == 'true' }}
         uses: ./.github/actions/run-argument-comment-lint
         with:
           target: ${{ runner.os }}
-          buildbuddy-api-key: ${{ secrets.BUILDBUDDY_API_KEY }}
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled() && steps.argument_comment_lint_gate.outputs.run == 'true'
+        uses: ./.github/actions/check-clean-worktree
 
   # --- Gatherer job that you mark as the ONLY required status -----------------
   results:
@@ -235,9 +250,7 @@ jobs:
             [[ '${{ needs.argument_comment_lint_package.result }}' == 'success' ]] || { echo 'argument_comment_lint_package failed'; exit 1; }
           fi
 
-          if [[ "${NEEDS_CHANGED_OUTPUTS_ARGUMENT_COMMENT_LINT}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
-            [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
-          fi
+          # The Bazel-backed argument-comment lint job is temporarily advisory.
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_CODEX}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
             [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }

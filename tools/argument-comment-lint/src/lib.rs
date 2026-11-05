@@ -13,15 +13,16 @@ extern crate rustc_span;
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::fn_def_id;
-use clippy_utils::is_res_lang_ctor;
 use clippy_utils::peel_blocks;
+use clippy_utils::res::MaybeDef;
+use clippy_utils::res::MaybeQPath;
 use clippy_utils::source::snippet;
 use rustc_ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::Expr;
 use rustc_hir::ExprKind;
-use rustc_hir::LangItem;
 use rustc_hir::UnOp;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_lint::LateContext;
 use rustc_lint::LateLintPass;
@@ -40,7 +41,7 @@ pub fn register_lints(_sess: &rustc_session::Session, lint_store: &mut rustc_lin
         ARGUMENT_COMMENT_MISMATCH,
         UNCOMMENTED_ANONYMOUS_LITERAL_ARGUMENT,
     ]);
-    lint_store.register_late_pass(|_| Box::new(ArgumentCommentLint));
+    lint_store.register_late_lint_pass(Box::new(|_| Box::new(ArgumentCommentLint)));
 }
 
 rustc_session::declare_lint! {
@@ -88,6 +89,8 @@ rustc_session::declare_lint! {
     ///
     /// Requires a `/*param*/` comment before anonymous literal-like
     /// arguments such as `None`, booleans, and numeric literals.
+    /// A method's sole non-self argument is exempt when its name matches the
+    /// method name.
     ///
     /// ### Why is this bad?
     ///
@@ -125,6 +128,11 @@ rustc_session::declare_lint! {
 #[derive(Default)]
 pub struct ArgumentCommentLint;
 
+enum CallKind {
+    Function,
+    Method { name: String },
+}
+
 rustc_session::impl_lint_pass!(
     ArgumentCommentLint => [ARGUMENT_COMMENT_MISMATCH, UNCOMMENTED_ANONYMOUS_LITERAL_ARGUMENT]
 );
@@ -137,10 +145,18 @@ impl<'tcx> LateLintPass<'tcx> for ArgumentCommentLint {
 
         match expr.kind {
             ExprKind::Call(callee, args) => {
-                self.check_call(cx, expr, callee.span, args, 0);
+                self.check_call(cx, expr, callee.span, args, CallKind::Function);
             }
-            ExprKind::MethodCall(_, receiver, args, _) => {
-                self.check_call(cx, expr, receiver.span, args, 1);
+            ExprKind::MethodCall(method, receiver, args, _) => {
+                self.check_call(
+                    cx,
+                    expr,
+                    receiver.span,
+                    args,
+                    CallKind::Method {
+                        name: method.ident.name.to_string(),
+                    },
+                );
             }
             _ => {}
         }
@@ -154,7 +170,7 @@ impl ArgumentCommentLint {
         call: &'tcx Expr<'tcx>,
         first_gap_anchor: Span,
         args: &'tcx [Expr<'tcx>],
-        parameter_offset: usize,
+        call_kind: CallKind,
     ) {
         let Some(def_id) = fn_def_id(cx, call) else {
             return;
@@ -167,6 +183,11 @@ impl ArgumentCommentLint {
             return;
         }
 
+        // Method parameter lists include `self`, which is not present in `args`.
+        let (parameter_offset, method_name) = match &call_kind {
+            CallKind::Function => (0, None),
+            CallKind::Method { name } => (1, Some(name.as_str())),
+        };
         let parameter_names: Vec<_> = cx.tcx.fn_arg_idents(def_id).iter().copied().collect();
         for (index, arg) in args.iter().enumerate() {
             if arg.span.from_expansion() {
@@ -215,6 +236,12 @@ impl ArgumentCommentLint {
                 continue;
             }
 
+            // Don't require a clarifying comment for self-documenting arguments whose names
+            // match the method.
+            if args.len() == 1 && method_name == Some(expected_name.as_str()) {
+                continue;
+            }
+
             if !is_anonymous_literal_like(cx, arg) {
                 continue;
             }
@@ -240,9 +267,10 @@ fn is_anonymous_literal_like(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
             LitKind::Str(..) | LitKind::ByteStr(..) | LitKind::CStr(..) | LitKind::Char(..)
         ),
         ExprKind::Unary(UnOp::Neg, inner) => matches!(peel_blocks(inner).kind, ExprKind::Lit(_)),
-        ExprKind::Path(qpath) => {
-            is_res_lang_ctor(cx, cx.qpath_res(&qpath, expr.hir_id), LangItem::OptionNone)
-        }
+        ExprKind::Path(_) => expr
+            .res(cx)
+            .ctor_parent(cx)
+            .is_lang_item(cx, LangItem::OptionNone),
         _ => false,
     }
 }
@@ -252,11 +280,7 @@ fn is_meaningful_parameter_name(name: &str) -> bool {
 }
 
 fn is_workspace_crate_name(name: &str) -> bool {
-    name.starts_with("codex_")
-        || matches!(
-            name,
-            "app_test_support" | "core_test_support" | "mcp_test_support"
-        )
+    name.starts_with("codex_") || matches!(name, "app_test_support" | "core_test_support")
 }
 
 #[test]

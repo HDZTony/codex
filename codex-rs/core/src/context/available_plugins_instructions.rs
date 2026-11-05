@@ -1,27 +1,35 @@
-use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct AvailablePluginsInstructions {
-    plugins: Vec<PluginCapabilitySummary>,
+pub(crate) struct AvailablePluginsInstructions(pub(crate) String);
+
+impl From<codex_prompts::ResolvedGenericPluginMessages> for AvailablePluginsInstructions {
+    fn from(messages: codex_prompts::ResolvedGenericPluginMessages) -> Self {
+        let intro = messages.intro;
+        let usage = messages.usage_instructions;
+        Self(format!(
+            "\n## Plugins\n{intro}\n### How to use plugins\n{usage}\n"
+        ))
+    }
 }
 
-impl AvailablePluginsInstructions {
-    pub(crate) fn from_plugins(plugins: &[PluginCapabilitySummary]) -> Option<Self> {
-        if plugins.is_empty() {
-            return None;
-        }
-
-        Some(Self {
-            plugins: plugins.to_vec(),
-        })
+impl Default for AvailablePluginsInstructions {
+    fn default() -> Self {
+        Self::from(codex_prompts::ResolvedModelMessages::bundled().generic_plugin())
     }
 }
 
 impl ContextualUserFragment for AvailablePluginsInstructions {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("plugins.usage_instructions".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -37,33 +45,7 @@ impl ContextualUserFragment for AvailablePluginsInstructions {
         )
     }
 
-    fn body(&self) -> String {
-        let mut lines = vec![
-            "## Plugins".to_string(),
-            "A plugin is a local bundle of skills, MCP servers, and apps. Below is the list of plugins that are enabled and available in this session.".to_string(),
-            "### Available plugins".to_string(),
-        ];
-
-        lines.extend(
-            self.plugins
-                .iter()
-                .map(|plugin| match plugin.description.as_deref() {
-                    Some(description) => format!("- `{}`: {description}", plugin.display_name),
-                    None => format!("- `{}`", plugin.display_name),
-                }),
-        );
-
-        lines.push("### How to use plugins".to_string());
-        lines.push(
-            r###"- Discovery: The list above is the plugins available in this session.
-- Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.
-- Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
-- Preference: When a relevant plugin is available, prefer using capabilities associated with that plugin over standalone capabilities that provide similar functionality.
-- Missing/blocked: If the user requests a plugin that is not listed above, or the plugin does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback."###
-                .to_string(),
-        );
-
-        format!("\n{}\n", lines.join("\n"))
+    fn body(&self) -> ContentItem {
+        input_text(self.0.clone())
     }
 }

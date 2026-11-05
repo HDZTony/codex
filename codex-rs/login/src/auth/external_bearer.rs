@@ -1,11 +1,13 @@
+use super::manager::CodexAuth;
 use super::manager::ExternalAuth;
+use super::manager::ExternalAuthFuture;
 use super::manager::ExternalAuthRefreshContext;
-use super::manager::ExternalAuthTokens;
-use async_trait::async_trait;
-use codex_app_server_protocol::AuthMode;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
+use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -20,24 +22,17 @@ pub(crate) struct BearerTokenRefresher {
 }
 
 impl BearerTokenRefresher {
-    pub(crate) fn new(config: ModelProviderAuthInfo) -> Self {
+    pub(crate) fn new(config: ModelProviderAuthInfo, env: HashMap<String, OsString>) -> Self {
         Self {
-            state: Arc::new(ExternalBearerAuthState::new(config)),
+            state: Arc::new(ExternalBearerAuthState::new(config, env)),
         }
-    }
-}
-
-#[async_trait]
-impl ExternalAuth for BearerTokenRefresher {
-    fn auth_mode(&self) -> AuthMode {
-        AuthMode::ApiKey
     }
 
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "external bearer cache misses intentionally hold cached_token across the provider command to avoid duplicate refreshes"
     )]
-    async fn resolve(&self) -> io::Result<Option<ExternalAuthTokens>> {
+    async fn resolve(&self) -> io::Result<CodexAuth> {
         let access_token = {
             let mut cached = self.state.cached_token.lock().await;
             if let Some(cached_token) = cached.as_ref() {
@@ -46,33 +41,39 @@ impl ExternalAuth for BearerTokenRefresher {
                     None => true,
                 };
                 if should_use_cached_token {
-                    return Ok(Some(ExternalAuthTokens::access_token_only(
-                        cached_token.access_token.clone(),
-                    )));
+                    return Ok(CodexAuth::from_api_key(cached_token.access_token.as_str()));
                 }
             }
 
-            let access_token = run_provider_auth_command(&self.state.config).await?;
+            let access_token =
+                run_provider_auth_command(&self.state.config, &self.state.env).await?;
             *cached = Some(CachedExternalBearerToken {
                 access_token: access_token.clone(),
                 fetched_at: Instant::now(),
             });
             access_token
         };
-        Ok(Some(ExternalAuthTokens::access_token_only(access_token)))
+        Ok(CodexAuth::from_api_key(access_token.as_str()))
     }
 
-    async fn refresh(
-        &self,
-        _context: ExternalAuthRefreshContext,
-    ) -> io::Result<ExternalAuthTokens> {
-        let access_token = run_provider_auth_command(&self.state.config).await?;
+    async fn refresh(&self, _context: ExternalAuthRefreshContext) -> io::Result<CodexAuth> {
+        let access_token = run_provider_auth_command(&self.state.config, &self.state.env).await?;
         let mut cached = self.state.cached_token.lock().await;
         *cached = Some(CachedExternalBearerToken {
             access_token: access_token.clone(),
             fetched_at: Instant::now(),
         });
-        Ok(ExternalAuthTokens::access_token_only(access_token))
+        Ok(CodexAuth::from_api_key(access_token.as_str()))
+    }
+}
+
+impl ExternalAuth for BearerTokenRefresher {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(BearerTokenRefresher::resolve(self))
+    }
+
+    fn refresh(&self, context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(BearerTokenRefresher::refresh(self, context))
     }
 }
 
@@ -85,13 +86,15 @@ impl fmt::Debug for BearerTokenRefresher {
 
 struct ExternalBearerAuthState {
     config: ModelProviderAuthInfo,
+    env: HashMap<String, OsString>,
     cached_token: Mutex<Option<CachedExternalBearerToken>>,
 }
 
 impl ExternalBearerAuthState {
-    fn new(config: ModelProviderAuthInfo) -> Self {
+    fn new(config: ModelProviderAuthInfo, env: HashMap<String, OsString>) -> Self {
         Self {
             config,
+            env,
             cached_token: Mutex::new(None),
         }
     }
@@ -102,11 +105,15 @@ struct CachedExternalBearerToken {
     fetched_at: Instant,
 }
 
-async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result<String> {
+async fn run_provider_auth_command(
+    config: &ModelProviderAuthInfo,
+    env: &HashMap<String, OsString>,
+) -> io::Result<String> {
     let program = resolve_provider_auth_program(&config.command, &config.cwd)?;
-    let mut command = Command::new(&program);
+    let mut command = Command::from(codex_utils_process::background_command(&program));
     command
-        .args(&config.args)
+        .args(config.args.iter().map(Deref::deref))
+        .envs(env)
         .current_dir(config.cwd.as_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -123,10 +130,13 @@ async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result
             ))
         })?
         .map_err(|err| {
-            io::Error::other(format!(
-                "provider auth command `{}` failed to start: {err}",
-                config.command
-            ))
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "provider auth command `{}` failed to start: {err}",
+                    config.command
+                ),
+            )
         })?;
 
     if !output.status.success() {

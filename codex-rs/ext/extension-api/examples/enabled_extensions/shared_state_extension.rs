@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_extension_api::ContentItemKind;
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -17,7 +18,7 @@ pub fn install(registry: &mut ExtensionRegistryBuilder<()>) {
 struct StyleContributor;
 
 impl ContextContributor for StyleContributor {
-    fn contribute<'a>(
+    fn contribute_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
@@ -28,6 +29,7 @@ impl ContextContributor for StyleContributor {
 
             vec![PromptFragment::developer_policy(
                 "Prefer short answers unless the user asks for detail.",
+                ContentItemKind("example.style_instructions".to_string()),
             )]
         })
     }
@@ -37,7 +39,7 @@ impl ContextContributor for StyleContributor {
 struct UsageContributor;
 
 impl ContextContributor for UsageContributor {
-    fn contribute<'a>(
+    fn contribute_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
@@ -48,6 +50,7 @@ impl ContextContributor for UsageContributor {
 
             vec![PromptFragment::developer_capability(
                 "This extension can contribute more than one prompt fragment.",
+                ContentItemKind("example.usage_instructions".to_string()),
             )]
         })
     }

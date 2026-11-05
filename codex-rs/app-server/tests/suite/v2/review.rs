@@ -1,16 +1,14 @@
 use anyhow::Result;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use app_test_support::create_command_execution_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
-use app_test_support::create_shell_command_sse_response;
-use app_test_support::to_response;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
@@ -18,24 +16,29 @@ use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
-use codex_app_server_protocol::ThreadStartedNotification;
-use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::TurnItemsView;
-use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_features::Feature;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
+#[test_case(None; "omitted_delivery")]
+#[test_case(Some(json!(null)); "null_delivery")]
+#[test_case(Some(json!("inline")); "inline_delivery")]
 #[tokio::test]
-async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()> {
+async fn review_start_runs_review_turn_and_emits_code_review_item(
+    delivery: Option<serde_json::Value>,
+) -> Result<()> {
     let review_payload = json!({
         "findings": [
             {
@@ -59,59 +62,51 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let thread_id = start_default_thread(&mut mcp).await?;
-
-    let review_req = mcp
-        .send_review_start_request(ReviewStartParams {
-            thread_id: thread_id.clone(),
-            delivery: Some(ReviewDelivery::Inline),
-            target: ReviewTarget::Commit {
-                sha: "1234567deadbeef".to_string(),
-                title: Some("Tidy UI colors".to_string()),
-            },
-        })
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
         .await?;
-    let review_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
-    )
-    .await??;
+    let thread_id = start_default_thread(&mut mcp).await?;
+    let mut params = json!({
+        "threadId": thread_id,
+        "target": {
+            "type": "commit",
+            "sha": "1234567deadbeef",
+            "title": "Tidy UI colors",
+        },
+    });
+    if let Some(delivery) = delivery {
+        params["delivery"] = delivery;
+    }
+    let request_id = mcp.send_raw_request("review/start", Some(params)).await?;
     let ReviewStartResponse {
         turn,
         review_thread_id,
-    } = to_response::<ReviewStartResponse>(review_resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(review_thread_id, thread_id.clone());
     let turn_id = turn.id.clone();
     assert_eq!(turn.status, TurnStatus::InProgress);
     assert_eq!(turn.items_view, TurnItemsView::NotLoaded);
     assert_eq!(
         turn.items,
-        vec![ThreadItem::UserMessage {
+        [ThreadItem::untimed(ThreadItemPayload::UserMessage {
             id: turn_id.clone(),
             client_id: None,
             content: vec![V2UserInput::Text {
                 text: "commit 1234567: Tidy UI colors".to_string(),
                 text_elements: Vec::new(),
             }],
-        }]
+        })]
     );
 
     // Confirm we see the EnteredReviewMode marker on the main thread.
     let mut saw_entered_review_mode = false;
     for _ in 0..10 {
-        let item_started: JSONRPCNotification = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("item/started"),
-        )
-        .await??;
         let started: ItemStartedNotification =
-            serde_json::from_value(item_started.params.expect("params must be present"))?;
-        match started.item {
-            ThreadItem::EnteredReviewMode { id, review } => {
-                assert_eq!(id, turn_id);
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("item/started")).await??;
+        match started.item.payload {
+            ThreadItemPayload::EnteredReviewMode { review, .. } => {
+                assert_eq!(started.turn_id, turn_id);
                 assert_eq!(review, "commit 1234567: Tidy UI colors");
                 saw_entered_review_mode = true;
                 break;
@@ -128,16 +123,14 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
     // on the same turn. Ignore any other items the stream surfaces.
     let mut review_body: Option<String> = None;
     for _ in 0..10 {
-        let review_notif: JSONRPCNotification = timeout(
+        let completed: ItemCompletedNotification = timeout(
             DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("item/completed"),
+            mcp.read_notification("item/completed"),
         )
         .await??;
-        let completed: ItemCompletedNotification =
-            serde_json::from_value(review_notif.params.expect("params must be present"))?;
-        match completed.item {
-            ThreadItem::ExitedReviewMode { id, review } => {
-                assert_eq!(id, turn_id);
+        match completed.item.payload {
+            ThreadItemPayload::ExitedReviewMode { review, .. } => {
+                assert_eq!(completed.turn_id, turn_id);
                 review_body = Some(review);
                 break;
             }
@@ -148,6 +141,12 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
     let review = review_body.expect("did not observe a code review item");
     assert!(review.contains("Prefer Stylize helpers"));
     assert!(review.contains("/tmp/file.rs:10-20"));
+    assert!(
+        !mcp.pending_notification_methods()
+            .iter()
+            .any(|method| method == "deprecationNotice"),
+        "inline reviews should not emit a deprecation notice"
+    );
 
     Ok(())
 }
@@ -156,7 +155,7 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
 #[ignore = "TODO(owenlin0): flaky"]
 async fn review_start_exec_approval_item_id_matches_command_execution_item() -> Result<()> {
     let responses = vec![
-        create_shell_command_sse_response(
+        create_command_execution_sse_response(
             vec![
                 "git".to_string(),
                 "rev-parse".to_string(),
@@ -171,41 +170,42 @@ async fn review_start_exec_approval_item_id_matches_command_execution_item() -> 
     let server = create_mock_responses_server_sequence(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml_with_approval_policy(codex_home.path(), &server.uri(), "untrusted")?;
+    MockResponsesConfig::new(&server.uri())
+        .with_provider_name("Mock provider")
+        .with_approval_policy("on-request")
+        .disable_feature(Feature::ShellSnapshot)
+        .write(codex_home.path())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
     let thread_id = start_default_thread(&mut mcp).await?;
-
-    let review_req = mcp
-        .send_review_start_request(ReviewStartParams {
-            thread_id,
-            delivery: Some(ReviewDelivery::Inline),
-            target: ReviewTarget::Commit {
-                sha: "1234567deadbeef".to_string(),
-                title: Some("Check review approvals".to_string()),
+    let ReviewStartResponse { turn, .. } = mcp
+        .request(|request_id| ClientRequest::ReviewStart {
+            request_id,
+            params: ReviewStartParams {
+                thread_id,
+                delivery: Some(ReviewDelivery::Inline),
+                target: ReviewTarget::Commit {
+                    sha: "1234567deadbeef".to_string(),
+                    title: Some("Check review approvals".to_string()),
+                },
             },
         })
         .await?;
-    let review_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
-    )
-    .await??;
-    let ReviewStartResponse { turn, .. } = to_response::<ReviewStartResponse>(review_resp)?;
     let turn_id = turn.id.clone();
     assert_eq!(turn.items_view, TurnItemsView::NotLoaded);
     assert_eq!(
         turn.items,
-        vec![ThreadItem::UserMessage {
+        [ThreadItem::untimed(ThreadItemPayload::UserMessage {
             id: turn_id.clone(),
             client_id: None,
             content: vec![V2UserInput::Text {
                 text: "commit 1234567: Check review approvals".to_string(),
                 text_elements: Vec::new(),
             }],
-        }]
+        })]
     );
 
     let server_req = timeout(
@@ -221,14 +221,9 @@ async fn review_start_exec_approval_item_id_matches_command_execution_item() -> 
 
     let mut command_item_id = None;
     for _ in 0..10 {
-        let item_started: JSONRPCNotification = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("item/started"),
-        )
-        .await??;
         let started: ItemStartedNotification =
-            serde_json::from_value(item_started.params.expect("params must be present"))?;
-        if let ThreadItem::CommandExecution { id, .. } = started.item {
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("item/started")).await??;
+        if let ThreadItemPayload::CommandExecution { id, .. } = started.item.payload {
             command_item_id = Some(id);
             break;
         }
@@ -256,8 +251,10 @@ async fn review_start_rejects_empty_base_branch() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
     let thread_id = start_default_thread(&mut mcp).await?;
 
     let request_id = mcp
@@ -284,101 +281,16 @@ async fn review_start_rejects_empty_base_branch() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(target_os = "windows", ignore = "flaky on windows CI")]
-#[tokio::test]
-async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<()> {
-    let review_payload = json!({
-        "findings": [],
-        "overall_correctness": "ok",
-        "overall_explanation": "detached review",
-        "overall_confidence_score": 0.5
-    })
-    .to_string();
-    let server = create_mock_responses_server_repeating_assistant(&review_payload).await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
-
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let thread_id = start_default_thread(&mut mcp).await?;
-    materialize_thread_rollout(&mut mcp, &thread_id).await?;
-
-    let review_req = mcp
-        .send_review_start_request(ReviewStartParams {
-            thread_id: thread_id.clone(),
-            delivery: Some(ReviewDelivery::Detached),
-            target: ReviewTarget::Custom {
-                instructions: "detached review".to_string(),
-            },
-        })
-        .await?;
-    let review_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
-    )
-    .await??;
-    let ReviewStartResponse {
-        turn,
-        review_thread_id,
-    } = to_response::<ReviewStartResponse>(review_resp)?;
-
-    assert_eq!(turn.status, TurnStatus::InProgress);
-    assert_eq!(turn.items_view, TurnItemsView::NotLoaded);
-    assert_eq!(
-        turn.items,
-        vec![ThreadItem::UserMessage {
-            id: turn.id.clone(),
-            client_id: None,
-            content: vec![V2UserInput::Text {
-                text: "detached review".to_string(),
-                text_elements: Vec::new(),
-            }],
-        }]
-    );
-    assert_ne!(
-        review_thread_id, thread_id,
-        "detached review should run on a different thread"
-    );
-
-    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
-    let notification = loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let message = timeout(remaining, mcp.read_next_message()).await??;
-        let JSONRPCMessage::Notification(notification) = message else {
-            continue;
-        };
-        if notification.method == "thread/status/changed" {
-            let status_changed: ThreadStatusChangedNotification =
-                serde_json::from_value(notification.params.expect("params must be present"))?;
-            if status_changed.thread_id == review_thread_id {
-                anyhow::bail!(
-                    "detached review threads should be introduced without a preceding thread/status/changed"
-                );
-            }
-            continue;
-        }
-        if notification.method == "thread/started" {
-            break notification;
-        }
-    };
-    let started: ThreadStartedNotification =
-        serde_json::from_value(notification.params.expect("params must be present"))?;
-    assert_eq!(started.thread.id, review_thread_id);
-    assert_eq!(started.thread.session_id, review_thread_id);
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn review_start_rejects_empty_commit_sha() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
     let thread_id = start_default_thread(&mut mcp).await?;
 
     let request_id = mcp
@@ -412,8 +324,10 @@ async fn review_start_rejects_empty_custom_instructions() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
     let thread_id = start_default_thread(&mut mcp).await?;
 
     let request_id = mcp
@@ -444,18 +358,12 @@ async fn review_start_rejects_empty_custom_instructions() -> Result<()> {
 }
 
 async fn start_default_thread(mcp: &mut TestAppServer) -> Result<String> {
-    let thread_req = mcp
-        .send_thread_start_request(ThreadStartParams {
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
         .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("thread/started"),
@@ -464,61 +372,9 @@ async fn start_default_thread(mcp: &mut TestAppServer) -> Result<String> {
     Ok(thread.id)
 }
 
-async fn materialize_thread_rollout(mcp: &mut TestAppServer, thread_id: &str) -> Result<()> {
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread_id.to_string(),
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "materialize rollout".to_string(),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-    Ok(())
-}
-
 fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
-    create_config_toml_with_approval_policy(codex_home, server_uri, "never")
-}
-
-fn create_config_toml_with_approval_policy(
-    codex_home: &std::path::Path,
-    server_uri: &str,
-    approval_policy: &str,
-) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "{approval_policy}"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[features]
-shell_snapshot = false
-
-[model_providers.mock_provider]
-name = "Mock provider"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
+    MockResponsesConfig::new(server_uri)
+        .with_provider_name("Mock provider")
+        .disable_feature(Feature::ShellSnapshot)
+        .write(codex_home)
 }

@@ -6,7 +6,17 @@ import type { TurnError } from "./TurnError";
 import type { TurnItemsView } from "./TurnItemsView";
 import type { TurnStatus } from "./TurnStatus";
 
-export type Turn = { id: string,
+export type Turn = {
+/**
+ * Identifier for this turn. Codex-generated turn IDs are UUIDv7.
+ */
+id: string,
+/**
+ * ID of the first turn in the chain of work that led to this turn.
+ * Pass this as `rootTurnId` when starting work on behalf of this turn.
+ * May be null in older history or a `review/start` response.
+ */
+rootTurnId: string | null,
 /**
  * Thread items currently included in this turn payload.
  */
@@ -16,7 +26,7 @@ items: Array<ThreadItem>,
  */
 itemsView: TurnItemsView, status: TurnStatus,
 /**
- * Only populated when the Turn's status is failed.
+ * Error associated with a failed or interrupted turn.
  */
 error: TurnError | null,
 /**

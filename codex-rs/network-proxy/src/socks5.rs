@@ -1,5 +1,8 @@
+use crate::attribution::BindConnectionAttribution;
 use crate::config::NetworkMode;
 use crate::connect_policy::TargetCheckedTcpConnector;
+use crate::connection_lifecycle::CancelOnShutdown;
+use crate::mitm;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
 use crate::network_policy::NetworkDecisionSource;
@@ -16,18 +19,26 @@ use crate::reasons::REASON_MITM_REQUIRED;
 use crate::reasons::REASON_PROXY_DISABLED;
 use crate::responses::PolicyDecisionDetails;
 use crate::responses::blocked_message_with_policy;
+use crate::runtime::HostMitmRequirement;
 use crate::state::BlockedRequest;
 use crate::state::BlockedRequestArgs;
 use crate::state::NetworkProxyState;
 use anyhow::Context as _;
 use anyhow::Result;
-use rama_core::Layer;
 use rama_core::Service;
 use rama_core::error::BoxError;
+use rama_core::extensions::Extensions;
+use rama_core::extensions::ExtensionsMut;
 use rama_core::extensions::ExtensionsRef;
-use rama_core::layer::AddInputExtensionLayer;
+use rama_core::graceful::ShutdownGuard;
+use rama_core::service::BoxService;
 use rama_core::service::service_fn;
+use rama_net::address::HostWithPort;
 use rama_net::client::EstablishedClientConnection;
+use rama_net::proxy::ProxyRequest;
+use rama_net::proxy::ProxyTarget;
+use rama_net::proxy::StreamForwardService;
+use rama_net::stream::Socket;
 use rama_net::stream::SocketInfo;
 use rama_socks5::Socks5Acceptor;
 use rama_socks5::server::DefaultConnector;
@@ -40,8 +51,14 @@ use rama_tcp::server::TcpListener;
 use std::io;
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context as TaskContext;
+use std::task::Poll;
 use std::time::Instant;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::ReadBuf;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -50,7 +67,9 @@ pub async fn run_socks5(
     state: Arc<NetworkProxyState>,
     addr: SocketAddr,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
     enable_socks5_udp: bool,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let listener = TcpListener::build()
         .bind(addr)
@@ -60,25 +79,45 @@ pub async fn run_socks5(
         .map_err(anyhow::Error::from)
         .with_context(|| format!("bind SOCKS5 proxy: {addr}"))?;
 
-    run_socks5_with_listener(state, listener, policy_decider, enable_socks5_udp).await
+    run_socks5_with_listener(
+        state,
+        listener,
+        policy_decider,
+        environment_id,
+        enable_socks5_udp,
+        guard,
+    )
+    .await
 }
 
 pub async fn run_socks5_with_std_listener(
     state: Arc<NetworkProxyState>,
     listener: StdTcpListener,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
     enable_socks5_udp: bool,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let listener =
         TcpListener::try_from(listener).context("convert std listener to SOCKS5 proxy listener")?;
-    run_socks5_with_listener(state, listener, policy_decider, enable_socks5_udp).await
+    run_socks5_with_listener(
+        state,
+        listener,
+        policy_decider,
+        environment_id,
+        enable_socks5_udp,
+        guard,
+    )
+    .await
 }
 
 async fn run_socks5_with_listener(
     state: Arc<NetworkProxyState>,
     listener: TcpListener,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
     enable_socks5_udp: bool,
+    guard: ShutdownGuard,
 ) -> Result<()> {
     let addr = listener
         .local_addr()
@@ -88,7 +127,9 @@ async fn run_socks5_with_listener(
 
     match state.network_mode().await {
         Ok(NetworkMode::Limited) => {
-            info!("SOCKS5 is blocked in limited mode; set mode=\"full\" to allow SOCKS5");
+            info!(
+                "SOCKS5 UDP and non-HTTPS SOCKS5 TCP are blocked in limited mode; HTTPS SOCKS5 TCP requires MITM inspection"
+            );
         }
         Ok(NetworkMode::Full) => {}
         Err(err) => {
@@ -96,46 +137,72 @@ async fn run_socks5_with_listener(
         }
     }
 
+    listener
+        .serve_graceful(
+            guard,
+            CancelOnShutdown::new(socks5_proxy_service(
+                state,
+                policy_decider,
+                environment_id,
+                enable_socks5_udp,
+            )),
+        )
+        .await;
+    Ok(())
+}
+
+pub(crate) fn socks5_proxy_service(
+    state: Arc<NetworkProxyState>,
+    policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
+    enable_socks5_udp: bool,
+) -> BoxService<TcpStream, (), BoxError> {
     let tcp_connector = TargetCheckedTcpConnector::new(state.clone());
     let policy_tcp_connector = service_fn({
         let policy_decider = policy_decider.clone();
+        let environment_id = environment_id.clone();
         move |req: TcpRequest| {
             let tcp_connector = tcp_connector.clone();
             let policy_decider = policy_decider.clone();
-            async move { handle_socks5_tcp(req, tcp_connector, policy_decider).await }
+            let environment_id = environment_id.clone();
+            async move { handle_socks5_tcp(req, tcp_connector, policy_decider, environment_id).await }
         }
     });
 
-    let socks_connector = DefaultConnector::default().with_connector(policy_tcp_connector);
+    let socks_proxy = service_fn(|request| async move { proxy_socks5_tcp(request).await });
+    let socks_connector = DefaultConnector::default()
+        .with_connector(policy_tcp_connector)
+        .with_service(socks_proxy);
     let base = Socks5Acceptor::new().with_connector(socks_connector);
 
     if enable_socks5_udp {
         let udp_state = state.clone();
         let udp_decider = policy_decider.clone();
-        let udp_relay = DefaultUdpRelay::default().with_async_inspector(service_fn({
-            move |request: RelayRequest| {
-                let udp_state = udp_state.clone();
-                let udp_decider = udp_decider.clone();
-                async move { inspect_socks5_udp(request, udp_state, udp_decider).await }
-            }
-        }));
+        let udp_relay =
+            DefaultUdpRelay::default().with_async_inspector(service_fn({
+                let environment_id = environment_id.clone();
+                move |request: RelayRequest| {
+                    let udp_state = udp_state.clone();
+                    let udp_decider = udp_decider.clone();
+                    let environment_id = environment_id.clone();
+                    async move {
+                        inspect_socks5_udp(request, udp_state, udp_decider, environment_id).await
+                    }
+                }
+            }));
         let socks_acceptor = base.with_udp_associator(udp_relay);
-        listener
-            .serve(AddInputExtensionLayer::new(state).into_layer(socks_acceptor))
-            .await;
+        BindConnectionAttribution::new(socks_acceptor, state, environment_id).boxed()
     } else {
-        listener
-            .serve(AddInputExtensionLayer::new(state).into_layer(base))
-            .await;
+        BindConnectionAttribution::new(base, state, environment_id).boxed()
     }
-    Ok(())
 }
 
 async fn handle_socks5_tcp(
     req: TcpRequest,
     tcp_connector: TargetCheckedTcpConnector,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
-) -> Result<EstablishedClientConnection<TcpStream, TcpRequest>, BoxError> {
+    environment_id: Option<String>,
+) -> Result<EstablishedClientConnection<Socks5TcpConnection, TcpRequest>, BoxError> {
     let app_state = req
         .extensions()
         .get::<Arc<NetworkProxyState>>()
@@ -144,6 +211,7 @@ async fn handle_socks5_tcp(
 
     let host = normalize_host(&req.authority.host.to_string());
     let port = req.authority.port;
+    let target = req.authority.clone();
     if host.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid host").into());
     }
@@ -196,100 +264,66 @@ async fn handle_socks5_tcp(
         }
     }
 
-    match app_state.network_mode().await {
-        Ok(NetworkMode::Limited) => {
-            emit_socks_block_decision_audit_event(
-                &app_state,
-                NetworkDecisionSource::ModeGuard,
-                REASON_METHOD_NOT_ALLOWED,
-                NetworkProtocol::Socks5Tcp,
-                host.as_str(),
-                port,
-                client.as_deref(),
-            );
-            let details = PolicyDecisionDetails {
-                decision: NetworkPolicyDecision::Deny,
-                reason: REASON_METHOD_NOT_ALLOWED,
-                source: NetworkDecisionSource::ModeGuard,
-                protocol: NetworkProtocol::Socks5Tcp,
-                host: &host,
-                port,
-            };
-            let _ = app_state
-                .record_blocked(BlockedRequest::new(BlockedRequestArgs {
-                    host: host.clone(),
-                    reason: REASON_METHOD_NOT_ALLOWED.to_string(),
-                    client: client.clone(),
-                    method: None,
-                    mode: Some(NetworkMode::Limited),
-                    protocol: "socks5".to_string(),
-                    decision: Some(details.decision.as_str().to_string()),
-                    source: Some(details.source.as_str().to_string()),
-                    port: Some(port),
-                }))
-                .await;
-            let client = client.as_deref().unwrap_or_default();
-            warn!(
-                "SOCKS blocked by method policy (client={client}, host={host}, mode=limited, allowed_methods=GET, HEAD, OPTIONS)"
-            );
-            return Err(policy_denied_error(REASON_METHOD_NOT_ALLOWED, &details).into());
-        }
-        Ok(NetworkMode::Full) => {}
+    let mode = match app_state.network_mode().await {
+        Ok(mode) => mode,
         Err(err) => {
             error!("failed to evaluate method policy: {err}");
             return Err(io::Error::other("proxy error").into());
         }
-    }
-
-    match app_state.host_has_mitm_hooks(&host).await {
-        Ok(true) => {
-            emit_socks_block_decision_audit_event(
-                &app_state,
-                NetworkDecisionSource::ModeGuard,
-                REASON_MITM_REQUIRED,
-                NetworkProtocol::Socks5Tcp,
-                host.as_str(),
-                port,
-                client.as_deref(),
-            );
-            let details = PolicyDecisionDetails {
-                decision: NetworkPolicyDecision::Deny,
-                reason: REASON_MITM_REQUIRED,
-                source: NetworkDecisionSource::ModeGuard,
-                protocol: NetworkProtocol::Socks5Tcp,
-                host: &host,
-                port,
-            };
-            let _ = app_state
-                .record_blocked(BlockedRequest::new(BlockedRequestArgs {
-                    host: host.clone(),
-                    reason: REASON_MITM_REQUIRED.to_string(),
-                    client: client.clone(),
-                    method: None,
-                    mode: Some(NetworkMode::Full),
-                    protocol: "socks5".to_string(),
-                    decision: Some(details.decision.as_str().to_string()),
-                    source: Some(details.source.as_str().to_string()),
-                    port: Some(port),
-                }))
-                .await;
-            let client = client.as_deref().unwrap_or_default();
-            warn!(
-                "SOCKS blocked; MITM required to enforce HTTPS policy (client={client}, host={host}, mode=full)"
-            );
-            return Err(policy_denied_error(REASON_MITM_REQUIRED, &details).into());
-        }
-        Ok(false) => {}
+    };
+    let host_mitm_requirement = match app_state.host_mitm_requirement(&host, port).await {
+        Ok(requirement) => requirement,
         Err(err) => {
-            error!("failed to inspect MITM hooks for {host}: {err}");
+            error!("failed to inspect MITM requirements for {host}: {err}");
             return Err(io::Error::other("proxy error").into());
         }
+    };
+    // Otherwise retain the existing limited-mode restriction to the default HTTPS port.
+    let brokered_http = matches!(host_mitm_requirement, HostMitmRequirement::Credential(protocols) if protocols.http);
+    let socks5_tcp_target_is_https = port == 443;
+    if mode == NetworkMode::Limited && !socks5_tcp_target_is_https && !brokered_http {
+        emit_socks_block_decision_audit_event(
+            &app_state,
+            NetworkDecisionSource::ModeGuard,
+            REASON_METHOD_NOT_ALLOWED,
+            NetworkProtocol::Socks5Tcp,
+            host.as_str(),
+            port,
+            client.as_deref(),
+        );
+        let details = PolicyDecisionDetails {
+            decision: NetworkPolicyDecision::Deny,
+            reason: REASON_METHOD_NOT_ALLOWED,
+            source: NetworkDecisionSource::ModeGuard,
+            protocol: NetworkProtocol::Socks5Tcp,
+            host: &host,
+            port,
+        };
+        let _ = app_state
+            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                host: host.clone(),
+                reason: REASON_METHOD_NOT_ALLOWED.to_string(),
+                client: client.clone(),
+                method: None,
+                mode: Some(NetworkMode::Limited),
+                protocol: "socks5".to_string(),
+                decision: Some(details.decision.as_str().to_string()),
+                source: Some(details.source.as_str().to_string()),
+                port: Some(port),
+            }))
+            .await;
+        let client = client.as_deref().unwrap_or_default();
+        warn!(
+            "SOCKS blocked; limited mode only supports HTTPS MITM (client={client}, host={host}, port={port})"
+        );
+        return Err(policy_denied_error(REASON_METHOD_NOT_ALLOWED, &details).into());
     }
 
     let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
         protocol: NetworkProtocol::Socks5Tcp,
         host: host.clone(),
         port,
+        environment_id,
         client_addr: client.clone(),
         method: None,
         command: None,
@@ -337,9 +371,100 @@ async fn handle_socks5_tcp(
         }
     }
 
+    let mitm_state = match app_state.mitm_state().await {
+        Ok(state) => state,
+        Err(err) => {
+            error!("failed to load MITM state: {err}");
+            return Err(io::Error::other("proxy error").into());
+        }
+    };
+    let socks_mitm_mode = if mode == NetworkMode::Limited && !brokered_http {
+        SocksMitmMode::Enabled
+    } else {
+        match host_mitm_requirement {
+            HostMitmRequirement::None => SocksMitmMode::Disabled,
+            HostMitmRequirement::Credential(protocols) => SocksMitmMode::DetectProtocol(protocols),
+            HostMitmRequirement::Always => SocksMitmMode::Enabled,
+        }
+    };
+    let unsupported_hook_protocol =
+        host_mitm_requirement == HostMitmRequirement::Always && !socks5_tcp_target_is_https;
+    if unsupported_hook_protocol
+        || (socks_mitm_mode != SocksMitmMode::Disabled && mitm_state.is_none())
+    {
+        emit_socks_block_decision_audit_event(
+            &app_state,
+            NetworkDecisionSource::ModeGuard,
+            REASON_MITM_REQUIRED,
+            NetworkProtocol::Socks5Tcp,
+            host.as_str(),
+            port,
+            client.as_deref(),
+        );
+        let details = PolicyDecisionDetails {
+            decision: NetworkPolicyDecision::Deny,
+            reason: REASON_MITM_REQUIRED,
+            source: NetworkDecisionSource::ModeGuard,
+            protocol: NetworkProtocol::Socks5Tcp,
+            host: &host,
+            port,
+        };
+        let _ = app_state
+            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                host: host.clone(),
+                reason: REASON_MITM_REQUIRED.to_string(),
+                client: client.clone(),
+                method: None,
+                mode: Some(mode),
+                protocol: "socks5".to_string(),
+                decision: Some(details.decision.as_str().to_string()),
+                source: Some(details.source.as_str().to_string()),
+                port: Some(port),
+            }))
+            .await;
+        let client = client.as_deref().unwrap_or_default();
+        warn!(
+            "SOCKS blocked; MITM required to enforce HTTPS policy (client={client}, host={host}, mode={mode:?}, host_mitm_requirement={host_mitm_requirement:?}, https_target={socks5_tcp_target_is_https})"
+        );
+        return Err(policy_denied_error(REASON_MITM_REQUIRED, &details).into());
+    }
+
+    if let Some(mitm_state) = mitm_state {
+        let client = client.as_deref().unwrap_or_default();
+        let conn = match socks_mitm_mode {
+            SocksMitmMode::Disabled => None,
+            SocksMitmMode::Enabled => Some(Socks5TcpConnection::Mitm {
+                target,
+                mode,
+                mitm: mitm_state,
+                extensions: Extensions::new(),
+            }),
+            SocksMitmMode::DetectProtocol(protocols) => Some(Socks5TcpConnection::DetectProtocol {
+                protocols,
+                target,
+                mode,
+                mitm: mitm_state,
+                state: app_state,
+                extensions: Extensions::new(),
+            }),
+        };
+        if let Some(conn) = conn {
+            info!(
+                "SOCKS MITM selected (client={client}, host={host}, port={port}, mode={mode:?}, mitm_mode={socks_mitm_mode:?})"
+            );
+            return Ok(EstablishedClientConnection { input: req, conn });
+        }
+    }
+
     info!("SOCKS upstream dial started (host={host}, port={port})");
     let connect_started_at = Instant::now();
-    let result = tcp_connector.serve(req).await;
+    let result = tcp_connector.serve(req).await.map(|connection| {
+        let EstablishedClientConnection { input, conn } = connection;
+        EstablishedClientConnection {
+            input,
+            conn: Socks5TcpConnection::Direct(conn),
+        }
+    });
     match &result {
         Ok(_) => info!(
             "SOCKS upstream dial established (host={host}, port={port}, elapsed_ms={})",
@@ -353,10 +478,192 @@ async fn handle_socks5_tcp(
     result
 }
 
+/// Internal connector output for SOCKS5 TCP. MITM requests do not dial upstream before the
+/// inner HTTPS request is inspected, so they carry the target metadata instead of a socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocksMitmMode {
+    Disabled,
+    Enabled,
+    DetectProtocol(crate::brokered_tunnel::BrokeredProtocols),
+}
+
+#[derive(Debug)]
+enum Socks5TcpConnection {
+    Direct(TcpStream),
+    Mitm {
+        target: HostWithPort,
+        mode: NetworkMode,
+        mitm: Arc<mitm::MitmState>,
+        extensions: Extensions,
+    },
+    DetectProtocol {
+        protocols: crate::brokered_tunnel::BrokeredProtocols,
+        target: HostWithPort,
+        mode: NetworkMode,
+        mitm: Arc<mitm::MitmState>,
+        state: Arc<NetworkProxyState>,
+        extensions: Extensions,
+    },
+}
+
+impl AsyncRead for Socks5TcpConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Mitm { .. } | Self::DetectProtocol { .. } => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+impl AsyncWrite for Socks5TcpConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Mitm { .. } | Self::DetectProtocol { .. } => Poll::Ready(Ok(buf.len())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Mitm { .. } | Self::DetectProtocol { .. } => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Mitm { .. } | Self::DetectProtocol { .. } => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+impl Socket for Socks5TcpConnection {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Direct(stream) => stream.local_addr(),
+            Self::Mitm { .. } | Self::DetectProtocol { .. } => {
+                Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
+            }
+        }
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Direct(stream) => stream.peer_addr(),
+            Self::Mitm { .. } | Self::DetectProtocol { .. } => {
+                Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
+            }
+        }
+    }
+}
+
+impl ExtensionsRef for Socks5TcpConnection {
+    fn extensions(&self) -> &Extensions {
+        match self {
+            Self::Direct(stream) => stream.extensions(),
+            Self::Mitm { extensions, .. } | Self::DetectProtocol { extensions, .. } => extensions,
+        }
+    }
+}
+
+impl ExtensionsMut for Socks5TcpConnection {
+    fn extensions_mut(&mut self) -> &mut Extensions {
+        match self {
+            Self::Direct(stream) => stream.extensions_mut(),
+            Self::Mitm { extensions, .. } | Self::DetectProtocol { extensions, .. } => extensions,
+        }
+    }
+}
+
+async fn proxy_socks5_tcp(
+    request: ProxyRequest<TcpStream, Socks5TcpConnection>,
+) -> Result<(), BoxError> {
+    let ProxyRequest { mut source, target } = request;
+    match target {
+        Socks5TcpConnection::Direct(target) => StreamForwardService::default()
+            .serve(ProxyRequest { source, target })
+            .await
+            .map_err(Into::into),
+        Socks5TcpConnection::Mitm {
+            target, mode, mitm, ..
+        } => {
+            source.extensions_mut().insert(ProxyTarget(target));
+            source.extensions_mut().insert(mode);
+            source.extensions_mut().insert(mitm);
+            mitm::mitm_stream(source, rama_http::uri::Scheme::HTTPS)
+                .await
+                .map_err(Into::into)
+        }
+        Socks5TcpConnection::DetectProtocol {
+            protocols,
+            target,
+            mode,
+            mitm,
+            state,
+            ..
+        } => {
+            source.extensions_mut().insert(ProxyTarget(target.clone()));
+            source.extensions_mut().insert(mode);
+            source.extensions_mut().insert(mitm);
+            let (protocol, source) = crate::brokered_tunnel::peek_protocol(source, protocols)
+                .await
+                .map_err(|err| -> BoxError { err.into() })?;
+            match protocol {
+                crate::brokered_tunnel::TunnelProtocol::Tls => {
+                    mitm::mitm_stream(source, rama_http::uri::Scheme::HTTPS)
+                        .await
+                        .map_err(Into::into)
+                }
+                crate::brokered_tunnel::TunnelProtocol::Http => {
+                    mitm::mitm_stream(source, rama_http::uri::Scheme::HTTP)
+                        .await
+                        .map_err(Into::into)
+                }
+                crate::brokered_tunnel::TunnelProtocol::Opaque => {
+                    if mode == NetworkMode::Limited {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "opaque tunnels are not allowed in limited mode",
+                        )
+                        .into());
+                    }
+                    info!("SOCKS opaque upstream dial started (target={target})");
+                    let connect_started_at = Instant::now();
+                    let EstablishedClientConnection { conn: upstream, .. } =
+                        TargetCheckedTcpConnector::new(state)
+                            .serve(TcpRequest::new(target.clone()))
+                            .await?;
+                    info!(
+                        "SOCKS opaque upstream dial established (target={target}, elapsed_ms={})",
+                        connect_started_at.elapsed().as_millis()
+                    );
+                    StreamForwardService::default()
+                        .serve(ProxyRequest {
+                            source,
+                            target: upstream,
+                        })
+                        .await
+                        .map_err(Into::into)
+                }
+            }
+        }
+    }
+}
+
 async fn inspect_socks5_udp(
     request: RelayRequest,
     state: Arc<NetworkProxyState>,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
 ) -> io::Result<RelayResponse> {
     let RelayRequest {
         server_address,
@@ -463,6 +770,7 @@ async fn inspect_socks5_udp(
         protocol: NetworkProtocol::Socks5Udp,
         host: host.clone(),
         port,
+        environment_id,
         client_addr: client.clone(),
         method: None,
         command: None,
@@ -546,41 +854,44 @@ mod tests {
     use super::*;
     use crate::config::NetworkMode;
     use crate::config::NetworkProxyConfig;
-    use crate::config::NetworkProxySettings;
     use crate::mitm_hook::MitmHookConfig;
     use crate::mitm_hook::MitmHookMatchConfig;
     use crate::network_policy::test_support::POLICY_DECISION_EVENT_NAME;
     use crate::network_policy::test_support::capture_events;
     use crate::network_policy::test_support::find_event_by_name;
     use crate::runtime::ConfigReloader;
+    use crate::runtime::ConfigReloaderFuture;
     use crate::runtime::ConfigState;
-    use crate::runtime::network_proxy_state_for_policy;
     use crate::state::NetworkProxyConstraints;
     use crate::state::build_config_state;
-    use async_trait::async_trait;
     use pretty_assertions::assert_eq;
     use rama_core::extensions::Extensions;
     use rama_core::extensions::ExtensionsMut;
     use rama_net::address::HostWithPort;
     use rama_net::address::SocketAddress;
     use rama_socks5::server::udp::RelayDirection;
+    use std::collections::HashMap;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
+    use std::sync::Mutex;
+
+    // Managed MITM CA files live under the shared test CODEX_HOME, so MITM-enabled config state
+    // must be materialized one test at a time.
+    static MITM_CONFIG_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Clone)]
     struct StaticReloader {
         state: ConfigState,
     }
 
-    #[async_trait]
     impl ConfigReloader for StaticReloader {
-        async fn maybe_reload(&self) -> anyhow::Result<Option<ConfigState>> {
-            Ok(None)
+        fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+            Box::pin(async { Ok(None) })
         }
 
-        async fn reload_now(&self) -> anyhow::Result<ConfigState> {
-            Ok(self.state.clone())
+        fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+            Box::pin(async { Ok(self.state.clone()) })
         }
 
         fn source_label(&self) -> String {
@@ -588,9 +899,15 @@ mod tests {
         }
     }
 
-    fn state_for_settings(network: NetworkProxySettings) -> Arc<NetworkProxyState> {
-        let config = NetworkProxyConfig { network };
-        let state = build_config_state(config, NetworkProxyConstraints::default()).unwrap();
+    fn state_for_settings(network: NetworkProxyConfig) -> Arc<NetworkProxyState> {
+        let config = network;
+        let _mitm_config_state_guard = config.mitm.then(|| MITM_CONFIG_STATE_LOCK.lock().unwrap());
+        let state = build_config_state(
+            config,
+            NetworkProxyConstraints::default(),
+            crate::Platform::native(),
+        )
+        .unwrap();
         let reloader = Arc::new(StaticReloader {
             state: state.clone(),
         });
@@ -599,10 +916,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_socks5_tcp_emits_block_decision_for_proxy_disabled() {
-        let state = state_for_settings(NetworkProxySettings {
+        let state = state_for_settings(NetworkProxyConfig {
             enabled: false,
             mode: NetworkMode::Full,
-            ..NetworkProxySettings::default()
+            ..NetworkProxyConfig::default()
         });
         let mut request =
             TcpRequest::new(HostWithPort::try_from("example.com:443").expect("valid authority"));
@@ -613,6 +930,7 @@ mod tests {
                 request,
                 TargetCheckedTcpConnector::new(state.clone()),
                 /*policy_decider*/ None,
+                /*environment_id*/ None,
             )
             .await
         })
@@ -639,43 +957,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handle_socks5_tcp_blocks_hooked_host_in_full_mode() {
-        let state = Arc::new(network_proxy_state_for_policy(NetworkProxySettings {
+    async fn handle_socks5_tcp_uses_mitm_in_limited_mode() {
+        let mut settings = NetworkProxyConfig {
             enabled: true,
-            mode: NetworkMode::Full,
+            mode: NetworkMode::Limited,
             mitm: true,
-            mitm_hooks: vec![MitmHookConfig {
-                host: "api.github.com".to_string(),
-                matcher: MitmHookMatchConfig {
-                    methods: vec!["GET".to_string()],
-                    path_prefixes: vec!["/".to_string()],
-                    ..MitmHookMatchConfig::default()
-                },
-                ..MitmHookConfig::default()
-            }],
-            ..NetworkProxySettings::default()
-        }));
+            ..NetworkProxyConfig::default()
+        };
+        settings.set_allowed_domains(vec!["example.com".to_string()]);
+        let state = state_for_settings(settings);
         let mut request =
-            TcpRequest::new(HostWithPort::try_from("api.github.com:443").expect("valid authority"));
+            TcpRequest::new(HostWithPort::try_from("example.com:443").expect("valid authority"));
+        request.extensions_mut().insert(state.clone());
+
+        let result = handle_socks5_tcp(
+            request,
+            TargetCheckedTcpConnector::new(state),
+            /*policy_decider*/ None,
+            /*environment_id*/ None,
+        )
+        .await
+        .expect("limited-mode HTTPS should use MITM");
+
+        assert!(matches!(result.conn, Socks5TcpConnection::Mitm { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_socks5_tcp_blocks_non_https_in_limited_mode() {
+        let mut settings = NetworkProxyConfig {
+            enabled: true,
+            mode: NetworkMode::Limited,
+            ..NetworkProxyConfig::default()
+        };
+        settings.set_allowed_domains(vec!["example.com".to_string()]);
+        let state = state_for_settings(settings);
+        let mut request =
+            TcpRequest::new(HostWithPort::try_from("example.com:80").expect("valid authority"));
         request.extensions_mut().insert(state.clone());
 
         let (result, events) = capture_events(|| async {
             handle_socks5_tcp(
                 request,
-                TargetCheckedTcpConnector::new(state.clone()),
+                TargetCheckedTcpConnector::new(state),
                 /*policy_decider*/ None,
+                /*environment_id*/ None,
             )
             .await
         })
         .await;
-        assert!(result.is_err(), "hooked host should require MITM");
-
-        let blocked = state.drain_blocked().await.unwrap();
-        assert_eq!(blocked.len(), 1);
-        assert_eq!(blocked[0].reason, REASON_MITM_REQUIRED);
-        assert_eq!(blocked[0].host, "api.github.com");
-        assert_eq!(blocked[0].port, Some(443));
-        assert_eq!(blocked[0].protocol, "socks5");
+        assert!(
+            result.is_err(),
+            "limited-mode non-HTTPS SOCKS should be denied"
+        );
 
         let event = find_event_by_name(&events, POLICY_DECISION_EVENT_NAME)
             .expect("expected policy decision event");
@@ -684,24 +1017,158 @@ mod tests {
         assert_eq!(event.field("network.policy.source"), Some("mode_guard"));
         assert_eq!(
             event.field("network.policy.reason"),
-            Some(REASON_MITM_REQUIRED)
+            Some(REASON_METHOD_NOT_ALLOWED)
         );
         assert_eq!(
             event.field("network.transport.protocol"),
             Some("socks5_tcp")
         );
-        assert_eq!(event.field("server.address"), Some("api.github.com"));
-        assert_eq!(event.field("server.port"), Some("443"));
+        assert_eq!(event.field("server.address"), Some("example.com"));
+        assert_eq!(event.field("server.port"), Some("80"));
         assert_eq!(event.field("http.request.method"), Some("none"));
         assert_eq!(event.field("client.address"), Some("unknown"));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn inspect_socks5_udp_emits_block_decision_for_mode_guard_deny() {
-        let state = state_for_settings(NetworkProxySettings {
+    async fn handle_socks5_tcp_detects_tls_for_brokered_nonstandard_port_in_full_mode() {
+        let mut settings = NetworkProxyConfig {
+            enabled: true,
+            mode: NetworkMode::Full,
+            mitm: true,
+            credential_broker: true,
+            ..NetworkProxyConfig::default()
+        };
+        settings.set_allowed_domains(vec!["api.openai.com".to_string()]);
+        let state = state_for_settings(settings);
+        let mut env = HashMap::from([("OPENAI_API_KEY".to_string(), "sk-real".to_string())]);
+        state.virtualize_child_credentials(&mut env);
+        let mut request = TcpRequest::new(
+            HostWithPort::try_from("api.openai.com:8443").expect("valid authority"),
+        );
+        request.extensions_mut().insert(state.clone());
+
+        let result = handle_socks5_tcp(
+            request,
+            TargetCheckedTcpConnector::new(state),
+            /*policy_decider*/ None,
+            /*environment_id*/ None,
+        )
+        .await
+        .expect("brokered TLS should defer MITM until protocol detection");
+
+        assert!(matches!(
+            result.conn,
+            Socks5TcpConnection::DetectProtocol { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_socks5_tcp_blocks_limited_mode_without_mitm_state() {
+        let mut settings = NetworkProxyConfig {
             enabled: true,
             mode: NetworkMode::Limited,
-            ..NetworkProxySettings::default()
+            ..NetworkProxyConfig::default()
+        };
+        settings.set_allowed_domains(vec!["example.com".to_string()]);
+        let state = state_for_settings(settings);
+        let mut request =
+            TcpRequest::new(HostWithPort::try_from("example.com:443").expect("valid authority"));
+        request.extensions_mut().insert(state.clone());
+
+        let err = handle_socks5_tcp(
+            request,
+            TargetCheckedTcpConnector::new(state),
+            /*policy_decider*/ None,
+            /*environment_id*/ None,
+        )
+        .await
+        .expect_err("limited-mode HTTPS requires MITM");
+
+        assert!(
+            format!("{err:?}").contains("MITM required"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_socks5_tcp_uses_mitm_for_hooked_host_in_full_mode() {
+        let mut settings = NetworkProxyConfig {
+            enabled: true,
+            mode: NetworkMode::Full,
+            mitm: true,
+            mitm_hooks: vec![MitmHookConfig {
+                host: "api.github.com".to_string(),
+                matcher: MitmHookMatchConfig {
+                    methods: vec!["POST".to_string()],
+                    path_prefixes: vec!["/repos/openai/".to_string()],
+                    ..MitmHookMatchConfig::default()
+                },
+                ..MitmHookConfig::default()
+            }],
+            ..NetworkProxyConfig::default()
+        };
+        settings.set_allowed_domains(vec!["api.github.com".to_string()]);
+        let state = state_for_settings(settings);
+        let mut request =
+            TcpRequest::new(HostWithPort::try_from("api.github.com:443").expect("valid authority"));
+        request.extensions_mut().insert(state.clone());
+
+        let result = handle_socks5_tcp(
+            request,
+            TargetCheckedTcpConnector::new(state),
+            /*policy_decider*/ None,
+            /*environment_id*/ None,
+        )
+        .await
+        .expect("hooked HTTPS should use MITM");
+
+        assert!(matches!(result.conn, Socks5TcpConnection::Mitm { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_socks5_tcp_blocks_hooked_non_https_host_in_full_mode() {
+        let mut settings = NetworkProxyConfig {
+            enabled: true,
+            mode: NetworkMode::Full,
+            mitm: true,
+            mitm_hooks: vec![MitmHookConfig {
+                host: "api.github.com".to_string(),
+                matcher: MitmHookMatchConfig {
+                    methods: vec!["POST".to_string()],
+                    path_prefixes: vec!["/repos/openai/".to_string()],
+                    ..MitmHookMatchConfig::default()
+                },
+                ..MitmHookConfig::default()
+            }],
+            ..NetworkProxyConfig::default()
+        };
+        settings.set_allowed_domains(vec!["api.github.com".to_string()]);
+        let state = state_for_settings(settings);
+        let mut request =
+            TcpRequest::new(HostWithPort::try_from("api.github.com:80").expect("valid authority"));
+        request.extensions_mut().insert(state.clone());
+
+        let err = handle_socks5_tcp(
+            request,
+            TargetCheckedTcpConnector::new(state),
+            /*policy_decider*/ None,
+            /*environment_id*/ None,
+        )
+        .await
+        .expect_err("hooked non-HTTPS SOCKS should require MITM");
+
+        assert!(
+            format!("{err:?}").contains("MITM required"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inspect_socks5_udp_emits_block_decision_for_mode_guard_deny() {
+        let state = state_for_settings(NetworkProxyConfig {
+            enabled: true,
+            mode: NetworkMode::Limited,
+            ..NetworkProxyConfig::default()
         });
         let request = RelayRequest {
             direction: RelayDirection::South,
@@ -711,7 +1178,10 @@ mod tests {
         };
 
         let (result, events) = capture_events(|| async {
-            inspect_socks5_udp(request, state, /*policy_decider*/ None).await
+            inspect_socks5_udp(
+                request, state, /*policy_decider*/ None, /*environment_id*/ None,
+            )
+            .await
         })
         .await;
         assert!(result.is_err(), "limited-mode UDP request should be denied");

@@ -54,7 +54,6 @@ impl ListAvailablePluginsToInstallHandler {
     }
 }
 
-#[async_trait::async_trait]
 impl ToolExecutor<ToolInvocation> for ListAvailablePluginsToInstallHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(LIST_AVAILABLE_PLUGINS_TO_INSTALL_TOOL_NAME)
@@ -65,10 +64,19 @@ impl ToolExecutor<ToolInvocation> for ListAvailablePluginsToInstallHandler {
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
-        false
+        true
     }
 
-    async fn handle(
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl ListAvailablePluginsToInstallHandler {
+    async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
@@ -109,13 +117,6 @@ mod tests {
     use super::*;
     use codex_tools::DiscoverableToolType;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn list_tool_does_not_support_parallel_calls() {
-        assert!(
-            !ListAvailablePluginsToInstallHandler::new(Vec::new()).supports_parallel_tool_calls()
-        );
-    }
 
     #[test]
     fn result_truncates_candidate_descriptions() {

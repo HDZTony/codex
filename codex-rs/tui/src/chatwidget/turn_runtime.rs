@@ -1,20 +1,59 @@
 //! Agent turn lifecycle and runtime bookkeeping for `ChatWidget`.
 //!
 //! This module owns task start/completion state, runtime metrics, plan updates,
-//! and final-message separator handling.
+//! and completion metadata rendering.
+//! Terminal errors retain live question drafts across queued input delivery.
 
 use super::*;
 
+const LEGACY_SAFETY_ACCESS_BLOCK_PREFIX: &str =
+    "Invalid prompt: we've limited access to this content for safety reasons.";
+const BIO_POLICY_SAFETY_ACCESS_BLOCK_PREFIX: &str =
+    "This content was flagged for possible biological risk.";
+
+pub(super) fn is_bio_policy_error(message: &str) -> bool {
+    is_safety_access_block_message(message)
+        || serde_json::from_str::<serde_json::Value>(message).is_ok_and(|response| {
+            response["error"]["code"].as_str() == Some("bio_policy")
+                || response["error"]["message"]
+                    .as_str()
+                    .is_some_and(is_safety_access_block_message)
+        })
+}
+
+fn is_safety_access_block_message(message: &str) -> bool {
+    message.starts_with(LEGACY_SAFETY_ACCESS_BLOCK_PREFIX)
+        || message.starts_with(BIO_POLICY_SAFETY_ACCESS_BLOCK_PREFIX)
+        || message.starts_with("This request has been flagged for possible biological risk.")
+}
+
 impl ChatWidget {
+    fn clear_guardian_review_status(&mut self) {
+        self.status_state.pending_guardian_review_status.clear();
+        if self.status_state.current_status.is_guardian_review() {
+            let header = self
+                .mcp_startup_status_header()
+                .unwrap_or_else(|| String::from("Working"));
+            self.set_status_header(header);
+        }
+    }
+
     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
     ///
     /// The bottom pane only has one running flag, but this module treats it as a derived state of
     /// both the agent turn lifecycle and MCP startup lifecycle.
     pub(super) fn update_task_running_state(&mut self) {
         self.bottom_pane.set_task_running(
-            self.turn_lifecycle.agent_turn_running || self.mcp_startup_status.is_some(),
+            self.turn_lifecycle.agent_turn_running
+                || self.review.is_review_mode
+                || self.mcp_startup_status.is_some(),
         );
-        self.refresh_plan_mode_nudge();
+        if self.mcp_startup_status.is_some()
+            && !self.turn_lifecycle.agent_turn_running
+            && !self.review.is_review_mode
+        {
+            self.bottom_pane.hide_status_indicator();
+        }
         self.refresh_status_surfaces();
     }
 
@@ -47,21 +86,28 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     pub(super) fn on_task_started(&mut self) {
+        self.status_state.program_status_after_turn =
+            crate::terminal_program_status::ProgramStatus::Idle;
+        self.bottom_pane.dismiss_composer_sparkle();
+        self.clear_context_compaction();
         self.input_queue.user_turn_pending_start = false;
+        self.reset_safety_buffering_for_turn_start();
         self.turn_lifecycle.start(Instant::now());
         self.transcript.reset_turn_flags();
         self.adaptive_chunking.reset();
-        self.plan_stream_controller = None;
+        if self.plan_stream_controller.take().is_some() {
+            self.request_pending_usage_output_insertion_after_stream_shutdown();
+        }
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
         self.session_telemetry.reset_runtime_metrics();
         self.bottom_pane.clear_quit_shortcut_hint();
         self.quit_shortcut_expires_at = None;
         self.quit_shortcut_key = None;
         self.update_task_running_state();
+        self.bottom_pane.ensure_status_indicator();
+        self.bottom_pane.reset_status_timer(Duration::ZERO);
         self.status_state.retry_status_header = None;
-        if self.active_hook_cell.take().is_some() {
-            self.bump_active_cell_revision();
-        }
+        self.clear_active_hook_cell();
         self.status_state.pending_status_indicator_restore = false;
         self.bottom_pane
             .set_interrupt_hint_visible(/*visible*/ true);
@@ -69,8 +115,11 @@ impl ChatWidget {
         if self.mcp_startup_status.is_none() || !self.status_header_is_mcp_startup_owned() {
             self.set_status_header(String::from("Working"));
         }
-        self.full_reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
+        self.reasoning_header = None;
+        self.status_state.reasoning_item_id = None;
+        self.status_state.reasoning_resume_turn_id = None;
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
             /*body*/ None,
@@ -78,27 +127,29 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    pub(super) fn on_replayed_task_started(&mut self, started_at: Option<i64>) {
+        self.on_task_started();
+        if let Some(started_at) = started_at {
+            let elapsed_secs = chrono::Utc::now().timestamp().saturating_sub(started_at);
+            self.bottom_pane.reset_status_timer(Duration::from_secs(
+                elapsed_secs.try_into().unwrap_or_default(),
+            ));
+        }
+    }
+
     pub(super) fn on_task_complete(
         &mut self,
         last_agent_message: Option<String>,
-        duration_ms: Option<i64>,
+        completion: Option<history_cell::FinalMessageSeparator>,
         from_replay: bool,
     ) {
-        self.input_queue.submit_pending_steers_after_interrupt = false;
-        // Use `last_agent_message` from the turn-complete notification as the copy
-        // source only when no earlier item-level event (AgentMessageItem, plan
-        // commit, review output) already recorded markdown for this turn. This
-        // prevents the final summary from overwriting a more specific source.
-        let sanitized_last_agent_message = last_agent_message
-            .as_deref()
-            .map(|message| parse_assistant_markdown(message).visible_markdown);
-        if let Some(message) = sanitized_last_agent_message
-            .as_ref()
-            .filter(|message| !message.is_empty())
-            && !self.transcript.saw_copy_source_this_turn
-        {
-            self.record_agent_markdown(message);
+        if self.status_state.reasoning_resume_turn_id.is_some() {
+            self.on_agent_reasoning_final();
         }
+        self.input_queue.submit_pending_steers_after_interrupt = false;
+        let sanitized_last_agent_message = last_agent_message.as_deref().map(|message| {
+            parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown
+        });
         // For desktop notifications: prefer the notification payload, fall back to
         // the item-level copy source if present, otherwise send an empty string.
         let notification_response = sanitized_last_agent_message
@@ -115,54 +166,46 @@ impl ChatWidget {
             .unwrap_or_default();
         self.transcript.saw_copy_source_this_turn = false;
         // If a stream is currently active, finalize it.
-        self.flush_answer_stream_with_separator();
-        if let Some(mut controller) = self.plan_stream_controller.take() {
-            let had_live_tail = controller.has_live_tail();
-            self.clear_active_stream_tail();
-            let (cell, source) = controller.finalize();
-            if !had_live_tail && let Some(cell) = cell {
-                self.add_boxed_history(cell);
-            }
-            if let Some(source) = source {
-                self.app_event_tx
-                    .send(AppEvent::ConsolidateProposedPlan(source));
-            }
-        }
+        self.flush_answer_and_plan_streams();
+        self.flush_interrupt_activity();
+        self.finish_dynamic_activity();
         self.flush_unified_exec_wait_streak();
+        self.flush_completed_tool_activity();
         if !from_replay {
             self.collect_runtime_metrics_delta();
-            let runtime_metrics =
-                (!self.turn_runtime_metrics.is_empty()).then_some(self.turn_runtime_metrics);
-            let show_work_separator = self.transcript.had_work_activity
-                && (self.transcript.needs_final_message_separator || runtime_metrics.is_some());
-            if show_work_separator || runtime_metrics.is_some() {
-                let elapsed_seconds = if show_work_separator {
-                    duration_ms
-                        .and_then(|duration_ms| u64::try_from(duration_ms).ok())
-                        .map(|duration_ms| duration_ms / 1_000)
-                        .or_else(|| {
-                            self.bottom_pane
-                                .status_widget()
-                                .map(crate::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
-                        })
-                } else {
-                    None
-                };
-                self.add_to_history(history_cell::FinalMessageSeparator::new(
-                    elapsed_seconds,
-                    runtime_metrics,
-                ));
-            }
-            self.turn_runtime_metrics = RuntimeMetricsSummary::default();
-            self.transcript.needs_final_message_separator = false;
-            self.transcript.had_work_activity = false;
+        }
+        let runtime_metrics = (!from_replay && !self.turn_runtime_metrics.is_empty())
+            .then_some(self.turn_runtime_metrics);
+        if let Some(completion) = completion {
+            self.add_to_history(completion.with_runtime_metrics(runtime_metrics));
+        } else if let Some(runtime_metrics) = runtime_metrics {
+            self.add_to_history(history_cell::FinalMessageSeparator::new(
+                /*elapsed_seconds*/ None,
+                Some(runtime_metrics),
+            ));
+        }
+        self.turn_runtime_metrics = RuntimeMetricsSummary::default();
+        if !from_replay {
             self.request_status_line_branch_refresh();
             self.request_status_line_git_summary_refresh();
+            self.refresh_thread_usage_after_turn();
         }
         // Mark task stopped and request redraw now that all content is in history.
+        self.clear_context_compaction();
         self.status_state.pending_status_indicator_restore = false;
+        self.status_state.reasoning_item_id = None;
+        self.status_state.reasoning_resume_turn_id = None;
+        self.reasoning_header = None;
         self.input_queue.user_turn_pending_start = false;
+        self.clear_active_hook_cell();
+        self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
+        self.status_state.program_status_after_turn = if from_replay {
+            crate::terminal_program_status::ProgramStatus::Idle
+        } else {
+            crate::terminal_program_status::ProgramStatus::Done
+        };
+        self.clear_safety_buffering();
         self.update_task_running_state();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -185,23 +228,27 @@ impl ChatWidget {
         if !from_replay {
             self.transcript.saw_plan_item_this_turn = false;
         }
-        // If there is a queued user message, send exactly one now to begin the next turn.
-        let follow_up_started = self.maybe_send_next_queued_input();
-        let active_goal_continuing = self
-            .current_goal_status
-            .as_ref()
-            .is_some_and(GoalStatusState::is_active);
-        // Emit a notification when the agent is truly waiting for the user.
-        // Queued follow-up input and active goal continuation both start the
-        // next turn immediately, so notifying at that boundary would feel like
-        // a false "needs attention".
-        if !follow_up_started && !active_goal_continuing {
-            self.notify(Notification::AgentTurnComplete {
-                response: notification_response,
-            });
+        if !from_replay {
+            // Emit a notification only when the live agent is waiting for the user.
+            let follow_up_started = self.maybe_send_next_queued_input();
+            let active_goal_continuing = self
+                .current_goal_status
+                .as_ref()
+                .is_some_and(GoalStatusState::is_active);
+            if !follow_up_started
+                && !active_goal_continuing
+                && !self
+                    .turn_lifecycle
+                    .last_turn_id
+                    .as_deref()
+                    .is_some_and(|turn_id| self.should_hide_realtime_delegation(turn_id))
+            {
+                self.notify(Notification::AgentTurnComplete {
+                    response: notification_response,
+                });
+            }
+            self.maybe_show_pending_rate_limit_prompt();
         }
-
-        self.maybe_show_pending_rate_limit_prompt();
     }
 
     pub(super) fn maybe_prompt_plan_implementation(&mut self) {
@@ -275,7 +322,7 @@ impl ChatWidget {
         None
     }
 
-    pub(super) fn has_queued_follow_up_messages(&self) -> bool {
+    pub(crate) fn has_queued_follow_up_messages(&self) -> bool {
         self.input_queue.has_queued_follow_up_messages()
     }
 
@@ -294,6 +341,18 @@ impl ChatWidget {
     /// This does not clear MCP startup tracking, because MCP startup can overlap with turn cleanup
     /// and should continue to drive the bottom-pane running indicator while it is in progress.
     pub(super) fn finalize_turn(&mut self) {
+        self.flush_answer_and_plan_streams();
+        self.flush_interrupt_activity();
+        self.finish_dynamic_activity();
+        if self.status_state.reasoning_resume_turn_id.is_some() {
+            self.on_agent_reasoning_final();
+        }
+        self.status_state.reasoning_item_id = None;
+        self.status_state.reasoning_resume_turn_id = None;
+        self.reasoning_header = None;
+        self.clear_context_compaction();
+        self.clear_safety_buffering();
+        self.safety_recourse = None;
         // Drop preview-only stream tail content on any termination path before
         // failed-cell finalization, so transient tail cells are never persisted.
         self.clear_active_stream_tail();
@@ -302,12 +361,17 @@ impl ChatWidget {
         // Turn-scoped hook rows are transient live state; once the turn is over,
         // do not leave an orphaned running row behind if no matching completion
         // event arrived before cancellation.
-        if self.active_hook_cell.take().is_some() {
-            self.bump_active_cell_revision();
-        }
+        self.clear_active_hook_cell();
         // Reset running state and clear streaming buffers.
         self.input_queue.user_turn_pending_start = false;
+        self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
+        self.status_state.program_status_after_turn = if self.thread_usage.replaying_turn_completion
+        {
+            crate::terminal_program_status::ProgramStatus::Idle
+        } else {
+            crate::terminal_program_status::ProgramStatus::Error
+        };
         self.update_task_running_state();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -316,10 +380,12 @@ impl ChatWidget {
         self.adaptive_chunking.reset();
         self.stream_controller = None;
         self.plan_stream_controller = None;
+        self.request_pending_usage_output_insertion_after_stream_shutdown();
         self.status_state.pending_status_indicator_restore = false;
-        self.clear_cancel_edit();
+        self.safety_buffering_prompt = None;
         self.request_status_line_branch_refresh();
         self.request_status_line_git_summary_refresh();
+        self.refresh_thread_usage_after_turn();
         self.maybe_show_pending_rate_limit_prompt();
     }
 
@@ -333,14 +399,13 @@ impl ChatWidget {
             message
         };
 
-        self.add_to_history(history_cell::new_warning_event(message));
+        self.add_to_history(history_cell::new_error_event(message));
         self.request_redraw();
         self.maybe_send_next_queued_input();
     }
 
-    pub(super) fn on_error(&mut self, message: String) {
+    fn on_error(&mut self, message: String) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
-        self.flush_answer_stream_with_separator();
         self.finalize_turn();
         self.add_to_history(history_cell::new_error_event(message));
         self.set_ambient_pet_notification(
@@ -353,10 +418,59 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
+    pub(crate) fn handle_turn_start_rejection(&mut self, message: String) -> bool {
+        if !self.input_queue.user_turn_pending_start {
+            return false;
+        }
+        self.on_error(message);
+        true
+    }
+
+    pub(super) fn cyber_policy_notice(&self) -> crate::daybreak::Notice {
+        let can_enable_daybreak =
+            self.daybreak_account_eligible() && !self.side_conversation_active();
+        crate::daybreak::notice_for_setting(
+            &self.model_catalog.models,
+            self.current_model(),
+            self.daybreak_enabled && can_enable_daybreak,
+            can_enable_daybreak,
+        )
+    }
+
     pub(super) fn on_cyber_policy_error(&mut self) {
+        let notice = self.cyber_policy_notice();
         self.input_queue.submit_pending_steers_after_interrupt = false;
         self.finalize_turn();
-        self.add_to_history(history_cell::new_cyber_policy_error_event());
+        self.add_to_history(history_cell::new_cyber_policy_error_event(notice));
+        if notice == crate::daybreak::Notice::Disabled
+            && !self.thread_usage.replaying_turn_completion
+            && !self.blocks_direct_input
+            && let Some(thread_id) = self.thread_id
+        {
+            self.bottom_pane.show_selection_view(SelectionViewParams {
+                title: Some("Turn on Daybreak for your next request?".into()),
+                items: vec![
+                    SelectionItem {
+                        name: "Enable Daybreak".into(),
+                        actions: vec![Box::new(move |tx| {
+                            tx.send(AppEvent::PersistDaybreakSelection {
+                                thread_id,
+                                enabled: true,
+                            })
+                        })],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Not now".into(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ],
+                ..SelectionViewParams::picker()
+            });
+            self.defer_input_until_settings_applied();
+        }
         self.request_redraw();
 
         // After an error ends the turn, try sending the next queued input.
@@ -364,8 +478,12 @@ impl ChatWidget {
     }
 
     pub(super) fn on_rate_limit_error(&mut self, error_kind: RateLimitErrorKind, message: String) {
+        self.invalidate_ordinary_usage_recovery();
+        // on_error can drain queued input, before the asynchronous recovery read completes.
+        self.input_queue.rate_limit_recovery_pending = self.has_chatgpt_account;
+        let usage_limit_error = matches!(error_kind, RateLimitErrorKind::UsageLimit);
         let rate_limit_reached_type = self.codex_rate_limit_reached_type.map(|kind| {
-            if matches!(error_kind, RateLimitErrorKind::UsageLimit) {
+            if usage_limit_error {
                 match kind {
                     RateLimitReachedType::WorkspaceOwnerCreditsDepleted => {
                         RateLimitReachedType::WorkspaceOwnerUsageLimitReached
@@ -379,32 +497,38 @@ impl ChatWidget {
                 kind
             }
         });
+        if self.codex_rate_limit_reached_type != rate_limit_reached_type {
+            self.clear_backend_banner();
+        }
         self.codex_rate_limit_reached_type = rate_limit_reached_type;
-
-        match rate_limit_reached_type {
-            Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted) => {
-                self.on_error(
+        // Keep owner remediation in history even when the optional backend banner is unavailable.
+        let (message, nudge) = match rate_limit_reached_type {
+            Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted) => (
                     "You're out of credits. Your workspace is out of credits. Add credits to continue using Codex."
                         .to_string(),
-                );
-            }
-            Some(RateLimitReachedType::WorkspaceOwnerUsageLimitReached) => {
-                self.on_error(
+                    None,
+            ),
+            Some(RateLimitReachedType::WorkspaceOwnerUsageLimitReached) => (
                     "Usage limit reached. You've reached your usage limit. Increase your limits to continue using codex."
                         .to_string(),
-                );
-            }
-            Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted) => {
-                self.on_error(message);
-                self.open_workspace_owner_nudge_prompt(AddCreditsNudgeCreditType::Credits);
-            }
-            Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached) => {
-                self.on_error(message);
-                self.open_workspace_owner_nudge_prompt(AddCreditsNudgeCreditType::UsageLimit);
-            }
-            Some(RateLimitReachedType::RateLimitReached) | None => {
-                self.on_error(message);
-            }
+                    None,
+            ),
+            Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted) =>
+                (message, Some(AddCreditsNudgeCreditType::Credits)),
+            Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached) =>
+                (message, Some(AddCreditsNudgeCreditType::UsageLimit)),
+            Some(RateLimitReachedType::RateLimitReached) | None => (message, None),
+        };
+        self.on_error(message);
+        if !self.has_applicable_backend_banner()
+            && let Some(credit_type) = nudge
+        {
+            self.open_workspace_owner_nudge_prompt(credit_type);
+        }
+        if self.has_chatgpt_account {
+            self.app_event_tx.send(AppEvent::RefreshRateLimits {
+                origin: crate::app_event::RateLimitRefreshOrigin::Recovery,
+            });
         }
     }
 
@@ -417,11 +541,26 @@ impl ChatWidget {
             .as_ref()
             .is_some_and(|info| self.handle_app_server_steer_rejected_error(info))
         {
+            return;
+        }
+        let question_drafts = if self.thread_usage.replaying_turn_completion {
+            None
+        } else {
+            self.take_question_drafts()
+        };
+        if codex_error_info == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation) {
+            self.on_misalignment_policy_violation();
         } else if codex_error_info
             .as_ref()
             .is_some_and(is_app_server_cyber_policy_error)
         {
             self.on_cyber_policy_error();
+        } else if is_bio_policy_error(&message) {
+            self.input_queue.submit_pending_steers_after_interrupt = false;
+            self.finalize_turn();
+            self.add_to_history(history_cell::new_safety_access_block_event());
+            self.request_redraw();
+            self.maybe_send_next_queued_input();
         } else if let Some(info) = codex_error_info
             .as_ref()
             .and_then(app_server_rate_limit_error_kind)
@@ -434,6 +573,13 @@ impl ChatWidget {
             }
         } else {
             self.on_error(message);
+        }
+        if let Some(drafts) = question_drafts
+            && !self.has_misalignment_policy_violation()
+        {
+            self.bottom_pane.append_question_drafts(&drafts);
+            self.refresh_pending_input_preview();
+            self.request_redraw();
         }
     }
 
@@ -469,13 +615,5 @@ impl ChatWidget {
         self.transcript.last_plan_progress = (total > 0).then_some((completed, total));
         self.refresh_status_surfaces();
         self.add_to_history(history_cell::new_plan_update(update));
-    }
-
-    pub(super) fn interrupted_turn_message(&self, reason: TurnAbortReason) -> String {
-        if reason == TurnAbortReason::BudgetLimited {
-            return "Goal budget reached - the turn was stopped.".to_string();
-        }
-
-        "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_string()
     }
 }

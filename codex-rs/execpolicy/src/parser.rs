@@ -65,12 +65,13 @@ impl PolicyParser {
         )
         .map_err(Error::Starlark)?;
         let globals = GlobalsBuilder::standard().with(policy_builtins).build();
-        let module = Module::new();
-        {
+        Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
             eval.extra = Some(&self.builder);
-            eval.eval_module(ast, &globals).map_err(Error::Starlark)?;
-        }
+            eval.eval_module(ast, &globals)
+                .map(|_| ())
+                .map_err(Error::Starlark)
+        })?;
         self.builder
             .borrow()
             .validate_pending_examples_from(pending_validation_count)?;
@@ -351,6 +352,7 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
         r#match: Option<UnpackList<Value<'v>>>,
         not_match: Option<UnpackList<Value<'v>>>,
         justification: Option<&'v str>,
+        canonical_matching: Option<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let decision = match decision {
@@ -392,6 +394,7 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
             .map(|head| {
                 Arc::new(PrefixRule {
                     pattern: PrefixPattern {
+                        canonical_matching: canonical_matching.unwrap_or(false),
                         first: Arc::from(head.as_str()),
                         rest: rest.clone(),
                     },

@@ -26,7 +26,6 @@ MODULE_BAZEL = ROOT / "MODULE.bazel"
 RUSTY_V8_CHECKSUMS_DIR = ROOT / "third_party" / "v8"
 RELEASE_ARTIFACT_PROFILE = "release"
 SANDBOX_ARTIFACT_PROFILE = "ptrcomp_sandbox_release"
-ARTIFACT_BAZEL_CONFIGS = ["rusty-v8-upstream-libcxx"]
 
 
 def bazel_execroot() -> Path:
@@ -123,14 +122,6 @@ def ensure_bazel_output_files(
     if missing:
         raise SystemExit(f"missing built outputs for {labels}: {missing}")
     return outputs
-
-
-def artifact_bazel_configs(bazel_configs: list[str] | None = None) -> list[str]:
-    configured = list(ARTIFACT_BAZEL_CONFIGS)
-    for config in bazel_configs or []:
-        if config not in configured:
-            configured.append(config)
-    return configured
 
 
 def release_pair_label(target: str, sandbox: bool = False) -> str:
@@ -245,7 +236,7 @@ def stage_artifacts(
     shutil.copyfile(binding_path, staged_binding)
 
     staged_checksums = output_dir / staged_checksums_name(target, artifact_profile)
-    with staged_checksums.open("w", encoding="utf-8") as checksums:
+    with staged_checksums.open("w", encoding="utf-8", newline="\n") as checksums:
         for path in [staged_library, staged_binding]:
             digest = hashlib.sha256()
             with path.open("rb") as artifact:
@@ -258,21 +249,27 @@ def stage_artifacts(
     print(staged_checksums)
 
 
-def upstream_release_pair_paths(source_root: Path, target: str) -> tuple[Path, Path]:
+def upstream_release_pair_paths(
+    target: str,
+    target_dir: Path,
+) -> tuple[Path, Path]:
     lib_name = (
         "rusty_v8.lib" if target.endswith("-pc-windows-msvc") else "librusty_v8.a"
     )
-    gn_out = source_root / "target" / target / "release" / "gn_out"
+    gn_out = target_dir / target / "release" / "gn_out"
     return gn_out / "obj" / lib_name, gn_out / "src_binding.rs"
 
 
 def stage_upstream_release_pair(
-    source_root: Path,
     target: str,
     output_dir: Path,
+    target_dir: Path,
     sandbox: bool = False,
 ) -> None:
-    lib_path, binding_path = upstream_release_pair_paths(source_root, target)
+    lib_path, binding_path = upstream_release_pair_paths(
+        target,
+        target_dir,
+    )
     stage_artifacts(target, lib_path, binding_path, output_dir, sandbox)
 
 
@@ -284,7 +281,6 @@ def stage_release_pair(
     bazel_configs: list[str] | None = None,
     sandbox: bool = False,
 ) -> None:
-    bazel_configs = artifact_bazel_configs(bazel_configs)
     outputs = ensure_bazel_output_files(
         platform,
         [release_pair_label(target, sandbox)],
@@ -330,7 +326,7 @@ def parse_args() -> argparse.Namespace:
         "stage-upstream-release-pair"
     )
     stage_upstream_release_pair_parser.add_argument(
-        "--source-root", type=Path, required=True
+        "--target-dir", type=Path, required=True
     )
     stage_upstream_release_pair_parser.add_argument("--target", required=True)
     stage_upstream_release_pair_parser.add_argument("--output-dir", required=True)
@@ -373,9 +369,9 @@ def main() -> int:
         return 0
     if args.command == "stage-upstream-release-pair":
         stage_upstream_release_pair(
-            source_root=args.source_root,
             target=args.target,
             output_dir=Path(args.output_dir),
+            target_dir=args.target_dir,
             sandbox=args.sandbox,
         )
         return 0

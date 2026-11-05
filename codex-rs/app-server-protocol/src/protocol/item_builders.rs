@@ -21,10 +21,10 @@ use crate::protocol::v2::ItemGuardianApprovalReviewCompletedNotification;
 use crate::protocol::v2::ItemGuardianApprovalReviewStartedNotification;
 use crate::protocol::v2::PatchApplyStatus;
 use crate::protocol::v2::PatchChangeKind;
-use crate::protocol::v2::ThreadItem;
+use crate::protocol::v2::ThreadItemPayload;
 use codex_protocol::ThreadId;
+use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
-use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::FileChange;
@@ -32,114 +32,168 @@ use codex_protocol::protocol::GuardianAssessmentAction;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::PatchApplyEndEvent;
+use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
+use codex_protocol::review_format::render_review_output_text;
+use codex_secrets::redact_secrets;
 use codex_shell_command::parse_command::parse_command;
 use codex_shell_command::parse_command::shlex_join;
+use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tracing::warn;
+
+/// Client-facing command and parsed actions projected from a raw command.
+pub struct CommandExecutionPresentation {
+    /// Shell-formatted command with recognizable secrets redacted.
+    pub command: String,
+    /// Parsed command actions with recognizable secrets redacted.
+    pub command_actions: Vec<CommandAction>,
+}
+
+impl CommandExecutionPresentation {
+    /// Projects a raw command into its client-facing representation.
+    pub fn from_raw(command: &[String], parsed_cmd: &[ParsedCommand], cwd: &PathUri) -> Self {
+        Self {
+            command: redact_secrets(shlex_join(command)),
+            command_actions: command_actions_for_path_uri(parsed_cmd, cwd),
+        }
+    }
+}
+
+pub(crate) fn review_output_text(output: Option<&ReviewOutputEvent>) -> String {
+    output
+        .map(render_review_output_text)
+        .unwrap_or_else(|| REVIEW_FALLBACK_MESSAGE.to_string())
+}
 
 pub fn build_file_change_approval_request_item(
     payload: &ApplyPatchApprovalRequestEvent,
-) -> ThreadItem {
-    ThreadItem::FileChange {
+) -> ThreadItemPayload {
+    ThreadItemPayload::FileChange {
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
         status: PatchApplyStatus::InProgress,
     }
 }
 
-pub fn build_file_change_begin_item(payload: &PatchApplyBeginEvent) -> ThreadItem {
-    ThreadItem::FileChange {
+pub fn build_file_change_begin_item(payload: &PatchApplyBeginEvent) -> ThreadItemPayload {
+    ThreadItemPayload::FileChange {
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
         status: PatchApplyStatus::InProgress,
     }
 }
 
-pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItem {
-    ThreadItem::FileChange {
+pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItemPayload {
+    ThreadItemPayload::FileChange {
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
         status: (&payload.status).into(),
     }
 }
 
-pub fn build_command_execution_approval_request_item(
-    payload: &ExecApprovalRequestEvent,
-) -> ThreadItem {
-    ThreadItem::CommandExecution {
+pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> ThreadItemPayload {
+    let presentation =
+        CommandExecutionPresentation::from_raw(&payload.command, &payload.parsed_cmd, &payload.cwd);
+    ThreadItemPayload::CommandExecution {
+        model_context: None,
+        sandbox_type: None,
         id: payload.call_id.clone(),
-        command: shlex_join(&payload.command),
-        cwd: payload.cwd.clone(),
-        process_id: None,
-        source: CommandExecutionSource::Agent,
-        status: CommandExecutionStatus::InProgress,
-        command_actions: payload
-            .parsed_cmd
-            .iter()
-            .cloned()
-            .map(|parsed| CommandAction::from_core_with_cwd(parsed, &payload.cwd))
-            .collect(),
-        aggregated_output: None,
-        exit_code: None,
-        duration_ms: None,
-    }
-}
-
-pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> ThreadItem {
-    ThreadItem::CommandExecution {
-        id: payload.call_id.clone(),
-        command: shlex_join(&payload.command),
-        cwd: payload.cwd.clone(),
+        plugin_id: payload.plugin_id.clone(),
+        script_path: payload.script_path.clone(),
+        command: presentation.command,
+        cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
         status: CommandExecutionStatus::InProgress,
-        command_actions: payload
-            .parsed_cmd
-            .iter()
-            .cloned()
-            .map(|parsed| CommandAction::from_core_with_cwd(parsed, &payload.cwd))
-            .collect(),
+        command_actions: presentation.command_actions,
         aggregated_output: None,
         exit_code: None,
         duration_ms: None,
     }
 }
 
-pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> ThreadItem {
+pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> ThreadItemPayload {
     let aggregated_output = if payload.aggregated_output.is_empty() {
         None
     } else {
         Some(payload.aggregated_output.clone())
     };
     let duration_ms = i64::try_from(payload.duration.as_millis()).unwrap_or(i64::MAX);
+    let presentation =
+        CommandExecutionPresentation::from_raw(&payload.command, &payload.parsed_cmd, &payload.cwd);
 
-    ThreadItem::CommandExecution {
+    ThreadItemPayload::CommandExecution {
+        model_context: None,
+        sandbox_type: None,
         id: payload.call_id.clone(),
-        command: shlex_join(&payload.command),
-        cwd: payload.cwd.clone(),
+        plugin_id: payload.plugin_id.clone(),
+        script_path: payload.script_path.clone(),
+        command: presentation.command,
+        cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
         status: (&payload.status).into(),
-        command_actions: payload
-            .parsed_cmd
-            .iter()
-            .cloned()
-            .map(|parsed| CommandAction::from_core_with_cwd(parsed, &payload.cwd))
-            .collect(),
+        command_actions: presentation.command_actions,
         aggregated_output,
         exit_code: Some(payload.exit_code),
         duration_ms: Some(duration_ms),
     }
 }
 
+fn command_actions_for_path_uri(parsed_cmd: &[ParsedCommand], cwd: &PathUri) -> Vec<CommandAction> {
+    parsed_cmd
+        .iter()
+        .cloned()
+        .filter_map(|parsed| match parsed {
+            ParsedCommand::Read { cmd, name, path } => {
+                // Resolve against the executor's URI, not the app-server's filesystem. POSIX
+                // non-UTF-8 paths are percent-encoded, not opaque. Expanding `~` or resolving a
+                // genuinely opaque cwd would require executor-native state unavailable here.
+                match cwd.join(path.to_string_lossy().as_ref()) {
+                    Ok(path) => Some(CommandAction::Read {
+                        command: redact_secrets(cmd),
+                        name,
+                        path: path.into(),
+                    }),
+                    Err(error) => {
+                        warn!(
+                            command = cmd,
+                            %cwd,
+                            file_path = %path.display(),
+                            %error,
+                            "omitting read action: invalid file path or cwd"
+                        );
+                        None
+                    }
+                }
+            }
+            ParsedCommand::ListFiles { cmd, path } => Some(CommandAction::ListFiles {
+                command: redact_secrets(cmd),
+                path,
+            }),
+            ParsedCommand::Search { cmd, query, path } => Some(CommandAction::Search {
+                command: redact_secrets(cmd),
+                query: query.map(redact_secrets),
+                path,
+            }),
+            ParsedCommand::Unknown { cmd } => Some(CommandAction::Unknown {
+                command: redact_secrets(cmd),
+            }),
+        })
+        .collect()
+}
+
 /// Build a guardian-derived [`ThreadItem`].
 ///
 /// Currently this only synthesizes [`ThreadItem::CommandExecution`] for
 /// [`GuardianAssessmentAction::Command`] and [`GuardianAssessmentAction::Execve`].
+/// Stdin reviews are child approvals and must not change the parent item lifecycle.
 pub fn build_item_from_guardian_event(
     assessment: &GuardianAssessmentEvent,
     status: CommandExecutionStatus,
-) -> Option<ThreadItem> {
+) -> Option<ThreadItemPayload> {
     match &assessment.action {
         GuardianAssessmentAction::Command { command, cwd, .. } => {
             let id = assessment.target_item_id.as_ref()?;
@@ -147,8 +201,12 @@ pub fn build_item_from_guardian_event(
             let command_actions = vec![CommandAction::Unknown {
                 command: command.clone(),
             }];
-            Some(ThreadItem::CommandExecution {
+            Some(ThreadItemPayload::CommandExecution {
                 id: id.clone(),
+                model_context: assessment.model_context.clone(),
+                sandbox_type: None,
+                plugin_id: assessment.plugin_id.clone(),
+                script_path: assessment.script_path.clone(),
                 command,
                 cwd: cwd.clone(),
                 process_id: None,
@@ -183,10 +241,14 @@ pub fn build_item_from_guardian_event(
                     .map(|parsed| CommandAction::from_core_with_cwd(parsed, cwd))
                     .collect()
             };
-            Some(ThreadItem::CommandExecution {
+            Some(ThreadItemPayload::CommandExecution {
                 id: id.clone(),
+                model_context: assessment.model_context.clone(),
+                sandbox_type: None,
+                plugin_id: assessment.plugin_id.clone(),
+                script_path: assessment.script_path.clone(),
                 command,
-                cwd: cwd.clone(),
+                cwd: cwd.clone().into(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
                 status,
@@ -196,7 +258,8 @@ pub fn build_item_from_guardian_event(
                 duration_ms: None,
             })
         }
-        GuardianAssessmentAction::ApplyPatch { .. }
+        GuardianAssessmentAction::WriteStdin { .. }
+        | GuardianAssessmentAction::ApplyPatch { .. }
         | GuardianAssessmentAction::NetworkAccess { .. }
         | GuardianAssessmentAction::McpToolCall { .. }
         | GuardianAssessmentAction::RequestPermissions { .. } => None,
@@ -315,3 +378,7 @@ fn format_file_change_diff(change: &FileChange) -> String {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "item_builders_tests.rs"]
+mod tests;

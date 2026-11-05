@@ -1,54 +1,18 @@
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
+use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::chatwidget::connectors::ConnectorsCacheState;
-use codex_app_server_protocol::AppInfo;
+use crate::hooks_rpc::HooksListTarget;
 use codex_app_server_protocol::HookErrorInfo;
 use codex_app_server_protocol::HooksListEntry;
-use codex_app_server_protocol::HooksListResponse;
+use codex_app_server_protocol::MarketplaceLoadErrorInfo;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
-use codex_features::Stage;
+use codex_app_server_protocol::PluginAvailability;
+use codex_app_server_protocol::PluginShareContext;
+use codex_app_server_protocol::PluginShareDiscoverability;
+use codex_app_server_protocol::PluginSource;
+use codex_connectors::AppInfo;
 use pretty_assertions::assert_eq;
-
-#[tokio::test]
-async fn realtime_error_closes_without_followup_closed_info() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.realtime_conversation.phase = RealtimeConversationPhase::Active;
-
-    chat.on_realtime_error(ThreadRealtimeErrorNotification {
-        thread_id: ThreadId::new().to_string(),
-        message: "boom".to_string(),
-    });
-    next_realtime_close_op(&mut op_rx);
-
-    chat.on_realtime_conversation_closed(ThreadRealtimeClosedNotification {
-        thread_id: ThreadId::new().to_string(),
-        reason: Some("error".to_string()),
-    });
-
-    let rendered = drain_insert_history(&mut rx)
-        .into_iter()
-        .map(|lines| lines_to_single_string(&lines))
-        .collect::<Vec<_>>();
-    insta::assert_snapshot!(rendered.join("\n\n"), @"■ Realtime voice error: boom");
-}
-
-#[cfg(not(target_os = "linux"))]
-#[tokio::test]
-async fn deleted_realtime_meter_uses_shared_stop_path() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.realtime_conversation.phase = RealtimeConversationPhase::Active;
-    let placeholder_id = chat.bottom_pane.insert_recording_meter_placeholder("⠤⠤⠤⠤");
-    chat.realtime_conversation.meter_placeholder_id = Some(placeholder_id.clone());
-
-    assert!(chat.stop_realtime_conversation_for_deleted_meter(&placeholder_id));
-
-    next_realtime_close_op(&mut op_rx);
-    assert_eq!(chat.realtime_conversation.meter_placeholder_id, None);
-    assert_eq!(
-        chat.realtime_conversation.phase,
-        RealtimeConversationPhase::Stopping
-    );
-}
 
 #[tokio::test]
 async fn experimental_mode_plan_is_ignored_on_startup() {
@@ -68,9 +32,11 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         .build()
         .await
         .expect("config");
-    let resolved_model = crate::legacy_core::test_support::get_model_offline(cfg.model.as_deref());
+    let resolved_model = get_model_offline_for_tests(cfg.model.as_deref());
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let init = ChatWidgetInit {
+        requires_openai_auth: true,
+        local_settings: crate::local_settings::LocalSettings::from(&cfg),
         config: cfg.clone(),
         frame_requester: FrameRequester::test_dummy(),
         app_event_tx: AppEventSender::new(unbounded_channel::<AppEvent>().0),
@@ -78,11 +44,11 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         initial_user_message: None,
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
+        has_codex_backend_auth: false,
         model_catalog: test_model_catalog(&cfg),
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,
-        runtime_model_provider_base_url: None,
         initial_plan_type: None,
         model: Some(resolved_model.clone()),
         startup_tooltip_override: None,
@@ -127,7 +93,7 @@ async fn marketplace_upgrade_loading_popup_snapshot() {
         .join(" | ");
     insta::assert_snapshot!(
         upgrade_lines,
-        @"Upgrading debug marketplace... | ›    Upgrading debug marketplace...  This updates when marketplace upgrade completes."
+        @"Upgrading debug marketplace... | ›    Upgrading debug marketplace...  This updates when marketplace upgrade completes"
     );
 }
 
@@ -170,18 +136,18 @@ async fn marketplace_upgrade_failure_includes_backend_messages_snapshot() {
 async fn hooks_popup_shows_list_diagnostics() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let cwd = chat.config.cwd.clone();
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
 
     chat.on_hooks_loaded(
-        cwd.to_path_buf(),
-        Ok(HooksListResponse {
-            data: vec![HooksListEntry {
-                cwd: cwd.to_path_buf(),
-                hooks: Vec::new(),
-                warnings: vec!["skipped invalid matcher for PreToolUse".to_string()],
-                errors: vec![HookErrorInfo {
-                    path: test_path_buf("/tmp/hooks.json"),
-                    message: "failed to parse hooks config".to_string(),
-                }],
+        HooksListTarget::Thread(thread_id),
+        Ok(HooksListEntry {
+            cwd: cwd.to_path_buf(),
+            hooks: Vec::new(),
+            warnings: vec!["skipped invalid matcher for PreToolUse".to_string()],
+            errors: vec![HookErrorInfo {
+                path: test_path_buf("/tmp/hooks.json"),
+                message: "failed to parse hooks config".to_string(),
             }],
         }),
     );
@@ -221,7 +187,7 @@ async fn plugins_popup_snapshot_shows_all_marketplaces_and_sorts_installed_then_
                 Some("Starter"),
                 Some("Included by default."),
                 /*installed*/ false,
-                /*enabled*/ true,
+                /*enabled*/ false,
                 PluginInstallPolicy::InstalledByDefault,
             ),
         ]),
@@ -235,7 +201,8 @@ async fn plugins_popup_snapshot_shows_all_marketplaces_and_sorts_installed_then_
             PluginInstallPolicy::Available,
         )]),
     ]);
-    let popup = render_loaded_plugins_popup(&mut chat, response);
+    render_loaded_plugins_popup(&mut chat, response);
+    let popup = render_bottom_popup(&chat, /*width*/ 320);
     assert_chatwidget_snapshot!("plugins_popup_curated_marketplace", popup);
     assert!(
         popup.contains("Hidden Repo Plugin"),
@@ -249,6 +216,27 @@ async fn plugins_popup_snapshot_shows_all_marketplaces_and_sorts_installed_then_
             && plugins_test_popup_row_position(&popup, "Hidden Repo Plugin")
                 < plugins_test_popup_row_position(&popup, "Starter"),
         "expected /plugins rows to sort installed plugins first, then alphabetically, got:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn plugins_popup_keeps_loaded_marketplace_state_with_load_errors() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let mut response = plugins_test_response(vec![plugins_test_curated_marketplace(Vec::new())]);
+    response
+        .marketplace_load_errors
+        .push(MarketplaceLoadErrorInfo {
+            marketplace_path: plugins_test_absolute_path("marketplaces/broken"),
+            message: "failed to load marketplace manifest".to_string(),
+        });
+
+    let popup = render_loaded_plugins_popup(&mut chat, response);
+    assert!(
+        popup.contains("No marketplace plugins available")
+            && !popup.contains("Marketplace unavailable"),
+        "expected /plugins to keep the loaded marketplace state, got:\n{popup}"
     );
 }
 
@@ -289,7 +277,7 @@ async fn plugins_popup_truncates_long_descriptions_in_list_rows() {
         .expect("expected verbose plugin row in popup");
     insta::assert_snapshot!(
         verbose_row,
-        @"  [-] Verbose Plugin  Available · ChatGPT Marketplace · This descri…"
+        @"  [-] Verbose Plugin  Available · OpenAI Curated · This description k…"
     );
     assert!(
         !popup
@@ -310,14 +298,14 @@ async fn plugins_popup_add_marketplace_tab_opens_prompt_and_submits_source() {
     );
 
     while rx.try_recv().is_ok() {}
-    for _ in 0..3 {
-        chat.handle_key_event(KeyEvent::from(KeyCode::Right));
-    }
-
-    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    let popup = select_plugins_tab_containing(
+        &mut chat,
+        /*width*/ 100,
+        "Add a marketplace from a Git repo or local root.",
+    );
     assert!(
         popup.contains("Add a marketplace from a Git repo or local root."),
-        "expected Add Marketplace tab, got:\n{popup}"
+        "expected Add marketplace tab, got:\n{popup}"
     );
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -368,7 +356,8 @@ async fn plugins_popup_upgrades_user_configured_git_marketplace_from_marketplace
             "[marketplaces.repo]\nsource_type = \"git\"\nsource = \"https://github.com/owner/repo.git\"\n",
         )
         .expect("marketplace config"),
-    );
+    )
+    .expect("marketplace user config should be valid");
 
     render_loaded_plugins_popup(
         &mut chat,
@@ -387,15 +376,11 @@ async fn plugins_popup_upgrades_user_configured_git_marketplace_from_marketplace
     );
 
     while rx.try_recv().is_ok() {}
-    for _ in 0..3 {
-        chat.handle_key_event(KeyEvent::from(KeyCode::Right));
-    }
-
-    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    let popup = select_plugins_tab_containing(&mut chat, /*width*/ 100, "Repo Marketplace.");
     assert!(
         popup.contains("Repo Marketplace.")
-            && popup.contains("ctrl + u upgrade")
-            && popup.contains("ctrl + r remove")
+            && popup.contains("⌃u upgrade")
+            && popup.contains("⌃r remove")
             && popup.contains("Debug Plugin"),
         "expected upgradeable user-configured marketplace tab, got:\n{popup}"
     );
@@ -443,7 +428,8 @@ async fn marketplace_add_success_refreshes_to_new_marketplace_tab() {
             "[marketplaces.debug]\nsource_type = \"git\"\nsource = \"https://github.com/owner/debug.git\"\n",
         )
         .expect("marketplace config"),
-    );
+    )
+    .expect("marketplace user config should be valid");
     render_loaded_plugins_popup(
         &mut chat,
         plugins_test_response(vec![plugins_test_curated_marketplace(Vec::new())]),
@@ -490,19 +476,28 @@ async fn marketplace_add_success_refreshes_to_new_marketplace_tab() {
     assert_chatwidget_snapshot!("plugins_popup_newly_installed_marketplace", popup);
     assert!(
         popup.contains("Debug Marketplace installed successfully.")
-            && popup.contains("ctrl + u upgrade")
-            && popup.contains("ctrl + r remove")
+            && popup.contains("⌃u upgrade")
+            && popup.contains("⌃r remove")
             && popup.contains("Debug Plugin"),
         "expected marketplace add refresh to switch to the new marketplace tab, got:\n{popup}"
     );
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
     chat.add_plugins_output();
-    for _ in 0..3 {
-        chat.handle_key_event(KeyEvent::from(KeyCode::Right));
-    }
-
-    let reopened_popup = render_bottom_popup(&chat, /*width*/ 100);
+    let reopened_popup = (0..8)
+        .find_map(|_| {
+            let popup = render_bottom_popup(&chat, /*width*/ 100);
+            if popup.contains("Installed 0 of 1 Debug Marketplace plugins.") {
+                Some(popup)
+            } else {
+                chat.handle_key_event(KeyEvent::from(KeyCode::Right));
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            let popup = render_bottom_popup(&chat, /*width*/ 100);
+            panic!("expected Debug Marketplace tab after reopening, got:\n{popup}");
+        });
     assert!(
         reopened_popup.contains("Installed 0 of 1 Debug Marketplace plugins.")
             && !reopened_popup.contains("installed successfully"),
@@ -523,7 +518,8 @@ async fn plugins_popup_removes_user_configured_marketplace_flow() {
             "[marketplaces.repo]\nsource_type = \"git\"\nsource = \"https://github.com/owner/repo.git\"\n",
         )
         .expect("marketplace config"),
-    );
+    )
+    .expect("marketplace user config should be valid");
 
     render_loaded_plugins_popup(
         &mut chat,
@@ -542,14 +538,12 @@ async fn plugins_popup_removes_user_configured_marketplace_flow() {
     );
     while rx.try_recv().is_ok() {}
 
-    for _ in 0..3 {
-        chat.handle_key_event(KeyEvent::from(KeyCode::Right));
-    }
-    let repo_tab = render_bottom_popup(&chat, /*width*/ 100);
+    let repo_tab =
+        select_plugins_tab_containing(&mut chat, /*width*/ 100, "Repo Marketplace.");
     assert!(
         repo_tab.contains("Repo Marketplace.")
-            && repo_tab.contains("ctrl + u upgrade")
-            && repo_tab.contains("ctrl + r remove")
+            && repo_tab.contains("⌃u upgrade")
+            && repo_tab.contains("⌃r remove")
             && repo_tab.contains("Debug Plugin"),
         "expected removable user-configured marketplace tab, got:\n{repo_tab}"
     );
@@ -617,16 +611,23 @@ async fn plugins_popup_removes_user_configured_marketplace_flow() {
         refreshed.contains("Browse plugins from available marketplaces.")
             && !refreshed.contains("Repo Marketplace")
             && !refreshed.contains("Debug Plugin")
-            && !refreshed.contains("ctrl + r remove"),
+            && !refreshed.contains("⌃r remove"),
         "expected refreshed plugin list without removed marketplace, got:\n{refreshed}"
     );
 }
 
 #[tokio::test]
-async fn plugin_detail_popup_snapshot_shows_install_actions_and_capability_summaries() {
+async fn plugin_detail_popup_snapshot_labels_personal_marketplace_as_local() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
 
+    let marketplace_name = "personal-marketplace";
+    let personal_marketplace_path = AbsolutePathBuf::try_from(
+        dirs::home_dir()
+            .expect("home directory")
+            .join(".agents/plugins/marketplace.json"),
+    )
+    .expect("absolute personal marketplace path");
     let summary = plugins_test_summary(
         "plugin-figma",
         "figma",
@@ -636,28 +637,29 @@ async fn plugin_detail_popup_snapshot_shows_install_actions_and_capability_summa
         /*enabled*/ true,
         PluginInstallPolicy::Available,
     );
-    let response = plugins_test_response(vec![plugins_test_curated_marketplace(vec![
-        summary.clone(),
-    ])]);
+    let response = plugins_test_response(vec![PluginMarketplaceEntry {
+        name: marketplace_name.to_string(),
+        path: Some(personal_marketplace_path.clone()),
+        interface: None,
+        plugins: vec![summary.clone()],
+    }]);
     let cwd = chat.config.cwd.clone();
     chat.on_plugins_loaded(cwd.to_path_buf(), Ok(response));
     chat.add_plugins_output();
-    chat.on_plugin_detail_loaded(
-        cwd.to_path_buf(),
-        Ok(PluginReadResponse {
-            plugin: plugins_test_detail(
-                summary,
-                Some("Turn Figma files into implementation context."),
-                &["design-review", "extract-copy"],
-                &[
-                    (codex_app_server_protocol::HookEventName::PreToolUse, 1),
-                    (codex_app_server_protocol::HookEventName::Stop, 2),
-                ],
-                &[("Figma", true), ("Slack", false)],
-                &["figma-mcp", "docs-mcp"],
-            ),
-        }),
+    let mut plugin = plugins_test_detail(
+        summary,
+        Some("Turn Figma files into implementation context."),
+        &["design-review", "extract-copy"],
+        &[
+            (codex_app_server_protocol::HookEventName::PreToolUse, 1),
+            (codex_app_server_protocol::HookEventName::Stop, 2),
+        ],
+        &["Figma", "Slack"],
+        &["figma-mcp", "docs-mcp"],
     );
+    plugin.marketplace_name = marketplace_name.to_string();
+    plugin.marketplace_path = Some(personal_marketplace_path);
+    chat.on_plugin_detail_loaded(cwd.to_path_buf(), Ok(PluginReadResponse { plugin }));
 
     let popup = render_bottom_popup(&chat, /*width*/ 100);
     assert_chatwidget_snapshot!(
@@ -667,10 +669,54 @@ async fn plugin_detail_popup_snapshot_shows_install_actions_and_capability_summa
 }
 
 #[tokio::test]
-async fn plugin_detail_popup_hides_disclosure_for_installed_plugins() {
+async fn plugin_detail_popup_snapshot_shows_npm_source() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
 
+    let mut summary = plugins_test_summary(
+        "plugin-figma",
+        "figma",
+        Some("Figma"),
+        Some("Design handoff."),
+        /*installed*/ false,
+        /*enabled*/ true,
+        PluginInstallPolicy::Available,
+    );
+    summary.source = PluginSource::Npm {
+        package: "@acme/figma-plugin".to_string(),
+        version: Some("^1.2.0".to_string()),
+        registry: Some("https://npm.example.com".to_string()),
+    };
+    let response = plugins_test_response(vec![plugins_test_curated_marketplace(vec![
+        summary.clone(),
+    ])]);
+    let cwd = chat.config.cwd.clone();
+    chat.on_plugins_loaded(cwd.to_path_buf(), Ok(response));
+    chat.add_plugins_output();
+    let plugin = plugins_test_detail(
+        summary,
+        Some("Turn Figma files into implementation context."),
+        &["design-review", "extract-copy"],
+        &[
+            (codex_app_server_protocol::HookEventName::PreToolUse, 1),
+            (codex_app_server_protocol::HookEventName::Stop, 2),
+        ],
+        &["Figma", "Slack"],
+        &["figma-mcp", "docs-mcp"],
+    );
+    chat.on_plugin_detail_loaded(cwd.to_path_buf(), Ok(PluginReadResponse { plugin }));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert_chatwidget_snapshot!(
+        "plugin_detail_popup_npm_source",
+        strip_osc8_for_snapshot(&popup)
+    );
+}
+
+#[tokio::test]
+async fn plugin_detail_popup_distinguishes_admin_installed_from_enabled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
     let summary = plugins_test_summary(
         "plugin-figma",
         "figma",
@@ -678,8 +724,375 @@ async fn plugin_detail_popup_hides_disclosure_for_installed_plugins() {
         Some("Design handoff."),
         /*installed*/ true,
         /*enabled*/ true,
-        PluginInstallPolicy::Available,
+        PluginInstallPolicy::InstalledByDefault,
     );
+    let response = plugins_test_response(vec![plugins_test_curated_marketplace(vec![
+        summary.clone(),
+    ])]);
+    let cwd = chat.config.cwd.clone();
+    chat.on_plugins_loaded(cwd.to_path_buf(), Ok(response));
+    chat.add_plugins_output();
+    let mut plugin = plugins_test_detail(
+        summary,
+        Some("Turn Figma files into implementation context."),
+        &["design-review", "extract-copy"],
+        &[
+            (codex_app_server_protocol::HookEventName::PreToolUse, 1),
+            (codex_app_server_protocol::HookEventName::Stop, 2),
+        ],
+        &["Figma", "Slack"],
+        &["figma-mcp", "docs-mcp"],
+    );
+    chat.on_plugin_detail_loaded(
+        cwd.to_path_buf(),
+        Ok(PluginReadResponse {
+            plugin: plugin.clone(),
+        }),
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        popup.contains("Installed by admin")
+            && !popup.contains("Uninstall plugin")
+            && !popup.contains("Data shared with this app is subject to the app's"),
+        "expected admin-installed plugin details to block uninstall and hide the disclosure line, got:\n{popup}"
+    );
+    assert_chatwidget_snapshot!(
+        "plugin_detail_popup_installed",
+        strip_osc8_for_snapshot(&popup)
+    );
+
+    plugin.summary.installed = false;
+    plugin.summary.enabled = false;
+    chat.on_plugin_detail_loaded(cwd.to_path_buf(), Ok(PluginReadResponse { plugin }));
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        popup.contains("Enabled by Admin")
+            && popup.contains("Install plugin")
+            && !popup.contains("Installed by admin"),
+        "expected an unmaterialized default plugin to show its admin assignment and remain installable, got:\n{popup}"
+    );
+    insta::assert_snapshot!(
+        popup
+            .lines()
+            .find(|line| line.contains("Figma ·"))
+            .expect("expected plugin detail header")
+            .trim(),
+        @"Figma · Enabled by Admin · ChatGPT Marketplace"
+    );
+}
+
+#[tokio::test]
+async fn plugins_popup_remote_row_opens_remote_detail() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let popup = render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![PluginMarketplaceEntry {
+            name: "workspace-directory".to_string(),
+            path: None,
+            interface: Some(MarketplaceInterface {
+                display_name: Some("Workspace".to_string()),
+            }),
+            plugins: vec![plugins_test_remote_summary(
+                "plugins~Plugin_calendar",
+                "calendar",
+                Some("Calendar"),
+                Some("Workspace schedules."),
+                /*installed*/ false,
+            )],
+        }]),
+    );
+    let remote_row = popup
+        .lines()
+        .find(|line| line.contains("Calendar"))
+        .expect("expected remote plugin row");
+    assert!(
+        remote_row.contains("Available")
+            && remote_row.contains("Press Enter to install or view plugin details"),
+        "expected remote plugin row to be viewable, got:\n{remote_row}"
+    );
+
+    while rx.try_recv().is_ok() {}
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match rx.try_recv() {
+        Ok(AppEvent::OpenPluginDetailLoading {
+            plugin_display_name,
+        }) => {
+            assert_eq!(plugin_display_name, "Calendar");
+        }
+        other => panic!("expected OpenPluginDetailLoading event, got {other:?}"),
+    }
+    match rx.try_recv() {
+        Ok(AppEvent::FetchPluginDetail { cwd: _, params }) => {
+            assert_eq!(params.marketplace_path, None);
+            assert_eq!(
+                params.remote_marketplace_name,
+                Some("workspace-directory".to_string())
+            );
+            assert_eq!(params.plugin_name, "plugins~Plugin_calendar");
+        }
+        other => panic!("expected FetchPluginDetail event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plugin_detail_unmaterialized_default_uses_remote_install_path() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let summary = PluginSummary {
+        install_policy: PluginInstallPolicy::InstalledByDefault,
+        ..plugins_test_remote_summary(
+            "plugins~Plugin_linear",
+            "linear",
+            Some("Linear"),
+            Some("Issue tracking."),
+            /*installed*/ false,
+        )
+    };
+    let cwd = chat.config.cwd.clone();
+    chat.on_plugins_loaded(
+        cwd.to_path_buf(),
+        Ok(plugins_test_response(vec![PluginMarketplaceEntry {
+            name: "workspace-shared-with-me-private".to_string(),
+            path: None,
+            interface: Some(MarketplaceInterface {
+                display_name: Some("Shared with me".to_string()),
+            }),
+            plugins: vec![summary.clone()],
+        }])),
+    );
+    chat.add_plugins_output();
+    chat.on_plugin_detail_loaded(
+        cwd.to_path_buf(),
+        Ok(PluginReadResponse {
+            plugin: PluginDetail {
+                onboarding_skill: None,
+                marketplace_name: "workspace-shared-with-me-private".to_string(),
+                marketplace_path: None,
+                summary,
+                share_url: None,
+                description: Some("Install shared Linear plugin.".to_string()),
+                skills: Vec::new(),
+                hooks: Vec::new(),
+                apps: Vec::new(),
+                app_templates: Vec::new(),
+                mcp_servers: Vec::new(),
+                scheduled_tasks: None,
+            },
+        }),
+    );
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        popup.contains("Install plugin") && popup.contains("Install this plugin now"),
+        "expected remote detail to offer install, got:\n{popup}"
+    );
+
+    while rx.try_recv().is_ok() {}
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match rx.try_recv() {
+        Ok(AppEvent::OpenPluginInstallLoading {
+            plugin_display_name,
+        }) => {
+            assert_eq!(plugin_display_name, "Linear");
+        }
+        other => panic!("expected OpenPluginInstallLoading event, got {other:?}"),
+    }
+    match rx.try_recv() {
+        Ok(AppEvent::FetchPluginInstall {
+            cwd: _,
+            location: crate::app_event::PluginLocation::Remote { marketplace_name },
+            plugin_name,
+            plugin_display_name,
+        }) => {
+            assert_eq!(marketplace_name, "workspace-shared-with-me-private");
+            assert_eq!(plugin_name, "plugins~Plugin_linear");
+            assert_eq!(plugin_display_name, "Linear");
+        }
+        other => panic!("expected remote FetchPluginInstall event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plugin_detail_remote_uninstall_uses_remote_plugin_id() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let summary = plugins_test_remote_summary(
+        "plugins~Plugin_linear",
+        "linear",
+        Some("Linear"),
+        Some("Issue tracking."),
+        /*installed*/ true,
+    );
+    let cwd = chat.config.cwd.clone();
+    chat.on_plugins_loaded(
+        cwd.to_path_buf(),
+        Ok(plugins_test_response(vec![
+            plugins_test_remote_marketplace(
+                "workspace-shared-with-me-private",
+                "Shared with me",
+                vec![summary.clone()],
+            ),
+        ])),
+    );
+    chat.add_plugins_output();
+    chat.on_plugin_detail_loaded(
+        cwd.to_path_buf(),
+        Ok(PluginReadResponse {
+            plugin: plugins_test_remote_detail(
+                "workspace-shared-with-me-private",
+                summary,
+                Some("Installed shared Linear plugin."),
+            ),
+        }),
+    );
+
+    while rx.try_recv().is_ok() {}
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match rx.try_recv() {
+        Ok(AppEvent::OpenPluginUninstallLoading {
+            plugin_display_name,
+        }) => {
+            assert_eq!(plugin_display_name, "Linear");
+        }
+        other => panic!("expected OpenPluginUninstallLoading event, got {other:?}"),
+    }
+    match rx.try_recv() {
+        Ok(AppEvent::FetchPluginUninstall {
+            plugin_id,
+            plugin_display_name,
+            ..
+        }) => {
+            assert_eq!(plugin_id, "plugins~Plugin_linear");
+            assert_eq!(plugin_display_name, "Linear");
+        }
+        other => panic!("expected remote FetchPluginUninstall event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plugin_detail_remote_without_remote_id_disables_uninstall_action() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let summary = PluginSummary {
+        source: PluginSource::Remote,
+        ..plugins_test_summary(
+            "linear@workspace-shared-with-me-private",
+            "linear",
+            Some("Linear"),
+            Some("Issue tracking."),
+            /*installed*/ true,
+            /*enabled*/ true,
+            PluginInstallPolicy::Available,
+        )
+    };
+    let cwd = chat.config.cwd.clone();
+    chat.on_plugins_loaded(
+        cwd.to_path_buf(),
+        Ok(plugins_test_response(vec![
+            plugins_test_remote_marketplace(
+                "workspace-shared-with-me-private",
+                "Shared with me",
+                vec![summary.clone()],
+            ),
+        ])),
+    );
+    chat.add_plugins_output();
+    chat.on_plugin_detail_loaded(
+        cwd.to_path_buf(),
+        Ok(PluginReadResponse {
+            plugin: plugins_test_remote_detail(
+                "workspace-shared-with-me-private",
+                summary,
+                Some("Installed shared Linear plugin."),
+            ),
+        }),
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(
+        popup.contains("This remote plugin did not provide an uninstall identity")
+            && !popup.contains("Remove this plugin now"),
+        "expected missing remote ID to disable uninstall, got:\n{popup}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    assert_eq!(
+        render_bottom_popup(&chat, /*width*/ 120),
+        popup,
+        "expected navigation to skip the disabled uninstall row"
+    );
+}
+
+#[tokio::test]
+async fn plugin_detail_popup_shows_local_share_context_as_read_only_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let summary = PluginSummary {
+        share_context: Some(PluginShareContext {
+            remote_plugin_id: "plugins~Plugin_docs".to_string(),
+            remote_version: Some("7".to_string()),
+            discoverability: Some(PluginShareDiscoverability::Private),
+            share_url: Some("https://chatgpt.com/codex/plugins/share/docs".to_string()),
+            creator_account_user_id: None,
+            creator_name: Some("Test User".to_string()),
+            share_principals: None,
+            can_publish_to_workspace: None,
+        }),
+        ..plugins_test_summary(
+            "plugin-docs",
+            "docs",
+            Some("Docs"),
+            Some("Workspace docs."),
+            /*installed*/ false,
+            /*enabled*/ true,
+            PluginInstallPolicy::Available,
+        )
+    };
+    let response = plugins_test_response(vec![plugins_test_curated_marketplace(vec![
+        summary.clone(),
+    ])]);
+    let cwd = chat.config.cwd.clone();
+    chat.on_plugins_loaded(cwd.to_path_buf(), Ok(response));
+    chat.add_plugins_output();
+    let mut detail = plugins_test_detail(summary, Some("Workspace docs."), &[], &[], &[], &[]);
+    detail.marketplace_path = Some(plugins_test_personal_marketplace_path());
+    chat.on_plugin_detail_loaded(cwd.to_path_buf(), Ok(PluginReadResponse { plugin: detail }));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert_chatwidget_snapshot!(
+        "plugin_detail_popup_local_share_read_only",
+        strip_osc8_for_snapshot(&popup)
+    );
+}
+
+#[tokio::test]
+async fn plugin_detail_popup_shows_admin_disabled_status_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let summary = PluginSummary {
+        availability: PluginAvailability::DisabledByAdmin,
+        ..plugins_test_summary(
+            "plugin-admin-blocked",
+            "admin-blocked",
+            Some("Admin Blocked"),
+            Some("Blocked by policy."),
+            /*installed*/ false,
+            /*enabled*/ true,
+            PluginInstallPolicy::Available,
+        )
+    };
     let response = plugins_test_response(vec![plugins_test_curated_marketplace(vec![
         summary.clone(),
     ])]);
@@ -689,29 +1102,362 @@ async fn plugin_detail_popup_hides_disclosure_for_installed_plugins() {
     chat.on_plugin_detail_loaded(
         cwd.to_path_buf(),
         Ok(PluginReadResponse {
-            plugin: plugins_test_detail(
-                summary,
-                Some("Turn Figma files into implementation context."),
-                &["design-review", "extract-copy"],
-                &[
-                    (codex_app_server_protocol::HookEventName::PreToolUse, 1),
-                    (codex_app_server_protocol::HookEventName::Stop, 2),
-                ],
-                &[("Figma", true), ("Slack", false)],
-                &["figma-mcp", "docs-mcp"],
-            ),
+            plugin: plugins_test_detail(summary, Some("Blocked by policy."), &[], &[], &[], &[]),
         }),
     );
 
-    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    let status_row = popup
+        .lines()
+        .find(|line| line.contains("Disabled by admin"))
+        .expect("expected admin-disabled status row");
+    insta::assert_snapshot!(
+        status_row,
+        @"  Admin Blocked · Disabled by admin · ChatGPT Marketplace"
+    );
     assert!(
-        !popup.contains("Data shared with this app is subject to the app's"),
-        "expected installed plugin details to hide the disclosure line, got:\n{popup}"
+        popup.contains("This plugin is disabled by your workspace admin")
+            && !popup.contains("Install this plugin now"),
+        "expected admin-disabled detail to block install, got:\n{popup}"
     );
-    assert_chatwidget_snapshot!(
-        "plugin_detail_popup_installed",
-        strip_osc8_for_snapshot(&popup)
+
+    while rx.try_recv().is_ok() {}
+    assert!(
+        rx.try_recv().is_err(),
+        "expected no action after rendering disabled install state"
     );
+}
+
+#[tokio::test]
+async fn plugins_popup_admin_disabled_installed_plugin_has_no_toggle_hint() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let summary = PluginSummary {
+        availability: PluginAvailability::DisabledByAdmin,
+        ..plugins_test_summary(
+            "plugin-admin-blocked",
+            "admin-blocked",
+            Some("Admin Blocked"),
+            Some("Blocked by policy."),
+            /*installed*/ true,
+            /*enabled*/ true,
+            PluginInstallPolicy::Available,
+        )
+    };
+    render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![plugins_test_curated_marketplace(vec![summary])]),
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert_chatwidget_snapshot!("plugins_popup_admin_disabled_installed", popup);
+    assert!(
+        popup.contains("[!] Admin Blocked")
+            && popup.contains("Disabled")
+            && popup.contains("Press Enter to view plugin details")
+            && !popup.contains("Disabled by admin")
+            && !popup.contains("Tab to disable"),
+        "expected admin-disabled installed row to omit toggle hint, got:\n{popup}"
+    );
+
+    while rx.try_recv().is_ok() {}
+    let before = render_bottom_popup(&chat, /*width*/ 120);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+    let after = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(
+        rx.try_recv().is_err(),
+        "tab should not toggle admin-disabled installed plugins"
+    );
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn plugins_popup_admin_disabled_available_plugin_has_view_only_hint() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let summary = PluginSummary {
+        availability: PluginAvailability::DisabledByAdmin,
+        ..plugins_test_summary(
+            "plugin-admin-blocked",
+            "admin-blocked",
+            Some("Admin Blocked"),
+            Some("Blocked by policy."),
+            /*installed*/ false,
+            /*enabled*/ true,
+            PluginInstallPolicy::Available,
+        )
+    };
+    render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![plugins_test_curated_marketplace(vec![summary])]),
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    let admin_blocked_row = popup
+        .lines()
+        .find(|line| line.contains("Admin Blocked"))
+        .expect("expected admin-disabled plugin row");
+    assert!(
+        admin_blocked_row.contains("Press Enter to view plugin details")
+            && !admin_blocked_row.contains("install or view"),
+        "expected admin-disabled available plugin to stay view-only, got:\n{admin_blocked_row}"
+    );
+}
+
+#[tokio::test]
+async fn plugins_popup_remote_section_fallback_states_when_remote_plugin_disabled_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+    chat.set_feature_enabled(Feature::RemotePlugin, /*enabled*/ false);
+
+    let select_tab_containing = |chat: &mut ChatWidget, visible_text: &str| -> String {
+        for _ in 0..8 {
+            let popup = render_bottom_popup(chat, /*width*/ 100);
+            if popup.contains(visible_text) {
+                return popup;
+            }
+            chat.handle_key_event(KeyEvent::from(KeyCode::Right));
+        }
+
+        let popup = render_bottom_popup(chat, /*width*/ 100);
+        panic!("expected plugins tab containing {visible_text:?}, got:\n{popup}");
+    };
+    let remote_section_state = |popup: &str| -> String {
+        let header = popup
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .nth(1)
+            .expect("expected remote section header");
+        let item = popup
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix('›'))
+            .expect("expected selected remote section item")
+            .trim();
+        format!("{header}\n{item}")
+    };
+
+    chat.add_plugins_output();
+    let cwd = chat.config.cwd.clone();
+    chat.on_plugins_loaded(
+        cwd.to_path_buf(),
+        Ok(plugins_test_response(vec![
+            plugins_test_curated_marketplace(Vec::new()),
+        ])),
+    );
+    let curated_loading_popup =
+        select_tab_containing(&mut chat, "Loading OpenAI Curated plugins...");
+    let workspace_loading_popup = select_tab_containing(&mut chat, "Loading Workspace plugins.");
+    let shared_loading_popup = select_tab_containing(&mut chat, "Loading Shared with me plugins.");
+    let _ = select_tab_containing(&mut chat, "Loading Workspace plugins.");
+
+    chat.on_plugin_remote_sections_loaded(cwd.to_path_buf(), Vec::new(), Vec::new());
+    let loaded_popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert_chatwidget_snapshot!("plugins_popup_empty_shared_section_hidden", loaded_popup);
+    assert!(
+        !loaded_popup.contains("Shared with me"),
+        "expected empty shared section to stay hidden, got:\n{loaded_popup}"
+    );
+
+    chat.on_plugin_remote_sections_loaded(
+        cwd.to_path_buf(),
+        Vec::new(),
+        vec![crate::app_event::PluginRemoteSectionError {
+            section_id: "workspace".to_string(),
+            label: "Workspace".to_string(),
+            message: "Sign in to ChatGPT to load workspace plugins.".to_string(),
+        }],
+    );
+    let workspace_error_popup = select_tab_containing(&mut chat, "Workspace unavailable.");
+
+    let (mut remote_chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    remote_chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+    remote_chat.add_plugins_output();
+    let remote_cwd = remote_chat.config.cwd.clone();
+    remote_chat.on_plugins_loaded(
+        remote_cwd.to_path_buf(),
+        Ok(plugins_test_response(vec![
+            plugins_test_curated_marketplace(Vec::new()),
+        ])),
+    );
+    let remote_curated_empty_popup =
+        select_tab_containing(&mut remote_chat, "No OpenAI Curated plugins available");
+
+    insta::assert_snapshot!(
+        [
+            remote_section_state(&curated_loading_popup),
+            remote_section_state(&workspace_loading_popup),
+            remote_section_state(&shared_loading_popup),
+            remote_section_state(&workspace_error_popup),
+            remote_section_state(&remote_curated_empty_popup),
+        ]
+        .join("\n\n"),
+        @r"
+    OpenAI Curated marketplace.
+    Loading OpenAI Curated plugins...  This updates when OpenAI Curated plugins finish loading
+
+    Loading Workspace plugins.
+    Loading Workspace plugins...  This updates when workspace plugins finish loading
+
+    Loading Shared with me plugins.
+    Loading Shared with me plugins...  This updates when shared plugins finish loading
+
+    Workspace unavailable.
+    Workspace unavailable  Sign in to ChatGPT to load workspace plugins.
+
+    OpenAI Curated marketplace.
+    No OpenAI Curated plugins available  No OpenAI Curated plugins available
+    "
+    );
+}
+
+#[tokio::test]
+async fn plugins_popup_remote_detail_tracks_physical_and_policy_install_state() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    let remote_plugin_id = "plugins~Plugin_docs";
+    let remote_marketplace_name = "workspace-shared-with-me-private";
+    let mut local_summary = PluginSummary {
+        share_context: Some(PluginShareContext {
+            remote_plugin_id: remote_plugin_id.to_string(),
+            remote_version: None,
+            discoverability: None,
+            share_url: None,
+            creator_account_user_id: None,
+            creator_name: None,
+            share_principals: None,
+            can_publish_to_workspace: None,
+        }),
+        ..plugins_test_summary(
+            "plugin-docs",
+            "docs",
+            Some("Docs"),
+            Some("Local editable docs plugin."),
+            /*installed*/ false,
+            /*enabled*/ true,
+            PluginInstallPolicy::InstalledByDefault,
+        )
+    };
+    let popup = render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![
+            plugins_test_curated_marketplace(vec![local_summary.clone()]),
+            PluginMarketplaceEntry {
+                name: remote_marketplace_name.to_string(),
+                path: None,
+                interface: Some(MarketplaceInterface {
+                    display_name: Some("Shared with me".to_string()),
+                }),
+                plugins: vec![plugins_test_remote_summary(
+                    remote_plugin_id,
+                    "docs",
+                    Some("Docs"),
+                    Some("Shared docs plugin."),
+                    /*installed*/ true,
+                )],
+            },
+        ]),
+    );
+    let all_plugins_row = popup
+        .lines()
+        .find(|line| line.contains("Docs"))
+        .expect("expected all-plugins row");
+    assert!(
+        popup.contains("Installed 1 of 1 available plugins.")
+            && all_plugins_row.contains("Installed")
+            && !all_plugins_row.contains("Available"),
+        "expected installed remote duplicate to win over local mapped share, got:\n{popup}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Right));
+    let installed_popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        installed_popup.contains("Showing 1 installed plugins.")
+            && installed_popup.contains("Docs"),
+        "expected installed remote duplicate in the Installed tab, got:\n{installed_popup}"
+    );
+
+    while rx.try_recv().is_ok() {}
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match rx.try_recv() {
+        Ok(AppEvent::OpenPluginDetailLoading {
+            plugin_display_name,
+        }) => {
+            assert_eq!(plugin_display_name, "Docs");
+        }
+        other => panic!("expected OpenPluginDetailLoading event, got {other:?}"),
+    }
+    match rx.try_recv() {
+        Ok(AppEvent::FetchPluginDetail { params, .. }) => {
+            assert_eq!(params.marketplace_path, None);
+            assert_eq!(
+                params.remote_marketplace_name,
+                Some(remote_marketplace_name.to_string())
+            );
+            assert_eq!(params.plugin_name, remote_plugin_id);
+        }
+        other => panic!("expected FetchPluginDetail event, got {other:?}"),
+    }
+
+    local_summary.install_policy = PluginInstallPolicy::Available;
+    let mut remote_summary = plugins_test_remote_summary(
+        remote_plugin_id,
+        "docs",
+        Some("Docs"),
+        Some("Shared docs plugin."),
+        /*installed*/ false,
+    );
+    remote_summary.install_policy = PluginInstallPolicy::InstalledByDefault;
+    let popup = render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![
+            plugins_test_curated_marketplace(vec![local_summary]),
+            PluginMarketplaceEntry {
+                name: remote_marketplace_name.to_string(),
+                path: None,
+                interface: Some(MarketplaceInterface {
+                    display_name: Some("Shared with me".to_string()),
+                }),
+                plugins: vec![remote_summary],
+            },
+        ]),
+    );
+    assert!(
+        popup.contains("Installed 0 of 1 available plugins.") && popup.contains("Admin assigned"),
+        "expected the unmaterialized admin-assigned remote duplicate to win without counting as installed, got:\n{popup}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Right));
+    let installed_popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        installed_popup.contains("Showing 0 installed plugins.")
+            && installed_popup.contains("No installed plugins")
+            && !installed_popup.contains("Docs"),
+        "expected the unmaterialized admin-assigned plugin to stay out of the Installed tab, got:\n{installed_popup}"
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Left));
+
+    while rx.try_recv().is_ok() {}
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::OpenPluginDetailLoading { .. })
+    ));
+    match rx.try_recv() {
+        Ok(AppEvent::FetchPluginDetail { params, .. }) => {
+            assert_eq!(params.marketplace_path, None);
+            assert_eq!(
+                params.remote_marketplace_name,
+                Some(remote_marketplace_name.to_string())
+            );
+            assert_eq!(params.plugin_name, remote_plugin_id);
+        }
+        other => panic!("expected FetchPluginDetail event, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -887,13 +1633,13 @@ async fn plugins_popup_refreshes_installed_counts_after_install() {
         "expected /plugins to refresh installed counts after install, got:\n{after}"
     );
     assert!(
-        after.contains("Installed   Space to disable; Enter view details."),
+        after.contains("Installed   Tab to disable; Enter view details"),
         "expected refreshed selected row copy to reflect the installed plugin state, got:\n{after}"
     );
 }
 
 #[tokio::test]
-async fn plugins_popup_space_toggles_installed_plugin_from_list() {
+async fn plugins_popup_toggle_keys_preserve_search_and_selection() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
 
@@ -939,17 +1685,68 @@ async fn plugins_popup_space_toggles_installed_plugin_from_list() {
         other => panic!("expected SetPluginEnabled event, got {other:?}"),
     }
 
+    type_plugins_search_query(&mut chat, "dr");
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+
+    match rx.try_recv() {
+        Ok(AppEvent::SetPluginEnabled {
+            cwd: event_cwd,
+            plugin_id,
+            enabled,
+        }) => {
+            assert_eq!(event_cwd, cwd);
+            assert_eq!(plugin_id, "plugin-drive");
+            assert!(enabled);
+        }
+        other => panic!("expected SetPluginEnabled event, got {other:?}"),
+    }
+
     chat.on_plugin_enabled_set(
         cwd,
         "plugin-drive".to_string(),
-        /*enabled*/ false,
+        /*enabled*/ true,
         Ok(()),
     );
 
     let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert_chatwidget_snapshot!("plugins_popup_toggle_refresh_preserves_search", popup);
     assert!(
-        popup.contains("› [ ] Drive"),
-        "expected selected plugin row to stay selected after refresh, got:\n{popup}"
+        popup.lines().any(|line| line.trim() == "dr")
+            && popup.contains("› [*] Drive")
+            && popup.contains("Tab to disable"),
+        "expected the filtered plugin and search query to survive refresh, got:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn plugins_popup_hides_tab_toggle_hint_when_tab_is_configured() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+    let mut keymap = crate::keymap::RuntimeKeymap::defaults();
+    keymap.list.move_down = vec![crate::key_hint::plain(KeyCode::Tab)];
+    chat.bottom_pane.set_keymap_bindings(&keymap);
+
+    let popup = render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![plugins_test_curated_marketplace(vec![
+            plugins_test_summary(
+                "plugin-drive",
+                "drive",
+                Some("Drive"),
+                Some("Document access."),
+                /*installed*/ true,
+                /*enabled*/ true,
+                PluginInstallPolicy::Available,
+            ),
+        ])]),
+    );
+
+    assert_chatwidget_snapshot!("plugins_popup_custom_tab_binding_hides_toggle_hint", popup);
+    assert!(
+        popup.contains("Installed   Press Enter to view plugin details")
+            && !popup.contains("Tab to disable")
+            && !popup.contains("tab toggle"),
+        "expected configured Tab binding to hide unavailable toggle hints, got:\n{popup}"
     );
 }
 
@@ -1079,6 +1876,44 @@ async fn plugins_popup_search_filters_visible_rows_snapshot() {
     assert!(
         !popup.contains("Calendar") && !popup.contains("Drive"),
         "expected search to leave only matching rows visible, got:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn plugins_popup_search_matches_plugin_descriptions() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+
+    render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![plugins_test_curated_marketplace(vec![
+            plugins_test_summary(
+                "plugin-calendar",
+                "calendar",
+                Some("Calendar"),
+                Some("Schedule management."),
+                /*installed*/ false,
+                /*enabled*/ true,
+                PluginInstallPolicy::Available,
+            ),
+            plugins_test_summary(
+                "plugin-drive",
+                "drive",
+                Some("Drive"),
+                Some("Document access."),
+                /*installed*/ false,
+                /*enabled*/ true,
+                PluginInstallPolicy::Available,
+            ),
+        ])]),
+    );
+
+    type_plugins_search_query(&mut chat, "document");
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(
+        popup.contains("Drive") && !popup.contains("Calendar"),
+        "expected plugin search to match descriptions, got:\n{popup}"
     );
 }
 
@@ -1223,7 +2058,14 @@ async fn plugins_popup_refresh_preserves_duplicate_marketplace_tab_by_path() {
     chat.on_plugins_loaded(cwd.clone(), Ok(response.clone()));
     chat.add_plugins_output();
 
-    for _ in 0..4 {
+    for _ in 0..10 {
+        let popup = render_bottom_popup(&chat, /*width*/ 100);
+        if popup.contains("Duplicate Marketplace (2/2).")
+            && popup.contains("Repo Plugin")
+            && !popup.contains("Home Plugin")
+        {
+            break;
+        }
         chat.handle_key_event(KeyEvent::from(KeyCode::Right));
     }
 
@@ -1298,7 +2140,8 @@ async fn plugins_popup_search_no_matches_and_backspace_restores_results() {
 
 #[tokio::test]
 async fn apps_popup_stays_loading_until_final_snapshot_updates() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
     set_chatgpt_auth(&mut chat);
     chat.config
         .features
@@ -1316,6 +2159,8 @@ async fn apps_popup_stays_loading_until_final_snapshot_updates() {
                 description: Some("Workspace docs".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
+                icon_assets: None,
+                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,
@@ -1332,6 +2177,14 @@ async fn apps_popup_stays_loading_until_final_snapshot_updates() {
     assert!(
         chat.connectors.prefetch_in_flight,
         "expected /apps to trigger a forced connectors refresh"
+    );
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::FetchConnectorsList { force_refetch, .. }) if force_refetch
+    );
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::FetchInstalledConnectorMentions { force_refresh, .. }) if force_refresh
     );
 
     let before = render_bottom_popup(&chat, /*width*/ 80);
@@ -1350,6 +2203,8 @@ async fn apps_popup_stays_loading_until_final_snapshot_updates() {
                     description: Some("Workspace docs".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1365,6 +2220,8 @@ async fn apps_popup_stays_loading_until_final_snapshot_updates() {
                     description: Some("Project tracking".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1392,7 +2249,8 @@ async fn apps_popup_stays_loading_until_final_snapshot_updates() {
 
 #[tokio::test]
 async fn apps_notification_update_excludes_inaccessible_apps_from_mentions() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
     set_chatgpt_auth(&mut chat);
     chat.config
         .features
@@ -1411,6 +2269,8 @@ async fn apps_notification_update_excludes_inaccessible_apps_from_mentions() {
                     description: Some("Connected files".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1426,12 +2286,14 @@ async fn apps_notification_update_excludes_inaccessible_apps_from_mentions() {
                     description: Some("Directory-only app".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
                     labels: None,
                     install_url: Some("https://example.test/arabica".to_string()),
-                    is_accessible: false,
+                    is_accessible: true,
                     is_enabled: true,
                     plugin_display_names: Vec::new(),
                 },
@@ -1440,24 +2302,137 @@ async fn apps_notification_update_excludes_inaccessible_apps_from_mentions() {
         /*is_final*/ false,
     );
 
-    assert_matches!(
-        &chat.connectors.partial_snapshot,
-        Some(snapshot)
-            if snapshot
-                .connectors
-                .iter()
-                .find(|connector| connector.id == "arabica_uae")
-                .is_some_and(|connector| !connector.is_accessible)
+    assert!(chat.connectors_for_mentions().is_none());
+
+    let mut installed = chat
+        .connectors
+        .partial_snapshot
+        .as_ref()
+        .expect("directory notification should remain available to /apps")
+        .connectors
+        .clone();
+    installed[1].is_enabled = false;
+    chat.on_connector_mentions_loaded(
+        chat.connector_scope_generation(),
+        Ok(ConnectorsSnapshot {
+            connectors: installed,
+        }),
     );
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
         popup.contains("Google Drive"),
-        "expected accessible apps to appear in the mention popup, got:\n{popup}"
+        "expected callable installed apps to appear in the mention popup, got:\n{popup}"
     );
     assert!(
         !popup.contains("% Arabica UAE"),
-        "did not expect an inaccessible directory app in the mention popup, got:\n{popup}"
+        "directory accessibility must not make an app callable, got:\n{popup}"
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    chat.insert_str("$arabica-uae ");
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(
+        next_submit_op(&mut op_rx),
+        Op::UserTurn { items, .. }
+            if matches!(items.as_slice(), [
+                UserInput::Text { .. },
+                UserInput::Mention { name, path },
+            ] if name == "Google Drive" && path == "app://google_drive")
+    );
+
+    chat.connectors.partial_snapshot = None;
+    assert_matches!(&chat.connectors.cache, ConnectorsCacheState::Uninitialized);
+    for (app_id, app_name) in [
+        ("arabica_uae", "% Arabica UAE"),
+        ("google_drive", "Google Drive"),
+    ] {
+        chat.on_plugin_install_loaded(
+            chat.config.cwd.to_path_buf(),
+            crate::app_event::PluginLocation::Remote {
+                marketplace_name: "marketplace".to_string(),
+            },
+            "plugin".to_string(),
+            "Plugin".to_string(),
+            Ok(serde_json::from_value(serde_json::json!({
+                "authPolicy": "ON_INSTALL",
+                "appsNeedingAuth": [{ "id": app_id, "name": app_name }],
+            }))
+            .expect("valid plugin installation response")),
+        );
+        let auth_popup = render_bottom_popup(&chat, /*width*/ 80);
+        assert!(auth_popup.contains("Already installed") && auth_popup.contains("Continue"));
+        if app_id == "arabica_uae" {
+            let snapshot = normalize_snapshot_paths(format!(
+                "{popup}\n\n--- plugin authentication ---\n{auth_popup}"
+            ));
+            assert_chatwidget_snapshot!("apps_mentions_only_callable_installed", snapshot);
+        }
+    }
+}
+
+#[tokio::test]
+async fn apps_installed_mentions_revoke_access_and_reject_stale_account_results() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
+    chat.set_feature_enabled(Feature::Apps, /*enabled*/ true);
+    let generation = chat.connector_scope_generation();
+    let connector_id = "account-app";
+    let connector =
+        serde_json::from_str(r#"{"id":"account-app","name":"Account app","isAccessible":true}"#)
+            .expect("valid installed app");
+    let snapshot = ConnectorsSnapshot {
+        connectors: vec![connector],
+    };
+    chat.on_connector_mentions_loaded(generation, Ok(snapshot.clone()));
+    assert!(chat.connectors.installed_app_ids.contains(connector_id));
+
+    chat.refresh_connector_mentions(/*force_refresh*/ false);
+    rx.try_recv().expect("pre-disable mention refresh");
+    chat.update_connector_enabled(connector_id, /*enabled*/ false);
+    chat.on_connector_mentions_loaded(generation, Ok(snapshot.clone()));
+    assert_eq!(chat.connectors_for_mentions(), Some([].as_slice()));
+    rx.try_recv().expect("post-disable mention refresh");
+    chat.on_connector_mentions_loaded(generation, Ok(snapshot.clone()));
+    assert_eq!(
+        chat.connectors_for_mentions(),
+        Some(snapshot.connectors.as_slice())
+    );
+
+    chat.on_connectors_loaded(Ok(snapshot.clone()), /*is_final*/ true);
+    for enabled in [false, true] {
+        chat.update_connector_enabled(connector_id, enabled);
+        assert_eq!(chat.connectors_for_mentions(), Some([].as_slice()));
+        assert_matches!(
+            rx.try_recv(),
+            Ok(AppEvent::FetchInstalledConnectorMentions { force_refresh, .. })
+                if force_refresh == enabled
+        );
+        let mut refreshed = snapshot.clone();
+        refreshed.connectors[0].is_enabled = enabled;
+        chat.on_connector_mentions_loaded(generation, Ok(refreshed));
+    }
+
+    chat.update_account_state(
+        /*status_account_display*/ None, /*plan_type*/ None,
+        /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ true,
+    );
+
+    assert_ne!(chat.connector_scope_generation(), generation);
+    assert_matches!(&chat.connectors.cache, ConnectorsCacheState::Uninitialized);
+    assert!(chat.connectors_for_mentions().is_none());
+    assert!(chat.connectors.mention_refresh_in_flight);
+
+    chat.on_connector_mentions_loaded(generation, Ok(snapshot));
+    assert!(chat.connectors_for_mentions().is_none());
+    assert!(chat.connectors.mention_refresh_in_flight);
+    assert!(chat.connectors.installed_app_ids.is_empty());
+
+    let (mut replacement, _, _) = make_chatwidget_manual(/*model_override*/ None).await;
+    replacement.invalidate_connector_scope();
+    assert_ne!(
+        chat.connector_scope_generation(),
+        replacement.connector_scope_generation()
     );
 }
 
@@ -1480,6 +2455,8 @@ async fn apps_refresh_failure_keeps_existing_full_snapshot() {
             description: Some("Workspace docs".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,
@@ -1495,6 +2472,8 @@ async fn apps_refresh_failure_keeps_existing_full_snapshot() {
             description: Some("Project tracking".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,
@@ -1520,6 +2499,8 @@ async fn apps_refresh_failure_keeps_existing_full_snapshot() {
                 description: Some("Workspace docs".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
+                icon_assets: None,
+                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,
@@ -1569,6 +2550,8 @@ async fn apps_popup_preserves_selected_app_across_refresh() {
                     description: Some("Workspace docs".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1584,6 +2567,8 @@ async fn apps_popup_preserves_selected_app_across_refresh() {
                     description: Some("Team chat".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1615,6 +2600,8 @@ async fn apps_popup_preserves_selected_app_across_refresh() {
                     description: Some("Spreadsheets".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1630,6 +2617,8 @@ async fn apps_popup_preserves_selected_app_across_refresh() {
                     description: Some("Workspace docs".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1645,6 +2634,8 @@ async fn apps_popup_preserves_selected_app_across_refresh() {
                     description: Some("Team chat".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1688,6 +2679,8 @@ async fn apps_refresh_failure_with_cached_snapshot_triggers_pending_force_refetc
         description: Some("Workspace docs".to_string()),
         logo_url: None,
         logo_url_dark: None,
+        icon_assets: None,
+        icon_dark_assets: None,
         distribution_channel: None,
         branding: None,
         app_metadata: None,
@@ -1731,6 +2724,8 @@ async fn apps_popup_keeps_existing_full_snapshot_while_partial_refresh_loads() {
             description: Some("Workspace docs".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,
@@ -1746,6 +2741,8 @@ async fn apps_popup_keeps_existing_full_snapshot_while_partial_refresh_loads() {
             description: Some("Project tracking".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,
@@ -1773,6 +2770,8 @@ async fn apps_popup_keeps_existing_full_snapshot_while_partial_refresh_loads() {
                     description: Some("Workspace docs".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1788,6 +2787,8 @@ async fn apps_popup_keeps_existing_full_snapshot_while_partial_refresh_loads() {
                     description: Some("Should be filtered".to_string()),
                     logo_url: None,
                     logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
                     distribution_channel: None,
                     branding: None,
                     app_metadata: None,
@@ -1819,6 +2820,47 @@ async fn apps_popup_keeps_existing_full_snapshot_while_partial_refresh_loads() {
 }
 
 #[tokio::test]
+async fn apps_popup_replaces_loading_state_after_initial_refresh_failure() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
+    chat.config
+        .features
+        .enable(Feature::Apps)
+        .expect("test config should allow feature update");
+    chat.bottom_pane.set_connectors_enabled(/*enabled*/ true);
+
+    chat.add_connectors_output();
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Loading apps..."));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::FetchConnectorsList { .. }));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::FetchInstalledConnectorMentions { .. })
+    );
+
+    chat.on_connectors_loaded(
+        Err("app/list failed: 403 Forbidden".to_string()),
+        /*is_final*/ true,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!popup.contains("Loading apps..."), "{popup}");
+    assert!(!popup.contains("403 Forbidden"), "{popup}");
+    assert!(popup.contains("Failed to load apps."), "{popup}");
+    assert_chatwidget_snapshot!("apps_popup_error_state", popup);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::RefreshConnectors {
+            force_refetch: true
+        })
+    );
+    chat.refresh_connectors(/*force_refetch*/ true);
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Loading apps..."));
+}
+
+#[tokio::test]
 async fn apps_refresh_failure_without_full_snapshot_falls_back_to_installed_apps() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     set_chatgpt_auth(&mut chat);
@@ -1836,6 +2878,8 @@ async fn apps_refresh_failure_without_full_snapshot_falls_back_to_installed_apps
                 description: Some("Workspace docs".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
+                icon_assets: None,
+                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,
@@ -1872,7 +2916,7 @@ async fn apps_refresh_failure_without_full_snapshot_falls_back_to_installed_apps
         "expected /apps to fall back to the installed apps snapshot, got:\n{popup}"
     );
     assert!(
-        popup.contains("Installed. Press Enter to open the app page"),
+        popup.contains("Installed · Press Enter to open the app page"),
         "expected the fallback popup to behave like the installed apps view, got:\n{popup}"
     );
 }
@@ -1895,6 +2939,8 @@ async fn apps_popup_shows_disabled_status_for_installed_but_disabled_apps() {
                 description: Some("Workspace docs".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
+                icon_assets: None,
+                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,
@@ -1911,11 +2957,11 @@ async fn apps_popup_shows_disabled_status_for_installed_but_disabled_apps() {
     chat.add_connectors_output();
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
-        popup.contains("Installed · Disabled. Press Enter to open the app page"),
+        popup.contains("Installed · Disabled · Press Enter to open the app page"),
         "expected selected app description to include disabled status, got:\n{popup}"
     );
     assert!(
-        popup.contains("enable/disable this app."),
+        popup.contains("enable/disable this app"),
         "expected selected app description to mention enable/disable action, got:\n{popup}"
     );
 }
@@ -1938,6 +2984,8 @@ async fn apps_refresh_preserves_toggled_enabled_state() {
                 description: Some("Workspace docs".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
+                icon_assets: None,
+                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,
@@ -1960,6 +3008,8 @@ async fn apps_refresh_preserves_toggled_enabled_state() {
                 description: Some("Workspace docs".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
+                icon_assets: None,
+                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,
@@ -1986,7 +3036,7 @@ async fn apps_refresh_preserves_toggled_enabled_state() {
     chat.add_connectors_output();
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
-        popup.contains("Installed · Disabled. Press Enter to open the app page"),
+        popup.contains("Installed · Disabled · Press Enter to open the app page"),
         "expected disabled status to persist after reload, got:\n{popup}"
     );
 }
@@ -2009,6 +3059,8 @@ async fn apps_popup_for_not_installed_app_uses_install_only_selected_description
                 description: Some("Project tracking".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
+                icon_assets: None,
+                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,
@@ -2025,11 +3077,11 @@ async fn apps_popup_for_not_installed_app_uses_install_only_selected_description
     chat.add_connectors_output();
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
-        popup.contains("Can be installed. Press Enter to open the app page to install"),
+        popup.contains("Can be installed · Press Enter to open the app page to install"),
         "expected selected app description to be install-only for not-installed apps, got:\n{popup}"
     );
     assert!(
-        !popup.contains("enable/disable this app."),
+        !popup.contains("enable/disable this app"),
         "did not expect enable/disable text for not-installed apps, got:\n{popup}"
     );
 }
@@ -2040,20 +3092,31 @@ async fn experimental_features_popup_snapshot() {
 
     let features = vec![
         ExperimentalFeatureItem {
-            feature: Feature::JsRepl,
+            key: Feature::JsRepl.key().to_string(),
+            writable: true,
             name: "JavaScript REPL".to_string(),
             description: "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities.".to_string(),
             enabled: false,
         },
         ExperimentalFeatureItem {
-            feature: Feature::ShellTool,
+            key: Feature::ShellTool.key().to_string(),
+            writable: true,
             name: "Shell tool".to_string(),
             description: "Allow the model to run shell commands.".to_string(),
             enabled: true,
         },
+        ExperimentalFeatureItem {
+            key: "voice_conversations".to_string(),
+            writable: true,
+            name: "Voice conversations".to_string(),
+            description: "Talk with Codex using /voice.".to_string(),
+            enabled: false,
+        },
     ];
     let view = ExperimentalFeaturesView::new(
         features,
+        ThreadId::new(),
+        /*catalog_rx*/ None,
         chat.app_event_tx.clone(),
         crate::keymap::RuntimeKeymap::defaults().list,
     );
@@ -2061,22 +3124,50 @@ async fn experimental_features_popup_snapshot() {
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("experimental_features_popup", popup);
+
+    let mut config = codex_config::types::TuiKeymap::default();
+    config.list.accept = Some(codex_config::types::KeybindingsSpec::One(
+        codex_config::types::KeybindingSpec("ctrl-x enter".to_string()),
+    ));
+    let keymap = crate::keymap::RuntimeKeymap::from_config(&config)
+        .expect("valid experimental-feature chord");
+    let view = ExperimentalFeaturesView::new(
+        vec![ExperimentalFeatureItem {
+            key: Feature::ShellTool.key().to_string(),
+            writable: true,
+            name: "Shell tool".to_string(),
+            description: "Allow the model to run shell commands.".to_string(),
+            enabled: true,
+        }],
+        ThreadId::new(),
+        /*catalog_rx*/ None,
+        chat.app_event_tx.clone(),
+        keymap.list,
+    );
+    chat.bottom_pane.show_view(Box::new(view));
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("experimental_features_popup_configured_key_chords", popup);
 }
 
 #[tokio::test]
 async fn experimental_features_toggle_saves_on_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
+    let mut keymap = crate::keymap::RuntimeKeymap::defaults().list;
+    keymap.cancel = vec![crate::key_hint::plain(KeyCode::F(2))];
     let expected_feature = Feature::JsRepl;
     let view = ExperimentalFeaturesView::new(
         vec![ExperimentalFeatureItem {
-            feature: expected_feature,
+            key: expected_feature.key().to_string(),
+            writable: true,
             name: "JavaScript REPL".to_string(),
             description: "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities.".to_string(),
             enabled: false,
         }],
+        ThreadId::new(),
+        /*catalog_rx*/ None,
         chat.app_event_tx.clone(),
-        crate::keymap::RuntimeKeymap::defaults().list,
+        keymap,
     );
     chat.bottom_pane.show_view(Box::new(view));
 
@@ -2087,12 +3178,17 @@ async fn experimental_features_toggle_saves_on_exit() {
         "expected no updates until saving the popup"
     );
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+    assert!(
+        !chat.has_active_view(),
+        "remapped cancel must save and close"
+    );
 
     let mut updates = None;
     while let Ok(event) = rx.try_recv() {
-        if let AppEvent::UpdateFeatureFlags {
+        if let AppEvent::SaveExperimentalFeatures {
             updates: event_updates,
+            ..
         } = event
         {
             updates = Some(event_updates);
@@ -2100,86 +3196,93 @@ async fn experimental_features_toggle_saves_on_exit() {
         }
     }
 
-    let updates = updates.expect("expected UpdateFeatureFlags event");
-    assert_eq!(updates, vec![(expected_feature, true)]);
+    let updates = updates.expect("expected SaveExperimentalFeatures event");
+    assert_eq!(updates, vec![(expected_feature.key().to_string(), true)]);
 }
 
 #[tokio::test]
-async fn experimental_popup_omits_stable_guardian_approval() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let guardian_stage = FEATURES
-        .iter()
-        .find(|spec| spec.id == Feature::GuardianApproval)
-        .map(|spec| spec.stage)
-        .expect("expected guardian approval feature metadata");
-
-    assert_eq!(guardian_stage, Stage::Stable);
-
+async fn experimental_popup_loading_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.open_experimental_popup();
-
-    let popup = render_bottom_popup(&chat, /*width*/ 120);
-    assert!(
-        !popup.contains("Auto-review"),
-        "expected stable auto-review feature to be omitted from experimental popup, got:\n{popup}"
+    assert!(!chat.has_active_view());
+    let cell = assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(cell)) => cell);
+    insta::assert_snapshot!(
+        "experimental_features_startup",
+        lines_to_single_string(&cell.display_lines(/*width*/ 80))
     );
-}
-
-#[tokio::test]
-async fn multi_agent_enable_prompt_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    chat.open_multi_agent_enable_prompt();
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("multi_agent_enable_prompt", popup);
-}
-
-#[tokio::test]
-async fn multi_agent_enable_prompt_updates_feature_and_emits_notice() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    chat.open_multi_agent_enable_prompt();
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-
-    assert_matches!(
-        rx.try_recv(),
-        Ok(AppEvent::UpdateFeatureFlags { updates }) if updates == vec![(Feature::Collab, true)]
-    );
-    let cell = match rx.try_recv() {
-        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
-        other => panic!("expected InsertHistoryCell event, got {other:?}"),
+    assert!(rx.try_recv().is_err());
+    chat.thread_id = Some(ThreadId::new());
+    chat.open_experimental_popup();
+    let AppEvent::FetchExperimentalFeatures { response_tx, .. } = rx.try_recv().unwrap() else {
+        panic!("expected experimental discovery request");
     };
-    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 120));
-    assert!(rendered.contains("Subagents will be enabled in the next session."));
+    assert_chatwidget_snapshot!(
+        "experimental_features_loading",
+        render_bottom_popup(&chat, /*width*/ 80)
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(response_tx.send(Ok(Vec::new())).is_err());
+    assert!(!chat.has_active_view());
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn memories_enable_prompt_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_feature_enabled(Feature::MemoryTool, /*enabled*/ false);
-
-    chat.open_memories_popup();
-
+async fn experimental_popup_available_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.open_experimental_popup();
+    let AppEvent::FetchExperimentalFeatures { response_tx, .. } = rx.try_recv().unwrap() else {
+        panic!("expected experimental discovery request");
+    };
+    let features = [
+        ("network_proxy", "Network proxy", "Apply network proxy restrictions to sandboxed sessions that already have network access."),
+        ("prevent_idle_sleep", "Prevent sleep while running", "Keep your computer awake while Codex is running a thread."),
+    ]
+    .into_iter()
+    .map(|(name, display_name, description)| codex_app_server_protocol::ExperimentalFeature {
+        name: name.to_string(),
+        stage: codex_app_server_protocol::ExperimentalFeatureStage::Beta,
+        display_name: Some(display_name.to_string()),
+        description: Some(description.to_string()),
+        announcement: None,
+        enabled: false,
+        default_enabled: false,
+    })
+    .collect();
+    response_tx.send(Ok(features)).unwrap();
+    chat.pre_draw_tick();
     let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("memories_enable_prompt", popup);
+    assert_chatwidget_snapshot!("experimental_features_available_popup", popup);
 }
 
 #[tokio::test]
-async fn memories_enable_prompt_updates_feature_without_notice() {
+async fn feature_enable_prompts_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::MemoryTool, /*enabled*/ false);
 
-    chat.open_memories_popup();
+    chat.open_feature_enable_prompt(Feature::Collab);
+    assert_chatwidget_snapshot!(
+        "multi_agent_enable_prompt",
+        render_bottom_popup(&chat, /*width*/ 80)
+    );
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-
     assert_matches!(
         rx.try_recv(),
-        Ok(AppEvent::UpdateFeatureFlags { updates }) if updates == vec![(Feature::MemoryTool, true)]
+        Ok(AppEvent::EnableFeatureForNewThreads(Feature::Collab))
     );
-    assert!(
-        rx.try_recv().is_err(),
-        "memory enable prompt should not emit the success notice before persistence succeeds"
+
+    chat.open_memories_popup();
+    assert_chatwidget_snapshot!(
+        "memories_enable_prompt",
+        render_bottom_popup(&chat, /*width*/ 80)
     );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::EnableFeatureForNewThreads(Feature::MemoryTool))
+    );
+    assert!(rx.try_recv().is_err());
+    assert!(!chat.has_active_view());
 }
 
 #[tokio::test]
@@ -2209,6 +3312,11 @@ async fn memories_reset_confirmation_snapshot() {
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("memories_reset_confirmation", popup);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Choose how Codex uses"));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    assert!(chat.no_modal_or_popup_active());
 }
 
 #[tokio::test]
@@ -2250,7 +3358,7 @@ async fn memories_reset_confirmation_sends_event_on_confirm() {
 
 #[tokio::test]
 async fn model_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_model_popup();
 
@@ -2258,70 +3366,297 @@ async fn model_selection_popup_snapshot() {
     assert_chatwidget_snapshot!("model_selection_popup", popup);
 }
 
+fn apply_model_list_response(chat: &mut ChatWidget, presets: Vec<ModelPreset>) {
+    let request_id = chat.model_popup_request_id.expect("pending model request");
+    assert!(chat.on_models_loaded(request_id, Ok(presets)));
+}
+
 #[tokio::test]
-async fn personality_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+async fn model_picker_refresh_rejects_obsolete_and_unusable_replies() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.open_personality_popup();
+    let initial = chat.model_catalog.try_list_models().unwrap();
+    let mut refreshed = initial.clone();
+    refreshed[0].description = "Updated model details".to_string();
+    chat.open_model_popup();
+    let old_request = chat.model_popup_request_id.unwrap();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    chat.open_model_popup();
+    let current_request = chat.model_popup_request_id.unwrap();
+    assert!(!chat.on_models_loaded(old_request, Ok(refreshed.clone())));
+    assert!(chat.model_popup_request_is_current(current_request));
+    // Identical visible account fields still mark an account boundary.
+    chat.update_account_state(
+        chat.status_account_display.clone(),
+        chat.plan_type,
+        chat.has_chatgpt_account,
+        chat.has_codex_backend_auth,
+    );
+    assert!(!chat.on_models_loaded(current_request, Ok(refreshed.clone())));
+    assert_eq!(chat.model_catalog.try_list_models().unwrap(), initial);
+
+    for result in [
+        Err("unavailable".to_string()),
+        Ok(Vec::new()),
+        Ok(initial.clone()),
+    ] {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        chat.open_model_popup();
+        let request_id = chat.model_popup_request_id.unwrap();
+        let before = render_bottom_popup(&chat, /*width*/ 80);
+        assert!(!chat.on_models_loaded(request_id, result));
+        assert!(!chat.model_popup_request_is_current(request_id));
+        assert_eq!(chat.model_catalog.try_list_models().unwrap(), initial);
+        assert_eq!(render_bottom_popup(&chat, /*width*/ 80), before);
+    }
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    chat.open_model_popup();
+    apply_model_list_response(&mut chat, refreshed.clone());
+    assert_eq!(chat.model_catalog.try_list_models().unwrap(), refreshed);
+}
+
+#[tokio::test]
+async fn model_picker_refreshes_startup_catalog() {
+    for (explicit_all_models, hidden_startup) in [(false, false), (true, false), (false, true)] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+        chat.thread_id = Some(ThreadId::new());
+        let mut startup = vec![get_available_model(&chat, "gpt-5.5")];
+        let mut refreshed = chat.model_catalog.try_list_models().unwrap();
+        let mut auto = startup[0].clone();
+        auto.model = "codex-auto-test".to_string();
+        auto.id = auto.model.clone();
+        auto.description = "Auto model".to_string();
+        refreshed.push(auto);
+        startup[0].show_in_picker = !hidden_startup;
+        chat.model_catalog = Arc::new(ModelCatalog::new(startup.clone()));
+        chat.open_model_popup();
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, AppEvent::FetchModels { .. }))
+        );
+        if explicit_all_models {
+            chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+            chat.open_all_models_popup();
+        }
+
+        apply_model_list_response(&mut chat, refreshed.clone());
+        if hidden_startup {
+            assert!(chat.no_modal_or_popup_active());
+            chat.open_model_popup();
+        }
+
+        assert_eq!(chat.model_catalog.try_list_models().unwrap(), refreshed);
+        insta::allow_duplicates! {
+            assert_chatwidget_snapshot!(
+                if explicit_all_models {
+                    "model_selection_popup"
+                } else {
+                    "model_picker_refreshes_auto_models"
+                },
+                render_bottom_popup(&chat, /*width*/ 80)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_picker_queued_all_models_uses_refreshed_catalog() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    let refreshed = chat.model_catalog.try_list_models().unwrap();
+    let preset = get_available_model(&chat, "gpt-5.5");
+    let mut auto = preset.clone();
+    auto.model = "codex-auto-test".to_string();
+    auto.id = auto.model.clone();
+    chat.model_catalog = Arc::new(ModelCatalog::new(vec![auto, preset]));
+    chat.open_model_popup();
+    assert_matches!(rx.try_recv(), Ok(AppEvent::FetchModels { .. }));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(chat.bottom_pane.active_view_id(), None);
+    // Apply the model/list reply before the queued All models intent is handled.
+    apply_model_list_response(&mut chat, refreshed);
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAllModelsPopup));
+    chat.open_all_models_popup();
+    assert_chatwidget_snapshot!(
+        "model_selection_popup",
+        render_bottom_popup(&chat, /*width*/ 80)
+    );
+}
+
+#[tokio::test]
+async fn model_picker_refresh_preserves_highlight() {
+    for (remove_selected, reasoning_submenu, expected) in [
+        (false, false, "gpt-5.6-terra"),
+        (true, false, "gpt-5.5"),
+        (false, true, "gpt-5.6-terra"),
+        (true, true, "gpt-5.5"),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+        chat.thread_id = Some(ThreadId::new());
+        let mut presets = vec![
+            get_available_model(&chat, "gpt-5.5"),
+            get_available_model(&chat, "gpt-5.6-terra"),
+        ];
+        for preset in &mut presets {
+            preset.display_name = "Shared display name".to_string();
+        }
+        chat.model_catalog = Arc::new(ModelCatalog::new(presets.clone()));
+        chat.open_model_popup();
+        chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+        if reasoning_submenu {
+            chat.open_reasoning_popup(presets[1].clone());
+        }
+        let before = render_bottom_popup(&chat, /*width*/ 80);
+        presets.reverse();
+        presets[0].display_name = "Renamed model".to_string();
+        if remove_selected {
+            presets.remove(/*index*/ 0);
+        }
+        apply_model_list_response(&mut chat, presets);
+        if reasoning_submenu {
+            assert_eq!(render_bottom_popup(&chat, /*width*/ 80), before);
+            chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        }
+        if !remove_selected {
+            insta::allow_duplicates! {
+                assert_chatwidget_snapshot!(
+                    "model_picker_refresh_preserves_highlight",
+                    render_bottom_popup(&chat, /*width*/ 80)
+                );
+            }
+        }
+        while rx.try_recv().is_ok() {}
+        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        let selected = assert_matches!(rx.try_recv(), Ok(AppEvent::OpenReasoningPopup { model }) => model.model);
+        assert_eq!(selected, expected);
+    }
+}
+
+#[tokio::test]
+async fn model_picker_refreshes_service_tier_controls() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_fast_mode_test_catalog(&mut chat);
+    chat.set_feature_enabled(Feature::FastMode, /*enabled*/ true);
+    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
+    let mut refreshed = chat.model_catalog.try_list_models().unwrap();
+    refreshed
+        .iter_mut()
+        .for_each(|model| model.service_tiers.clear());
+    chat.open_model_popup();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+
+    apply_model_list_response(&mut chat, refreshed);
+
+    assert_eq!(chat.current_service_tier(), None);
+    chat.bottom_pane
+        .set_composer_text("/fast".to_string(), Vec::new(), Vec::new());
+    assert_chatwidget_snapshot!(
+        "model_picker_refreshes_service_tier_controls",
+        normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80))
+    );
+}
+
+#[tokio::test]
+async fn model_picker_refresh_preserves_dismissal_and_reasoning_submenu() {
+    for (dismiss, explicit_all_models, accept_reasoning) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+        (false, true, true),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+        chat.thread_id = Some(ThreadId::new());
+        let preset = get_available_model(&chat, "gpt-5.5");
+        let refreshed = chat.model_catalog.try_list_models().unwrap();
+        chat.model_catalog = Arc::new(ModelCatalog::new(vec![preset.clone()]));
+        chat.open_model_popup();
+        assert_matches!(rx.try_recv(), Ok(AppEvent::FetchModels { .. }));
+        if explicit_all_models {
+            chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+            chat.open_all_models_popup();
+        }
+        if dismiss {
+            chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        } else {
+            chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+            let model =
+                assert_matches!(rx.try_recv(), Ok(AppEvent::OpenReasoningPopup { model }) => model);
+            chat.open_reasoning_popup(model);
+        }
+        let before = render_bottom_popup(&chat, /*width*/ 80);
+
+        apply_model_list_response(&mut chat, refreshed.clone());
+
+        assert_eq!(chat.model_catalog.try_list_models().unwrap(), refreshed);
+        assert_eq!(render_bottom_popup(&chat, /*width*/ 80), before);
+        if !dismiss {
+            chat.handle_key_event(KeyEvent::from(if accept_reasoning {
+                KeyCode::Enter
+            } else {
+                KeyCode::Esc
+            }));
+        }
+        if dismiss || accept_reasoning {
+            assert!(chat.no_modal_or_popup_active());
+        } else {
+            insta::allow_duplicates! {
+                assert_chatwidget_snapshot!(
+                    "model_selection_popup",
+                    render_bottom_popup(&chat, /*width*/ 80)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_picker_refresh_dismisses_empty_choices() {
+    for (explicit_all_models, reasoning_submenu) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+        chat.thread_id = Some(ThreadId::new());
+        let mut preset = get_available_model(&chat, "gpt-5.5");
+        chat.open_model_popup();
+        if explicit_all_models {
+            chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+            chat.open_all_models_popup();
+        }
+        if reasoning_submenu {
+            chat.open_reasoning_popup(preset.clone());
+        }
+        let before = render_bottom_popup(&chat, /*width*/ 80);
+        if explicit_all_models {
+            preset.model = "codex-auto-test".to_string();
+        } else {
+            preset.show_in_picker = false;
+        }
+        while rx.try_recv().is_ok() {}
+        apply_model_list_response(&mut chat, vec![preset]);
+        if reasoning_submenu {
+            assert_eq!(render_bottom_popup(&chat, /*width*/ 80), before);
+            chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        }
+        assert_eq!(chat.bottom_pane.active_view_id(), None);
+        let cell = assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(cell)) => cell);
+        insta::allow_duplicates! {
+            insta::assert_snapshot!(
+                lines_to_single_string(&cell.display_lines(/*width*/ 80)),
+                @"• No additional models are available right now."
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn skills_menu_default_mentions_shortcut_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.open_skills_menu();
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("personality_selection_popup", popup);
-}
-
-#[cfg(not(target_os = "linux"))]
-#[tokio::test]
-async fn realtime_audio_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
-    chat.open_realtime_audio_popup();
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("realtime_audio_selection_popup", popup);
-}
-
-#[cfg(not(target_os = "linux"))]
-#[tokio::test]
-async fn realtime_audio_selection_popup_narrow_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
-    chat.open_realtime_audio_popup();
-
-    let popup = render_bottom_popup(&chat, /*width*/ 56);
-    assert_chatwidget_snapshot!("realtime_audio_selection_popup_narrow", popup);
-}
-
-#[cfg(not(target_os = "linux"))]
-#[tokio::test]
-async fn realtime_microphone_picker_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
-    chat.config.realtime_audio.microphone = Some("Studio Mic".to_string());
-    chat.open_realtime_audio_device_selection_with_names(
-        RealtimeAudioDeviceKind::Microphone,
-        vec!["Built-in Mic".to_string(), "USB Mic".to_string()],
-    );
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("realtime_microphone_picker_popup", popup);
-}
-
-#[cfg(not(target_os = "linux"))]
-#[tokio::test]
-async fn realtime_audio_picker_emits_persist_event() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
-    chat.open_realtime_audio_device_selection_with_names(
-        RealtimeAudioDeviceKind::Speaker,
-        vec!["Desk Speakers".to_string(), "Headphones".to_string()],
-    );
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert_matches!(
-        rx.try_recv(),
-        Ok(AppEvent::PersistRealtimeAudioDeviceSelection {
-            kind: RealtimeAudioDeviceKind::Speaker,
-            name: Some(name),
-        }) if name == "Headphones"
-    );
+    assert_chatwidget_snapshot!("skills_menu_default_mentions_shortcut", popup);
 }
 
 #[tokio::test]
@@ -2333,6 +3668,7 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
         model: slug.to_string(),
         display_name: slug.to_string(),
         description: format!("{slug} description"),
+        model_specialty: None,
         default_reasoning_effort: ReasoningEffortConfig::Medium,
         supported_reasoning_efforts: vec![ReasoningEffortPreset {
             effort: ReasoningEffortConfig::Medium,
@@ -2342,9 +3678,11 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker,
+        multi_agent_version: None,
         availability_nux: None,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
@@ -2368,8 +3706,8 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
 
 #[tokio::test]
 async fn server_overloaded_error_does_not_switch_models() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
-    chat.set_model("gpt-5.3-codex");
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.set_model("gpt-5.2");
     while rx.try_recv().is_ok() {}
     while op_rx.try_recv().is_ok() {}
 
@@ -2382,7 +3720,7 @@ async fn server_overloaded_error_does_not_switch_models() {
     while let Ok(event) = rx.try_recv() {
         if let AppEvent::UpdateModel(model) = event {
             assert_eq!(
-                model, "gpt-5.3-codex",
+                model, "gpt-5.2",
                 "did not expect model switch on server-overloaded error"
             );
         }
@@ -2400,12 +3738,31 @@ async fn server_overloaded_error_does_not_switch_models() {
 
 #[tokio::test]
 async fn model_reasoning_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
 
     set_chatgpt_auth(&mut chat);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
-    let preset = get_available_model(&chat, "gpt-5.4");
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset.supported_reasoning_efforts.insert(
+        2,
+        ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Max,
+            description: "Maximum available reasoning".to_string(),
+        },
+    );
+    preset
+        .supported_reasoning_efforts
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Ultra,
+            description: "Ultra reasoning".to_string(),
+        });
+    preset
+        .supported_reasoning_efforts
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Persistent,
+            description: "Continue working until put to sleep".to_string(),
+        });
     chat.open_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -2413,40 +3770,176 @@ async fn model_reasoning_selection_popup_snapshot() {
 }
 
 #[tokio::test]
-async fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+async fn model_advanced_reasoning_selection_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Ultra));
 
-    set_chatgpt_auth(&mut chat);
-    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
-
-    let preset = get_available_model(&chat, "gpt-5.2");
-    chat.open_reasoning_popup(preset);
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset.supported_reasoning_efforts.extend([
+        ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Ultra,
+            description: "Ultra reasoning".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Max,
+            description: "Maximum available reasoning".to_string(),
+        },
+    ]);
+    chat.open_advanced_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("model_reasoning_selection_popup_extra_high_warning", popup);
+    assert_chatwidget_snapshot!("model_advanced_reasoning_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn model_reasoning_selection_popup_applies_custom_effort() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    let custom_effort = ReasoningEffortConfig::Custom("future".to_string());
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset
+        .supported_reasoning_efforts
+        .push(ReasoningEffortPreset {
+            effort: custom_effort.clone(),
+            description: "Maximum available reasoning".to_string(),
+        });
+    chat.open_reasoning_popup(preset);
+    while rx.try_recv().is_ok() {}
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let selected_effort_events = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::ApplyModelSelection { model, effort } => Some((model, effort)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected_effort_events,
+        vec![("gpt-5.5".to_string(), Some(custom_effort))]
+    );
+}
+
+async fn select_ultra_with_multi_agent_thread_limit(max_threads: usize) -> (bool, Vec<String>) {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    chat.config
+        .multi_agent_v2
+        .max_concurrent_threads_per_session = max_threads;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset.default_reasoning_effort = ReasoningEffortConfig::High;
+    preset.supported_reasoning_efforts = vec![
+        ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::High,
+            description: "High reasoning".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Ultra,
+            description: "Ultra reasoning".to_string(),
+        },
+    ];
+    chat.open_reasoning_popup(preset);
+    while rx.try_recv().is_ok() {}
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let advanced_preset = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        AppEvent::OpenAdvancedReasoningPopup { model } => Some(model),
+        _ => None,
+    });
+    chat.open_advanced_reasoning_popup(advanced_preset.expect("advanced reasoning popup"));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let mut selected_ultra = false;
+    let mut warnings = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::ApplyAdvancedReasoning {
+                effort: ReasoningEffortConfig::Ultra,
+                ..
+            } => {
+                selected_ultra = true;
+            }
+            AppEvent::InsertHistoryCell(cell) => {
+                warnings.push(lines_to_single_string(&cell.transcript_lines(/*width*/ 80)));
+            }
+            _ => {}
+        }
+    }
+
+    (selected_ultra, warnings)
+}
+
+#[tokio::test]
+async fn ultra_reasoning_selection_warns_for_high_multi_agent_concurrency() {
+    let (selected_ultra, warnings) =
+        select_ultra_with_multi_agent_thread_limit(/*max_threads*/ 8).await;
+
+    assert!(selected_ultra);
+    assert_eq!(warnings.len(), 1);
+    assert_chatwidget_snapshot!(
+        "ultra_reasoning_selection_high_multi_agent_concurrency_warning",
+        &warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn ultra_reasoning_selection_skips_warning_below_threshold() {
+    let below_threshold = select_ultra_with_multi_agent_thread_limit(/*max_threads*/ 7).await;
+
+    assert_eq!(below_threshold, (true, Vec::new()));
+}
+
+#[tokio::test]
+async fn max_reasoning_selection_persists_model_selection() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+        effort: ReasoningEffortConfig::Max,
+        description: "Maximum reasoning".to_string(),
+    }];
+    chat.open_advanced_reasoning_popup(preset);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::ApplyModelSelection {
+            model,
+            effort: Some(ReasoningEffortConfig::Max),
+        } if model == "gpt-5.5"
+    )));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AppEvent::ApplyAdvancedReasoning { .. }))
+    );
 }
 
 async fn assert_reasoning_shortcuts_update_effort(
     key_events: [KeyEvent; 2],
     expected_effort: ReasoningEffortConfig,
-    expect_model_update: bool,
 ) {
     for key_event in key_events {
-        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
         chat.thread_id = Some(ThreadId::new());
         chat.set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
 
         chat.handle_key_event(key_event);
 
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        if expect_model_update {
-            assert!(
-                events.iter().any(
-                    |event| matches!(event, AppEvent::UpdateModel(model) if model == "gpt-5.4")
-                ),
-                "expected model update event for {key_event:?}; events: {events:?}"
-            );
-        }
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AppEvent::UpdateModel(_))),
+            "did not expect model update event for {key_event:?}; events: {events:?}"
+        );
         assert!(
             events.iter().any(|event| matches!(
                 event,
@@ -2471,7 +3964,6 @@ async fn reasoning_up_shortcuts_raise_reasoning_effort() {
             KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
         ],
         ReasoningEffortConfig::High,
-        /*expect_model_update*/ true,
     )
     .await;
 }
@@ -2484,14 +3976,13 @@ async fn reasoning_down_shortcuts_lower_reasoning_effort() {
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
         ],
         ReasoningEffortConfig::Low,
-        /*expect_model_update*/ false,
     )
     .await;
 }
 
 #[tokio::test]
 async fn reasoning_shortcut_clears_armed_quit_shortcut() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     chat.arm_quit_shortcut(key_hint::ctrl(KeyCode::Char('c')));
@@ -2512,7 +4003,7 @@ async fn reasoning_shortcut_clears_armed_quit_shortcut() {
 
 #[tokio::test]
 async fn reasoning_shortcut_is_ignored_with_model_popup_open() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
     chat.open_model_popup();
@@ -2535,12 +4026,179 @@ async fn reasoning_shortcut_is_ignored_with_model_popup_open() {
 }
 
 #[tokio::test]
+async fn reasoning_up_shortcuts_reach_max_in_default_and_plan_modes() {
+    for plan_mode in [false, true] {
+        for key in [
+            KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+        ] {
+            let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+            chat.thread_id = Some(ThreadId::new());
+            chat.show_welcome_banner = false;
+            chat.local_settings.tui.status_line = Some(vec!["model-with-reasoning".to_string()]);
+            let mut preset = get_available_model(&chat, "gpt-5.5");
+            preset
+                .supported_reasoning_efforts
+                .push(ReasoningEffortPreset {
+                    effort: ReasoningEffortConfig::Max,
+                    description: "Maximum reasoning".to_string(),
+                });
+            if plan_mode {
+                chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+                let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+                    .expect("expected plan collaboration mode");
+                chat.set_collaboration_mask(plan_mask);
+            }
+            chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
+            if plan_mode {
+                chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+            } else {
+                chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+            }
+
+            chat.handle_key_event(key);
+
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            let update = events
+                .into_iter()
+                .find(|event| {
+                    matches!(
+                        (plan_mode, event),
+                        (
+                            false,
+                            AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Max))
+                        ) | (
+                            true,
+                            AppEvent::UpdatePlanModeReasoningEffort(Some(
+                                ReasoningEffortConfig::Max
+                            ))
+                        )
+                    )
+                })
+                .expect("expected max reasoning update");
+            match update {
+                AppEvent::UpdateReasoningEffort(effort) => chat.set_reasoning_effort(effort),
+                AppEvent::UpdatePlanModeReasoningEffort(effort) => {
+                    chat.set_plan_mode_reasoning_effort(effort)
+                }
+                _ => unreachable!(),
+            }
+
+            if key.code == KeyCode::Char('.') {
+                let width = 80;
+                let height = chat.desired_height(width);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .expect("create terminal");
+                terminal
+                    .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+                    .expect("draw footer");
+                let snapshot = normalized_backend_snapshot(terminal.backend());
+                if plan_mode {
+                    assert_chatwidget_snapshot!("reasoning_shortcut_max_plan_footer", snapshot);
+                } else {
+                    assert_chatwidget_snapshot!("reasoning_shortcut_max_footer", snapshot);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_up_shortcut_does_not_silently_enter_ultra() {
+    for (model, model_path) in [
+        ("gpt-5.5", "All models → gpt-5.5"),
+        ("codex-auto-test", "codex-auto-test"),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+        chat.thread_id = Some(ThreadId::new());
+        let mut preset = get_available_model(&chat, "gpt-5.5");
+        preset.id = model.to_string();
+        preset.model = model.to_string();
+        preset.display_name = model.to_string();
+        preset.supported_reasoning_efforts.extend([
+            ReasoningEffortPreset {
+                effort: ReasoningEffortConfig::Max,
+                description: "Maximum reasoning".to_string(),
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffortConfig::Ultra,
+                description: "Ultra reasoning".to_string(),
+            },
+        ]);
+        chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
+        chat.set_model(model);
+
+        chat.set_reasoning_effort(Some(ReasoningEffortConfig::Max));
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT));
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AppEvent::UpdateReasoningEffort(_) | AppEvent::ApplyAdvancedReasoning { .. }
+        )));
+        let messages = events
+            .into_iter()
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => {
+                    Some(lines_to_single_string(&cell.display_lines(/*width*/ 140)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        insta::allow_duplicates! {
+            insta::assert_snapshot!(
+                messages.join("").replace(model_path, "<model path>"),
+                @"• Ultra is available under /model → <model path> → More reasoning…"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_down_shortcut_can_leave_advanced_effort() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset.supported_reasoning_efforts.extend([
+        ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Ultra,
+            description: "Ultra reasoning".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Max,
+            description: "Maximum reasoning".to_string(),
+        },
+    ]);
+    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
+
+    for (current, expected) in [
+        (ReasoningEffortConfig::Ultra, ReasoningEffortConfig::Max),
+        (ReasoningEffortConfig::Max, ReasoningEffortConfig::XHigh),
+    ] {
+        chat.set_reasoning_effort(Some(current));
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT));
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::UpdateReasoningEffort(Some(effort)) if effort == &expected
+        )));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AppEvent::PersistModelSelection { .. }))
+        );
+    }
+}
+
+#[tokio::test]
 async fn reasoning_popup_shows_extra_high_with_space() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
 
     set_chatgpt_auth(&mut chat);
 
-    let preset = get_available_model(&chat, "gpt-5.4");
+    let preset = get_available_model(&chat, "gpt-5.5");
     chat.open_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, /*width*/ 120);
@@ -2567,15 +4225,18 @@ async fn single_reasoning_option_skips_selection() {
         model: "model-with-single-reasoning".to_string(),
         display_name: "model-with-single-reasoning".to_string(),
         description: "".to_string(),
+        model_specialty: None,
         default_reasoning_effort: ReasoningEffortConfig::High,
         supported_reasoning_efforts: single_effort,
         supports_personality: false,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker: true,
+        multi_agent_version: None,
         availability_nux: None,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
@@ -2596,8 +4257,62 @@ async fn single_reasoning_option_skips_selection() {
     assert!(
         events
             .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
+            .any(|ev| matches!(ev, AppEvent::ApplyModelSelection { effort: Some(effort), .. } if *effort == ReasoningEffortConfig::High)),
         "expected reasoning effort to be applied automatically; events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn advanced_only_reasoning_option_requires_explicit_selection() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset.default_reasoning_effort = ReasoningEffortConfig::Ultra;
+    preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+        effort: ReasoningEffortConfig::Ultra,
+        description: "Ultra reasoning".to_string(),
+    }];
+    chat.open_reasoning_popup(preset);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("advanced_only_reasoning_selection_popup", popup);
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        AppEvent::UpdateReasoningEffort(_)
+            | AppEvent::ApplyAdvancedReasoning { .. }
+            | AppEvent::PersistModelSelection { .. }
+    )));
+}
+
+#[tokio::test]
+async fn auto_model_advertising_advanced_effort_opens_reasoning_picker() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut preset = get_available_model(&chat, "gpt-5.6-terra");
+    preset.id = "codex-auto-test".to_string();
+    preset.model = "codex-auto-test".to_string();
+    preset.display_name = "codex-auto-test".to_string();
+    preset.default_reasoning_effort = ReasoningEffortConfig::Medium;
+    preset
+        .supported_reasoning_efforts
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Ultra,
+            description: "Ultra reasoning".to_string(),
+        });
+    chat.open_model_popup_with_presets(vec![preset]);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        AppEvent::UpdateReasoningEffort(_)
+            | AppEvent::ApplyAdvancedReasoning { .. }
+            | AppEvent::PersistModelSelection { .. }
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AppEvent::OpenReasoningPopup { .. }))
     );
 }
 
@@ -2656,11 +4371,11 @@ async fn feedback_good_result_consent_popup_includes_connectivity_diagnostics_fi
 
 #[tokio::test]
 async fn reasoning_popup_escape_returns_to_model_popup() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_model_popup();
 
-    let preset = get_available_model(&chat, "gpt-5.4");
+    let preset = get_available_model(&chat, "gpt-5.5");
     chat.open_reasoning_popup(preset);
 
     let before_escape = render_bottom_popup(&chat, /*width*/ 80);
@@ -2671,4 +4386,32 @@ async fn reasoning_popup_escape_returns_to_model_popup() {
     let after_escape = render_bottom_popup(&chat, /*width*/ 80);
     assert!(after_escape.contains("Select Model"));
     assert!(!after_escape.contains("Select Reasoning Level"));
+}
+
+#[tokio::test]
+async fn account_change_dismisses_the_previous_app_directory_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
+    chat.on_connectors_loaded(
+        Ok(ConnectorsSnapshot {
+            connectors: vec![serde_json::from_str(
+                r#"{"id":"previous-account","name":"Previous Account App","isAccessible":true}"#,
+            )
+            .expect("valid app")],
+        }),
+        /*is_final*/ true,
+    );
+    chat.add_connectors_output();
+    let before = render_bottom_popup(&chat, /*width*/ 80);
+
+    chat.update_account_state(
+        /*status_account_display*/ None, /*plan_type*/ None,
+        /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ true,
+    );
+    let after = normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80));
+    assert_chatwidget_snapshot!(
+        "connector_scope_invalidation",
+        format!("Before account change:\n{before}\n\nAfter account change:\n{after}")
+    );
 }

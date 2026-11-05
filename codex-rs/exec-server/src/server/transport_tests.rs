@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCRequest;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::RequestId;
+use codex_exec_server_protocol::JSONRPCMessage;
+use codex_exec_server_protocol::JSONRPCNotification;
+use codex_exec_server_protocol::JSONRPCRequest;
+use codex_exec_server_protocol::JSONRPCResponse;
+use codex_exec_server_protocol::RequestId;
 use pretty_assertions::assert_eq;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
@@ -17,11 +17,12 @@ use super::DEFAULT_LISTEN_URL;
 use super::ExecServerListenTransport;
 use super::parse_listen_url;
 use super::run_stdio_connection_with_io;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::protocol::INITIALIZE_METHOD;
 use crate::protocol::INITIALIZED_METHOD;
 use crate::protocol::InitializeParams;
 use crate::protocol::InitializeResponse;
+use crate::server::RequestDispatchMode;
 
 #[test]
 fn parse_listen_url_accepts_default_websocket_url() {
@@ -61,6 +62,11 @@ async fn stdio_listen_transport_serves_initialize() {
         server_reader,
         server_writer,
         test_runtime_paths(),
+        crate::ExecServerTelemetry::default(),
+        codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
+        RequestDispatchMode::Inline,
     ));
     let mut client_lines = BufReader::new(client_reader).lines();
 
@@ -157,8 +163,8 @@ async fn write_jsonrpc_line(writer: &mut tokio::io::DuplexStream, message: &JSON
         .expect("JSON-RPC newline should write");
 }
 
-fn test_runtime_paths() -> ExecServerRuntimePaths {
-    ExecServerRuntimePaths::new(
+fn test_runtime_paths() -> ExecServerRuntimeOptions {
+    ExecServerRuntimeOptions::new(
         std::env::current_exe().expect("current exe"),
         /*codex_linux_sandbox_exe*/ None,
     )

@@ -264,12 +264,12 @@ fn dispatched_tool_kind(tool_name: &str, _payload: &ToolDispatchPayload) -> Tool
         "write_stdin" => ToolCallKind::WriteStdin,
         "apply_patch" => ToolCallKind::ApplyPatch,
         "web_search" | "web_search_preview" => ToolCallKind::Web,
-        "image_generation" | "image_query" => ToolCallKind::ImageGeneration,
+        "image_generation" | "image_query" | "imagegen" => ToolCallKind::ImageGeneration,
         "spawn_agent" => ToolCallKind::SpawnAgent,
         "send_message" => ToolCallKind::SendMessage,
         "followup_task" | "assign_task" => ToolCallKind::AssignAgentTask,
         "wait_agent" => ToolCallKind::WaitAgent,
-        "close_agent" => ToolCallKind::CloseAgent,
+        "close_agent" | "interrupt_agent" => ToolCallKind::CloseAgent,
         other => ToolCallKind::Other {
             name: other.to_string(),
         },
@@ -423,6 +423,32 @@ mod tests {
                 input: "payload".to_string(),
             },
         )));
+    }
+
+    #[test]
+    fn classifies_interrupt_agent_as_close_agent() {
+        assert_eq!(
+            dispatched_tool_kind(
+                "interrupt_agent",
+                &ToolDispatchPayload::Function {
+                    arguments: r#"{"target":"/root/child"}"#.to_string(),
+                },
+            ),
+            ToolCallKind::CloseAgent
+        );
+    }
+
+    #[test]
+    fn classifies_imagegen_as_image_generation() {
+        assert_eq!(
+            dispatched_tool_kind(
+                "imagegen",
+                &ToolDispatchPayload::Function {
+                    arguments: String::new(),
+                },
+            ),
+            ToolCallKind::ImageGeneration
+        );
     }
 
     fn invocation(

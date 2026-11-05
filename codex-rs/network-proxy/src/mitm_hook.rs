@@ -1,7 +1,12 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
+use crate::authorization_path::is_safe_for_authorization;
+use crate::aws_sigv4::AwsSigV4Config;
+use crate::aws_sigv4::AwsSigV4Signer;
 use crate::config::NetworkProxyConfig;
 use crate::policy::normalize_host;
+use crate::secret_substitution::BodySecretSubstitution;
+use crate::secret_substitution::BodySecretSubstitutionConfig;
 use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -16,7 +21,9 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
+use std::sync::Arc;
 use url::form_urlencoded;
 
 const PATTERN_PREFIX: &str = "pattern:";
@@ -35,6 +42,8 @@ pub struct MitmHookConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct MitmHookMatchConfig {
+    pub schemes: Vec<String>,
+    pub ports: Vec<u16>,
     pub methods: Vec<String>,
     pub path_prefixes: Vec<String>,
     pub query: BTreeMap<String, Vec<String>>,
@@ -45,6 +54,8 @@ pub struct MitmHookMatchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct MitmHookActionsConfig {
+    pub body_secret_substitution: Option<BodySecretSubstitutionConfig>,
+    pub aws_sigv4: Option<AwsSigV4Config>,
     pub strip_request_headers: Vec<String>,
     pub inject_request_headers: Vec<InjectedHeaderConfig>,
 }
@@ -52,6 +63,8 @@ pub struct MitmHookActionsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct InjectedHeaderConfig {
+    /// Replace exactly this entire guest header value. Requires HTTPS on port 443.
+    pub placeholder: Option<String>,
     pub name: String,
     pub secret_env_var: Option<String>,
     pub secret_file: Option<String>,
@@ -71,6 +84,8 @@ pub struct MitmHook {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MitmHookMatcher {
+    pub schemes: Vec<String>,
+    pub ports: Vec<u16>,
     pub methods: Vec<String>,
     pub path_prefixes: Vec<PathMatcher>,
     pub query: Vec<QueryConstraint>,
@@ -92,12 +107,15 @@ pub struct HeaderConstraint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MitmHookActions {
+    pub(crate) body_secret_substitution: Option<Arc<BodySecretSubstitution>>,
+    pub(crate) aws_sigv4: Option<Arc<AwsSigV4Signer>>,
     pub strip_request_headers: Vec<HeaderName>,
     pub inject_request_headers: Vec<ResolvedInjectedHeader>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedInjectedHeader {
+    pub placeholder: Option<HeaderValue>,
     pub name: HeaderName,
     pub value: HeaderValue,
     pub source: SecretSource,
@@ -161,6 +179,12 @@ impl CompiledGlobMatcher {
 
 pub type MitmHooksByHost = BTreeMap<String, Vec<MitmHook>>;
 
+/// The authenticated tunnel destination, independent of guest HTTP authority headers.
+pub(crate) struct MitmHookOrigin {
+    pub scheme: rama_http::uri::Scheme,
+    pub port: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookEvaluation {
     NoHooksForHost,
@@ -169,12 +193,12 @@ pub enum HookEvaluation {
 }
 
 pub(crate) fn validate_mitm_hook_config(config: &NetworkProxyConfig) -> Result<()> {
-    let hooks = &config.network.mitm_hooks;
+    let hooks = &config.mitm_hooks;
     if hooks.is_empty() {
         return Ok(());
     }
 
-    if !config.network.mitm {
+    if !config.mitm {
         return Err(anyhow!("network.mitm_hooks requires network.mitm = true"));
     }
 
@@ -182,6 +206,14 @@ pub(crate) fn validate_mitm_hook_config(config: &NetworkProxyConfig) -> Result<(
         let host = normalize_hook_host(&hook.host)
             .with_context(|| format!("invalid network.mitm_hooks[{hook_index}].host"))?;
 
+        if hook.matcher.schemes.iter().any(|scheme| {
+            !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https")
+        }) || hook.matcher.ports.contains(&0)
+        {
+            return Err(anyhow!(
+                "MITM hook schemes must be HTTP/HTTPS and ports must be nonzero"
+            ));
+        }
         let methods = normalize_methods(&hook.matcher.methods)
             .with_context(|| format!("invalid network.mitm_hooks[{hook_index}].match.methods"))?;
         if methods.is_empty() {
@@ -214,6 +246,12 @@ pub(crate) fn validate_mitm_hook_config(config: &NetworkProxyConfig) -> Result<(
         validate_strip_request_headers(&hook.actions.strip_request_headers).with_context(|| {
             format!("invalid network.mitm_hooks[{hook_index}].actions.strip_request_headers")
         })?;
+        if let Some(signing) = &hook.actions.aws_sigv4 {
+            signing.validate()?;
+        }
+        if let Some(substitution) = &hook.actions.body_secret_substitution {
+            substitution.validate()?;
+        }
         validate_injected_headers(&hook.actions.inject_request_headers).with_context(|| {
             format!("invalid network.mitm_hooks[{hook_index}].actions.inject_request_headers")
         })?;
@@ -233,9 +271,14 @@ pub(crate) fn compile_mitm_hooks(config: &NetworkProxyConfig) -> Result<MitmHook
         config,
         |name| env::var(name).ok(),
         |path| {
-            let value = fs::read_to_string(path.as_path()).with_context(|| {
-                format!("failed to read secret file {}", path.as_path().display())
-            })?;
+            let mut value = String::new();
+            fs::File::open(path.as_path())?
+                .take(65_537)
+                .read_to_string(&mut value)
+                .map_err(|_| anyhow!("failed to read proxy secret file"))?;
+            if value.len() > 65_536 {
+                return Err(anyhow!("proxy secret file exceeds 64 KiB"));
+            }
             Ok(value.trim().to_string())
         },
     )
@@ -245,6 +288,7 @@ pub(crate) fn evaluate_mitm_hooks(
     hooks_by_host: &MitmHooksByHost,
     host: &str,
     req: &Request,
+    origin: &MitmHookOrigin,
 ) -> HookEvaluation {
     let normalized_host = normalize_host(host);
     let Some(hooks) = hooks_by_host.get(&normalized_host) else {
@@ -252,7 +296,7 @@ pub(crate) fn evaluate_mitm_hooks(
     };
 
     for hook in hooks {
-        if hook_matches(hook, req) {
+        if hook_matches(hook, req, origin) {
             return HookEvaluation::Matched {
                 actions: hook.actions.clone(),
             };
@@ -274,7 +318,7 @@ where
     validate_mitm_hook_config(config)?;
 
     let mut hooks_by_host = MitmHooksByHost::new();
-    for hook in &config.network.mitm_hooks {
+    for hook in &config.mitm_hooks {
         let host = normalize_hook_host(&hook.host)?;
         let methods = normalize_methods(&hook.matcher.methods)?;
         let path_prefixes = compile_path_matchers(&hook.matcher.path_prefixes)?;
@@ -322,6 +366,13 @@ where
             .push(MitmHook {
                 host,
                 matcher: MitmHookMatcher {
+                    schemes: hook
+                        .matcher
+                        .schemes
+                        .iter()
+                        .map(|scheme| scheme.to_ascii_lowercase())
+                        .collect(),
+                    ports: hook.matcher.ports.clone(),
                     methods,
                     path_prefixes,
                     query,
@@ -329,12 +380,38 @@ where
                     body: None,
                 },
                 actions: MitmHookActions {
+                    body_secret_substitution: hook
+                        .actions
+                        .body_secret_substitution
+                        .as_ref()
+                        .map(|substitution| {
+                            substitution
+                                .compile(&resolve_env_var, &read_secret_file)
+                                .map(Arc::new)
+                        })
+                        .transpose()?,
+                    aws_sigv4: hook
+                        .actions
+                        .aws_sigv4
+                        .as_ref()
+                        .map(|signing| {
+                            signing
+                                .compile(&resolve_env_var, &read_secret_file)
+                                .map(Arc::new)
+                        })
+                        .transpose()?,
                     strip_request_headers,
                     inject_request_headers,
                 },
             });
     }
 
+    crate::aws_sigv4::validate_guest_placeholders(
+        hooks_by_host
+            .values()
+            .flatten()
+            .filter_map(|hook| hook.actions.aws_sigv4.as_deref()),
+    )?;
     Ok(hooks_by_host)
 }
 
@@ -370,29 +447,44 @@ where
     };
 
     let prefix = header.prefix.clone().unwrap_or_default();
-    let value = HeaderValue::from_str(&format!("{prefix}{secret}"))
+    let mut value = HeaderValue::from_str(&format!("{prefix}{secret}"))
         .with_context(|| format!("invalid value for injected header {}", header.name))?;
 
+    value.set_sensitive(true);
     Ok(ResolvedInjectedHeader {
+        placeholder: header
+            .placeholder
+            .as_ref()
+            .map(|value| HeaderValue::from_str(value))
+            .transpose()?,
         name,
         value,
         source,
     })
 }
 
-fn hook_matches(hook: &MitmHook, req: &Request) -> bool {
-    let method = req.method().as_str().to_ascii_uppercase();
+fn hook_matches(hook: &MitmHook, req: &Request, origin: &MitmHookOrigin) -> bool {
+    if (!hook.matcher.schemes.is_empty()
+        && !hook
+            .matcher
+            .schemes
+            .iter()
+            .any(|scheme| scheme == origin.scheme.as_str()))
+        || (!hook.matcher.ports.is_empty() && !hook.matcher.ports.contains(&origin.port))
+    {
+        return false;
+    }
     if !hook
         .matcher
         .methods
         .iter()
-        .any(|allowed| allowed == &method)
+        .any(|allowed| allowed.as_str() == req.method().as_str())
     {
         return false;
     }
 
     let path = req.uri().path();
-    if !path_matches(&hook.matcher.path_prefixes, path) {
+    if !is_safe_for_authorization(path) || !path_matches(&hook.matcher.path_prefixes, path) {
         return false;
     }
 
@@ -419,34 +511,38 @@ fn query_matches(query_constraints: &[QueryConstraint], req: &Request) -> bool {
 
     query_constraints.iter().all(|constraint| {
         actual_values.get(&constraint.name).is_some_and(|actual| {
-            actual.iter().any(|candidate| {
-                constraint
-                    .allowed_values
-                    .iter()
-                    .any(|allowed| allowed.matches(candidate))
-            })
+            // Origins disagree on which occurrence wins. Authorize only a single value.
+            let [candidate] = actual.as_slice() else {
+                return false;
+            };
+            constraint
+                .allowed_values
+                .iter()
+                .any(|allowed| allowed.matches(candidate))
         })
     })
 }
 
 fn headers_match(header_constraints: &[HeaderConstraint], req: &Request) -> bool {
     header_constraints.iter().all(|constraint| {
-        let actual = req.headers().get_all(&constraint.name);
-        if actual.iter().next().is_none() {
+        let values = req.headers().get_all(&constraint.name);
+        let mut actual = values.iter();
+        let Some(value) = actual.next() else {
             return false;
-        }
+        };
         if constraint.allowed_values.is_empty() {
             return true;
         }
 
-        actual.iter().any(|value| {
-            value.to_str().ok().is_some_and(|candidate| {
-                constraint
-                    .allowed_values
-                    .iter()
-                    .any(|allowed| allowed.matches(candidate))
+        actual.next().is_none()
+            && value.to_str().ok().is_some_and(|candidate| {
+                constraint.allowed_values.iter().any(|allowed| {
+                    // A field line can combine multiple logical values. A glob must not
+                    // consume the comma and accidentally authorize a second list member.
+                    (!candidate.contains(',') || matches!(allowed, ValueMatcher::Exact(_)))
+                        && allowed.matches(candidate)
+                })
             })
-        })
     })
 }
 
@@ -549,11 +645,20 @@ fn normalize_methods(methods: &[String]) -> Result<Vec<String>> {
     methods
         .iter()
         .map(|method| {
-            let normalized = method.trim().to_ascii_uppercase();
-            if normalized.is_empty() {
+            let method = method.trim();
+            if method.is_empty() {
                 return Err(anyhow!("methods must not contain empty entries"));
             }
-            Ok(normalized)
+            // Keep existing case-insensitive configuration for standard methods. Extension
+            // methods have case-sensitive names that must match what the origin receives.
+            let standard = [
+                "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+            ];
+            Ok(standard
+                .into_iter()
+                .find(|name| name.eq_ignore_ascii_case(method))
+                .unwrap_or(method)
+                .to_string())
         })
         .collect()
 }
@@ -600,7 +705,27 @@ fn validate_strip_request_headers(header_names: &[String]) -> Result<()> {
 
 fn validate_injected_headers(headers: &[InjectedHeaderConfig]) -> Result<()> {
     for header in headers {
-        let _ = parse_header_name(&header.name)?;
+        let name = parse_header_name(&header.name)?;
+        // Rama records User-Agent as a string in its upstream connection spans.
+        if name == rama_http::header::USER_AGENT {
+            return Err(anyhow!("proxy secrets cannot be injected into User-Agent"));
+        }
+        if let Some(placeholder) = &header.placeholder {
+            if placeholder.is_empty()
+                || matches!(
+                    name.as_str(),
+                    "host"
+                        | "content-length"
+                        | "transfer-encoding"
+                        | "connection"
+                        | "trailer"
+                        | "upgrade"
+                )
+            {
+                return Err(anyhow!("invalid secret substitution header or placeholder"));
+            }
+            HeaderValue::from_str(placeholder)?;
+        }
         match (
             header.secret_env_var.as_deref(),
             header.secret_file.as_deref(),
@@ -642,9 +767,37 @@ fn parse_secret_file(path: &str) -> Result<AbsolutePathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejects_secret_user_agent_before_loading_the_source() {
+        for placeholder in [None, Some("guest".to_string())] {
+            let header = InjectedHeaderConfig {
+                name: "User-Agent".to_string(),
+                secret_env_var: Some("PROXY_SECRET".to_string()),
+                placeholder,
+                ..Default::default()
+            };
+            assert!(validate_injected_headers(&[header]).is_err());
+        }
+    }
+
+    fn evaluate_mitm_hooks(
+        hooks: &super::MitmHooksByHost,
+        host: &str,
+        request: &rama_http::Request,
+    ) -> super::HookEvaluation {
+        super::evaluate_mitm_hooks(
+            hooks,
+            host,
+            request,
+            &super::MitmHookOrigin {
+                scheme: rama_http::uri::Scheme::HTTPS,
+                port: 443,
+            },
+        )
+    }
     use super::*;
     use crate::NetworkMode;
-    use crate::config::NetworkProxySettings;
+    use crate::config::NetworkProxyConfig;
     use pretty_assertions::assert_eq;
     use rama_http::Body;
     use rama_http::Method;
@@ -652,11 +805,9 @@ mod tests {
 
     fn base_config() -> NetworkProxyConfig {
         NetworkProxyConfig {
-            network: NetworkProxySettings {
-                mitm: true,
-                mode: NetworkMode::Limited,
-                ..NetworkProxySettings::default()
-            },
+            mitm: true,
+            mode: NetworkMode::Limited,
+            ..NetworkProxyConfig::default()
         }
     }
 
@@ -669,8 +820,11 @@ mod tests {
                 ..MitmHookMatchConfig::default()
             },
             actions: MitmHookActionsConfig {
+                body_secret_substitution: None,
+                aws_sigv4: None,
                 strip_request_headers: vec!["authorization".to_string()],
                 inject_request_headers: vec![InjectedHeaderConfig {
+                    placeholder: None,
                     name: "authorization".to_string(),
                     secret_env_var: Some("CODEX_GITHUB_TOKEN".to_string()),
                     secret_file: None,
@@ -683,8 +837,8 @@ mod tests {
     #[test]
     fn validate_requires_mitm_for_hooks() {
         let mut config = base_config();
-        config.network.mitm = false;
-        config.network.mitm_hooks = vec![github_hook()];
+        config.mitm = false;
+        config.mitm_hooks = vec![github_hook()];
 
         let err = validate_mitm_hook_config(&config).expect_err("hooks require mitm");
         assert!(
@@ -696,8 +850,8 @@ mod tests {
     #[test]
     fn validate_allows_hooks_in_full_mode() {
         let mut config = base_config();
-        config.network.mode = NetworkMode::Full;
-        config.network.mitm_hooks = vec![github_hook()];
+        config.mode = NetworkMode::Full;
+        config.mitm_hooks = vec![github_hook()];
 
         validate_mitm_hook_config(&config).expect("hooks should be allowed in full mode");
     }
@@ -709,7 +863,7 @@ mod tests {
         hook.matcher.body = Some(MitmHookBodyConfig(serde_json::json!({
             "repository": "openai/codex"
         })));
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let err = validate_mitm_hook_config(&config).expect_err("body matchers are reserved");
         assert!(err.to_string().contains("match.body is reserved"));
@@ -721,7 +875,7 @@ mod tests {
         let mut hook = github_hook();
         hook.actions.inject_request_headers[0].secret_env_var = None;
         hook.actions.inject_request_headers[0].secret_file = Some("token.txt".to_string());
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let err = validate_mitm_hook_config(&config).expect_err("secret file must be absolute");
         assert!(format!("{err:#}").contains("secret_file must be an absolute path"));
@@ -732,7 +886,7 @@ mod tests {
         let mut config = base_config();
         let mut hook = github_hook();
         hook.actions.inject_request_headers[0].secret_file = Some("/tmp/github-token".to_string());
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let err = validate_mitm_hook_config(&config).expect_err("dual secret sources invalid");
         assert!(format!("{err:#}").contains("exactly one of secret_env_var or secret_file"));
@@ -741,7 +895,7 @@ mod tests {
     #[test]
     fn compile_resolves_env_backed_injected_headers() {
         let mut config = base_config();
-        config.network.mitm_hooks = vec![github_hook()];
+        config.mitm_hooks = vec![github_hook()];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,
@@ -772,7 +926,7 @@ mod tests {
         hook.actions.inject_request_headers[0].secret_env_var = None;
         hook.actions.inject_request_headers[0].secret_file =
             Some(secret_file.path().display().to_string());
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let hooks = compile_mitm_hooks(&config).unwrap();
         let compiled = hooks.get("api.github.com").unwrap();
@@ -786,10 +940,11 @@ mod tests {
     fn evaluate_returns_first_matching_hook() {
         let mut config = base_config();
         let mut first = github_hook();
-        first.matcher.path_prefixes = vec!["/repos/openai/".to_string()];
+        first.matcher.schemes = vec!["https".to_string()];
+        first.matcher.ports = vec![443];
         let mut second = github_hook();
         second.actions.inject_request_headers[0].prefix = Some("Token ".to_string());
-        config.network.mitm_hooks = vec![first, second];
+        config.mitm_hooks = vec![first, second];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,
@@ -813,6 +968,22 @@ mod tests {
             actions.inject_request_headers[0].value,
             HeaderValue::from_static("Bearer abc")
         );
+        assert!(!format!("{actions:?}").contains("Bearer abc"));
+        for (scheme, port) in [
+            (rama_http::uri::Scheme::HTTP, 443),
+            (rama_http::uri::Scheme::HTTPS, 8443),
+        ] {
+            let origin = MitmHookOrigin { scheme, port };
+            let HookEvaluation::Matched { actions } =
+                super::evaluate_mitm_hooks(&hooks, "api.github.com", &req, &origin)
+            else {
+                panic!("expected the second hook");
+            };
+            assert_eq!(
+                actions.inject_request_headers[0].value,
+                HeaderValue::from_static("Token abc")
+            );
+        }
     }
 
     #[test]
@@ -827,7 +998,7 @@ mod tests {
             "x-github-api-version".to_string(),
             vec!["2022-11-28".to_string()],
         )]);
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,
@@ -851,6 +1022,68 @@ mod tests {
     }
 
     #[test]
+    fn credential_hooks_reject_ambiguous_query_and_header_values() {
+        let mut config = base_config();
+        let mut hook = github_hook();
+        hook.matcher
+            .query
+            .insert("tenant".into(), vec!["good".into()]);
+        hook.matcher
+            .headers
+            .insert("x-tenant".into(), vec!["pattern:good*".into()]);
+        hook.matcher.methods = vec!["post".into(), "ReadItem".into()];
+        hook.actions.inject_request_headers[0].placeholder = Some("dummy".into());
+        config.mitm_hooks = vec![hook];
+        let hooks = compile_mitm_hooks_with_resolvers(
+            &config,
+            |_| Some("host-secret".to_string()),
+            |_| Err(anyhow!("unexpected file lookup")),
+        )
+        .unwrap();
+
+        for (query, tenants, allowed) in [
+            ("tenant=good", &["good"][..], true),
+            ("tenant=bad&tenant=good", &["good"][..], false),
+            ("tenant=good&tenant=bad", &["good"][..], false),
+            ("tenant=good&%74enant=bad", &["good"][..], false),
+            ("tenant=good", &["good", "bad"][..], false),
+            ("tenant=good", &["bad", "good"][..], false),
+            ("tenant=good", &["good, bad"][..], false),
+        ] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/repos/openai/issues?{query}"))
+                .header("authorization", "dummy");
+            for &tenant in tenants {
+                req = req.header("x-tenant", tenant);
+            }
+            let mut req = req.body(Body::empty()).unwrap();
+            assert_eq!(
+                matches!(
+                    evaluate_mitm_hooks(&hooks, "api.github.com", &req),
+                    HookEvaluation::Matched { .. }
+                ),
+                allowed,
+                "{query} {tenants:?}"
+            );
+            if allowed {
+                for (method, matched) in [("post", false), ("ReadItem", true), ("READITEM", false)]
+                {
+                    *req.method_mut() = Method::from_bytes(method.as_bytes()).unwrap();
+                    assert_eq!(
+                        matches!(
+                            evaluate_mitm_hooks(&hooks, "api.github.com", &req),
+                            HookEvaluation::Matched { .. }
+                        ),
+                        matched,
+                        "{method}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn evaluate_matches_wildcard_path_query_and_header_constraints() {
         let mut config = base_config();
         let mut hook = github_hook();
@@ -861,7 +1094,7 @@ mod tests {
             "x-github-api-version".to_string(),
             vec!["pattern:2022*preview".to_string()],
         )]);
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,
@@ -889,7 +1122,7 @@ mod tests {
         let mut config = base_config();
         let mut hook = github_hook();
         hook.matcher.path_prefixes = vec!["pattern:/repos/[".to_string()];
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let err = validate_mitm_hook_config(&config).expect_err("invalid glob should fail");
         assert!(format!("{err:#}").contains("invalid glob pattern"));
@@ -900,7 +1133,7 @@ mod tests {
         let mut config = base_config();
         let mut hook = github_hook();
         hook.matcher.path_prefixes = vec!["pattern:/repos/*/codex/issues*".to_string()];
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,
@@ -921,6 +1154,46 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_rejects_paths_that_upstream_may_normalize() {
+        let mut config = base_config();
+        let mut hook = github_hook();
+        hook.matcher.methods = vec!["GET".to_string()];
+        hook.matcher.path_prefixes = vec!["pattern:/openai/openai/**".to_string()];
+        config.mitm_hooks = vec![hook];
+
+        let hooks = compile_mitm_hooks_with_resolvers(
+            &config,
+            |_| Some("abc".to_string()),
+            |_| Err(anyhow!("unexpected file lookup")),
+        )
+        .unwrap();
+        let paths = [
+            "/openai/openai/../codex",
+            "/openai/openai/%2e%2e/codex",
+            "/openai/openai/%2E%2E/codex",
+            "/openai/openai/.%2e/codex",
+            "/openai/openai/%2e./codex",
+            "/openai/openai/%252e%252e/codex",
+            "/openai/openai/%2f..%2fcodex",
+            "/openai/openai/%5c..%5ccodex",
+            "/openai/openai/%2e%2e/%2e%2e/microsoft/vscode",
+        ];
+        let actual = paths
+            .iter()
+            .map(|path| {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(*path)
+                    .body(Body::empty())
+                    .unwrap();
+                evaluate_mitm_hooks(&hooks, "api.github.com", &req)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, vec![HookEvaluation::HookedHostNoMatch; paths.len()]);
+    }
+
+    #[test]
     fn evaluate_treats_glob_metacharacters_as_literal_without_glob_prefix() {
         let mut config = base_config();
         let mut hook = github_hook();
@@ -930,7 +1203,7 @@ mod tests {
             "x-github-api-version".to_string(),
             vec!["2022-11-28[preview]".to_string()],
         )]);
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,
@@ -973,7 +1246,7 @@ mod tests {
             "x-github-api-version".to_string(),
             vec!["literal:pattern:*".to_string()],
         )]);
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,
@@ -1011,7 +1284,7 @@ mod tests {
         let mut config = base_config();
         let mut hook = github_hook();
         hook.matcher.query = BTreeMap::from([("state".to_string(), vec!["open".to_string()])]);
-        config.network.mitm_hooks = vec![hook];
+        config.mitm_hooks = vec![hook];
 
         let hooks = compile_mitm_hooks_with_resolvers(
             &config,

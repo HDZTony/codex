@@ -1,59 +1,70 @@
-//! Backtracking and transcript overlay event routing.
+//! Backtracking and detailed transcript event routing.
 //!
 //! This file owns backtrack mode (Esc/Enter navigation in the transcript overlay) and also
 //! mediates a key rendering boundary for the transcript overlay.
 //!
-//! Overall goal: keep the main chat view and the transcript overlay in sync while allowing
-//! users to "rewind" to an earlier user message. We stage a rollback request, wait for core to
-//! confirm it, then trim the local transcript to the matching history boundary. This avoids UI
-//! state diverging from the agent if a rollback fails or targets a different thread.
+//! Overall goal: keep the main chat view and the transcript overlay in sync while allowing users
+//! to edit an earlier prompt in place. Confirming a selection reverts before
+//! the selected turn and restores its prompt in the composer.
 //!
 //! Backtrack operates as a small state machine:
 //! - The first `Esc` in the main view "primes" the feature and captures a base thread id.
-//! - A subsequent `Esc` opens the transcript overlay (`Ctrl+T`) and highlights a user message when
-//!   there is a rewind target.
-//! - `Enter` requests a rollback from core and records a `pending_rollback` guard.
-//! - On rollback completion, we either finish an in-flight backtrack request or queue a
-//!   rollback trim so it runs in event order with transcript inserts.
+//! - A subsequent `Esc` starts compact transcript browsing and highlights the latest user prompt.
+//! - Left/Right choose prompts, Ctrl+T toggles details, and Esc restores the browsing origin.
+//! - `Enter` requests a revert before the selected prompt and reopens it for editing.
 //!
-//! The transcript overlay (`Ctrl+T`) renders committed transcript cells plus a render-only live
-//! tail derived from the current in-flight `ChatWidget.active_cell`.
+//! Owned sessions use the shared transcript viewport for `Ctrl+T`; inline sessions retain the
+//! overlay. Both render committed cells and a live tail from the current `ChatWidget.active_cell`.
 //!
 //! That live tail is kept in sync during `TuiEvent::Draw` handling for `Overlay::Transcript` by
 //! asking `ChatWidget` for an active-cell cache key and transcript lines and by passing them into
 //! `TranscriptOverlay::sync_live_tail`. This preserves the invariant that the overlay reflects
 //! both committed history and in-flight activity without changing flush or coalescing behavior.
 
+mod browsing;
+mod legacy_input;
+mod prompt_navigation;
+
 use std::any::TypeId;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::app::App;
-use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
+use crate::app_server_session::AppServerSession;
+use crate::bottom_pane::LocalImageAttachment;
+use crate::chatwidget::ChatWidget;
 use crate::chatwidget::UserMessage;
+use crate::chatwidget::mention_bindings_from_user_inputs;
 #[cfg(test)]
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
+use crate::history_cell::sanitize_user_text;
 use crate::pager_overlay::Overlay;
+use crate::pager_overlay::TranscriptHistoryState;
 use crate::tui;
 use crate::tui::TuiEvent;
+use codex_app_server_protocol::ThreadItemPayload;
+use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnStatus;
 use codex_protocol::ThreadId;
-use codex_protocol::user_input::TextElement;
+use codex_protocol::models::local_image_label_text;
 use color_eyre::eyre::Result;
+use color_eyre::eyre::bail;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 
 const NO_PREVIOUS_MESSAGE_TO_EDIT: &str = "No previous message to edit.";
+pub(crate) const SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE: &str =
+    "Editing previous prompts is unavailable in side conversations.";
 
 /// Aggregates all backtrack-related state used by the App.
 #[derive(Default)]
 pub(crate) struct BacktrackState {
     /// True when Esc has primed backtrack mode in the main view.
     pub(crate) primed: bool,
-    /// Session id of the base thread to rollback.
+    /// Session id of the base thread whose transcript is being inspected.
     ///
     /// If the current thread changes, backtrack selections become invalid and must be ignored.
     pub(crate) base_id: Option<ThreadId>,
@@ -64,108 +75,69 @@ pub(crate) struct BacktrackState {
     pub(crate) nth_user_message: usize,
     /// True when the transcript overlay is showing a backtrack preview.
     pub(crate) overlay_preview_active: bool,
-    /// Pending rollback request awaiting confirmation from core.
-    ///
-    /// This acts as a guardrail: once we request a rollback, we block additional backtrack
-    /// submissions until core responds with either a success or failure event.
-    pub(crate) pending_rollback: Option<PendingBacktrackRollback>,
+    /// Consume held-key input after a fresh press acts on transcript select mode.
+    pub(crate) select_exit_key: Option<crate::key_hint::KeyBinding>,
+    /// Preserve the initiating key while a select-and-follow copy is pending.
+    pub(crate) pending_select_exit_key: Option<(u64, crate::key_hint::KeyBinding)>,
+    origin: Option<browsing::BrowsingOrigin>,
 }
 
-/// A user-visible backtrack choice that can be confirmed into a rollback request.
-#[derive(Debug, Clone)]
+impl BacktrackState {
+    pub(crate) fn observe_pending_select_exit_key(&mut self, event: KeyEvent) {
+        if event.kind == KeyEventKind::Release
+            && self.pending_select_exit_key.is_some_and(|(_, binding)| {
+                binding.parts() == crate::key_hint::KeyBinding::from_event(event).parts()
+            })
+        {
+            self.pending_select_exit_key = None;
+        }
+    }
+
+    pub(crate) fn finish_pending_select_exit_key(
+        &mut self,
+        completed_id: u64,
+        select_mode_closed: bool,
+    ) -> Option<crate::key_hint::KeyBinding> {
+        match self.pending_select_exit_key {
+            Some((id, key)) if id == completed_id => {
+                self.pending_select_exit_key = None;
+                select_mode_closed.then_some(key)
+            }
+            Some((id, _)) if id < completed_id => {
+                self.pending_select_exit_key = None;
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A user-visible backtrack choice that can be reopened in the current thread.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BacktrackSelection {
+    pub(crate) thread_id: ThreadId,
     /// The selected user message, counted from the most recent session start.
-    ///
-    /// This value is used both to compute the rollback depth and to trim the local transcript
-    /// after core confirms the rollback.
     pub(crate) nth_user_message: usize,
-    /// Composer prefill derived from the selected user message.
-    ///
-    /// This is applied immediately on selection confirmation; if the rollback fails, the prefill
-    /// remains as a convenience so the user can retry or edit.
-    pub(crate) prefill: String,
-    /// Text elements associated with the selected user message.
-    pub(crate) text_elements: Vec<TextElement>,
-    /// Local image paths associated with the selected user message.
-    pub(crate) local_image_paths: Vec<PathBuf>,
-    /// Remote image URLs associated with the selected user message.
-    pub(crate) remote_image_urls: Vec<String>,
-}
-
-/// An in-flight rollback requested from core.
-///
-/// We keep enough information to apply the corresponding local trim only if the response targets
-/// the same active thread we issued the request for.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingBacktrackRollback {
-    pub(crate) selection: BacktrackSelection,
-    pub(crate) thread_id: Option<ThreadId>,
+    pub(crate) prompt: UserMessage,
 }
 
 impl App {
-    /// Route overlay events while the transcript overlay is active.
+    /// Route overlay events, reserving backtracking for the transcript overlay.
     ///
-    /// If backtrack preview is active, Esc / Left steps selection, Right steps forward, Enter
+    /// If browsing is active, Left/Right steps selection, Esc cancels, and Enter
     /// confirms. Otherwise, Esc begins preview mode and all other events are forwarded to the
     /// overlay.
     pub(crate) async fn handle_backtrack_overlay_event(
         &mut self,
         tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<bool> {
-        if self.backtrack.overlay_preview_active {
-            match event {
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Esc,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                }) => {
-                    self.overlay_step_backtrack(tui, event)?;
-                    Ok(true)
-                }
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Left,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                }) => {
-                    self.overlay_step_backtrack(tui, event)?;
-                    Ok(true)
-                }
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Right,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                }) => {
-                    self.overlay_step_backtrack_forward(tui, event)?;
-                    Ok(true)
-                }
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Enter,
-                    kind: KeyEventKind::Press,
-                    ..
-                }) => {
-                    self.overlay_confirm_backtrack(tui);
-                    Ok(true)
-                }
-                _ => {
-                    self.overlay_forward_event(tui, event)?;
-                    Ok(true)
-                }
-            }
-        } else if let TuiEvent::Key(KeyEvent {
-            code: KeyCode::Esc,
-            kind: KeyEventKind::Press | KeyEventKind::Repeat,
-            ..
-        }) = event
-        {
-            // First Esc in transcript overlay: begin backtrack preview at latest user message.
-            self.begin_overlay_backtrack_preview(tui);
-            Ok(true)
-        } else {
-            // Not in backtrack mode: forward events to the overlay widget.
+        if !matches!(self.overlay, Some(Overlay::Transcript(_))) {
             self.overlay_forward_event(tui, event)?;
-            Ok(true)
+            return Ok(true);
         }
+        self.handle_legacy_transcript_event(tui, app_server, event)
     }
 
     /// Handle global Esc presses for backtracking when no overlay is present.
@@ -175,105 +147,99 @@ impl App {
         }
 
         if !self.backtrack.primed {
+            self.remember_browsing_origin(tui);
             self.prime_backtrack();
         } else if self.overlay.is_none() {
             self.open_backtrack_preview(tui);
-        } else if self.backtrack.overlay_preview_active {
-            self.step_backtrack_and_highlight(tui);
         }
     }
 
-    /// Stage a backtrack and request thread history from the agent.
-    ///
-    /// We send the rollback request immediately, but we only mutate the transcript after core
-    /// confirms success so the UI cannot get ahead of the actual thread state.
-    ///
-    /// The composer prefill is applied immediately as a UX convenience; it does not imply that
-    /// core has accepted the rollback.
-    pub(crate) fn apply_backtrack_rollback(&mut self, selection: BacktrackSelection) {
-        let user_total = user_count(&self.transcript_cells);
-        if user_total == 0 {
-            return;
-        }
-
-        if self.backtrack.pending_rollback.is_some() {
+    /// Revert the current thread before the selected prompt.
+    pub(crate) fn apply_backtrack_selection(&mut self, selection: BacktrackSelection) {
+        if self.chat_widget.side_conversation_active() {
+            self.reset_backtrack_state();
             self.chat_widget
-                .add_error_message("Backtrack rollback already in progress.".to_string());
+                .add_error_message(SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE.to_string());
             return;
         }
 
-        let num_turns = user_total.saturating_sub(selection.nth_user_message);
-        let num_turns = u32::try_from(num_turns).unwrap_or(u32::MAX);
-        if num_turns == 0 {
+        if self.chat_widget.thread_id() != Some(selection.thread_id) {
             return;
         }
 
-        let prefill = selection.prefill.clone();
-        let text_elements = selection.text_elements.clone();
-        let local_image_paths = selection.local_image_paths.clone();
-        let remote_image_urls = selection.remote_image_urls.clone();
-        let has_remote_image_urls = !remote_image_urls.is_empty();
-        self.backtrack.pending_rollback = Some(PendingBacktrackRollback {
-            selection,
-            thread_id: self.chat_widget.thread_id(),
-        });
-        self.chat_widget
-            .submit_op(AppCommand::thread_rollback(num_turns));
-        self.chat_widget.set_remote_image_urls(remote_image_urls);
-        if !prefill.is_empty()
-            || !text_elements.is_empty()
-            || !local_image_paths.is_empty()
-            || has_remote_image_urls
-        {
-            self.chat_widget
-                .set_composer_text(prefill, text_elements, local_image_paths);
-        }
-    }
-
-    pub(crate) fn apply_cancelled_turn_edit(&mut self, prompt: UserMessage) {
-        let user_total = user_count(&self.transcript_cells);
-        let selection = BacktrackSelection {
-            nth_user_message: user_total.saturating_sub(1),
-            prefill: prompt.text.clone(),
-            text_elements: prompt.text_elements.clone(),
-            local_image_paths: prompt
-                .local_images
-                .iter()
-                .map(|image| image.path.clone())
-                .collect(),
-            remote_image_urls: prompt.remote_image_urls.clone(),
+        let Some(index) = nth_user_position(&self.transcript_cells, selection.nth_user_message)
+        else {
+            return;
         };
-        if user_total == 0 {
-            if self.backtrack.pending_rollback.is_some() {
-                self.chat_widget
-                    .add_error_message("Backtrack rollback already in progress.".to_string());
-                return;
-            }
-            self.backtrack.pending_rollback = Some(PendingBacktrackRollback {
-                selection,
-                thread_id: self.chat_widget.thread_id(),
+        self.app_event_tx
+            .send(AppEvent::RevertSessionForPromptEdit {
+                thread_id: selection.thread_id,
+                selected_cell: Arc::clone(&self.transcript_cells[index]),
+                prompt: selection.prompt,
             });
-            self.chat_widget
-                .submit_op(AppCommand::thread_rollback(/*num_turns*/ 1));
-            self.chat_widget.restore_user_message_to_composer(prompt);
-            return;
-        }
-        self.apply_backtrack_rollback(selection);
-        self.chat_widget.restore_user_message_to_composer(prompt);
     }
 
-    /// Open transcript overlay (enters alternate screen and shows full transcript).
+    pub(crate) fn restore_backtrack_prompt_after_revert_error(
+        &mut self,
+        prompt: UserMessage,
+        err: impl std::fmt::Display,
+    ) {
+        self.chat_widget.restore_user_message_to_composer(prompt);
+        self.chat_widget
+            .add_error_message(format!("Failed to edit the selected prompt: {err:#}"));
+    }
+
+    /// Show detailed history in the owned viewport or the inline session's transcript overlay.
     pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) {
+        if tui.is_owned_screen() {
+            if self.scrollback_has_older_history
+                && !self.transcript_view.history.has_unloaded_history()
+            {
+                self.transcript_view.history = TranscriptHistoryState::Partial;
+            }
+            self.transcript_view.set_presentation(
+                /*detailed*/ true,
+                self.chat_widget.history_render_mode(),
+            );
+            tui.frame_requester().schedule_frame();
+            return;
+        }
         let _ = tui.enter_alt_screen();
-        self.overlay = Some(Overlay::new_transcript(
-            self.transcript_cells.clone(),
-            self.keymap.pager.clone(),
-        ));
+        self.overlay = Some(
+            Overlay::new_transcript(
+                self.transcript_cells.clone(),
+                self.keymap.pager.clone(),
+                self.local_settings
+                    .copy_on_select(&codex_terminal_detection::terminal_info()),
+                self.local_settings
+                    .tui
+                    .mouse_scroll_speed
+                    .unwrap_or(/*default*/ 1.0),
+            )
+            .with_copy_on_select_clear_selection(
+                self.local_settings.tui.copy_on_select_clear_selection,
+            ),
+        );
+        if self.scrollback_has_older_history
+            && let Some(Overlay::Transcript(overlay)) = self.overlay.as_mut()
+        {
+            overlay.set_history_state(TranscriptHistoryState::Partial);
+        }
         tui.frame_requester().schedule_frame();
     }
 
-    /// Close transcript overlay and restore normal UI.
+    /// Close the current overlay and restore normal UI, retaining Analytics navigation state.
     pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) {
+        if tui.is_owned_screen() && self.overlay.is_none() {
+            self.transcript_view.set_presentation(
+                /*detailed*/ false,
+                self.chat_widget.history_render_mode(),
+            );
+            self.backtrack.overlay_preview_active = false;
+            self.reset_backtrack_state();
+            tui.frame_requester().schedule_frame();
+            return;
+        }
         let _ = tui.leave_alt_screen();
         let was_backtrack = self.backtrack.overlay_preview_active;
         if !self.deferred_history_lines.is_empty() {
@@ -283,8 +249,17 @@ impl App {
                 self.history_line_wrap_policy(),
             );
         }
-        self.overlay = None;
+        if let Some(Overlay::Analytics(mut view)) = self.overlay.take() {
+            view.cancel_loads();
+            self.retained_analytics = Some(view);
+        }
+        if self.pending_thread_usage_history_refresh
+            && let Err(err) = self.refresh_thread_usage_history_tail(tui)
+        {
+            tracing::warn!(error = %err, "failed to refresh thread usage after closing overlay");
+        }
         self.backtrack.overlay_preview_active = false;
+        tui.frame_requester().schedule_frame();
         if was_backtrack {
             // Ensure backtrack state is fully reset when overlay closes (e.g. via 'q').
             self.reset_backtrack_state();
@@ -303,7 +278,7 @@ impl App {
 
     /// Open overlay and begin backtrack preview flow (first step + highlight).
     fn open_backtrack_preview(&mut self, tui: &mut tui::Tui) {
-        if !has_backtrack_target(&self.transcript_cells) {
+        if !has_backtrack_target(&self.transcript_cells) && !self.scrollback_has_older_history {
             self.reset_backtrack_state();
             self.chat_widget
                 .add_info_message(NO_PREVIOUS_MESSAGE_TO_EDIT.to_string(), /*hint*/ None);
@@ -313,14 +288,15 @@ impl App {
 
         self.open_transcript_overlay(tui);
         self.backtrack.overlay_preview_active = true;
-        // Composer is hidden by overlay; clear its hint.
+        self.set_browsing_details(/*detailed*/ false);
+        // The selected prompt now supplies the backtrack context instead of the composer hint.
         self.chat_widget.clear_esc_backtrack_hint();
         self.step_backtrack_and_highlight(tui);
     }
 
     /// When overlay is already open, begin preview mode and select latest user message.
     fn begin_overlay_backtrack_preview(&mut self, tui: &mut tui::Tui) {
-        if !has_backtrack_target(&self.transcript_cells) {
+        if !has_backtrack_target(&self.transcript_cells) && !self.scrollback_has_older_history {
             self.close_transcript_overlay(tui);
             self.chat_widget
                 .add_info_message(NO_PREVIOUS_MESSAGE_TO_EDIT.to_string(), /*hint*/ None);
@@ -328,9 +304,12 @@ impl App {
             return;
         }
 
+        self.remember_browsing_origin(tui);
+        self.backtrack.nth_user_message = usize::MAX;
         self.backtrack.primed = true;
         self.backtrack.base_id = self.chat_widget.thread_id();
         self.backtrack.overlay_preview_active = true;
+        self.set_browsing_details(/*detailed*/ false);
         let count = user_count(&self.transcript_cells);
         if let Some(last) = count.checked_sub(1) {
             self.apply_backtrack_selection_internal(last);
@@ -383,17 +362,23 @@ impl App {
     }
 
     /// Apply a computed backtrack selection to the overlay and internal counter.
-    fn apply_backtrack_selection_internal(&mut self, nth_user_message: usize) {
+    pub(crate) fn apply_backtrack_selection_internal(&mut self, nth_user_message: usize) {
         if let Some(cell_idx) = nth_user_position(&self.transcript_cells, nth_user_message) {
             self.backtrack.nth_user_message = nth_user_message;
             if let Some(Overlay::Transcript(t)) = &mut self.overlay {
                 t.set_highlight_cell(Some(cell_idx));
+            }
+            if self.overlay.is_none() {
+                self.transcript_view.set_highlight(Some(cell_idx));
+                self.transcript_view
+                    .ensure_entry_visible(&self.transcript_cells, cell_idx);
             }
         } else {
             self.backtrack.nth_user_message = usize::MAX;
             if let Some(Overlay::Transcript(t)) = &mut self.overlay {
                 t.set_highlight_cell(/*cell*/ None);
             }
+            self.transcript_view.set_highlight(/*index*/ None);
         }
     }
 
@@ -411,25 +396,84 @@ impl App {
     /// source of truth for the active cell and its cache invalidation key, and because `App` owns
     /// overlay lifecycle and frame scheduling for animations.
     fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
-        if matches!(&event, TuiEvent::Draw | TuiEvent::Resize)
+        let select_exit_key = Self::transcript_select_exit_key(&event);
+        if matches!(
+            &event,
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained
+        ) {
+            self.chat_widget.refresh_terminal_program_status();
+        }
+        let width = tui.terminal.last_known_screen_size.width.max(/*other*/ 1);
+        let footer = self.prompt_navigation_footer(width.saturating_sub(/*rhs*/ 2));
+        if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
+            overlay.browsing_footer =
+                footer.and_then(|footer| footer.text.lines.into_iter().next());
+        }
+        let input = matches!(&event, TuiEvent::Key(key) if key.kind != KeyEventKind::Release)
+            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved);
+        if (input
+            || matches!(
+                &event,
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained
+            ))
             && let Some(Overlay::Transcript(t)) = &mut self.overlay
         {
+            let was_select_mode = t.is_select_mode();
+            let pending_follow_before = t.pending_follow_id();
+            tui.set_mouse_capture(tui::MouseCapture::Enabled)?;
+            t.motion = crate::motion::MotionMode::from_animations_enabled(
+                self.local_settings.tui.animations && self.local_settings.tui.effects.shimmer,
+            );
             let active_key = self.chat_widget.active_cell_transcript_key();
             let chat_widget = &self.chat_widget;
-            tui.draw(u16::MAX, |frame| {
-                let width = frame.area().width.max(1);
-                t.sync_live_tail(width, active_key, |w| {
-                    chat_widget.active_cell_transcript_hyperlink_lines(w)
-                });
-                t.render(frame.area(), frame.buffer);
-            })?;
+            let detailed = t.is_detailed();
+            let size = tui.prepare_draw_size()?;
+            t.sync_search_live_tail(size.width.max(/*other*/ 1), active_key, |width| {
+                chat_widget.active_cell_transcript_hyperlink_lines(width)
+            });
+            t.sync_live_tail(size.width.max(/*other*/ 1), active_key, |width| {
+                if detailed {
+                    chat_widget.active_cell_transcript_hyperlink_lines(width)
+                } else {
+                    chat_widget
+                        .active_cell_owned_transcript_lines(width, /*expanded*/ false)
+                        .map(|mut lines| {
+                            lines.activity.extend(lines.auxiliary);
+                            lines.activity
+                        })
+                }
+            });
+            // Refresh visible rows before selection captures this live revision.
+            let result =
+                if input { t.draw(tui) } else { Ok(()) }.and_then(|()| t.handle_event(tui, event));
+            if result.is_err() {
+                let _ = tui.set_mouse_capture(tui::MouseCapture::Inherit);
+            }
+            let completed_copy = result?;
             let close_overlay = t.is_done();
+            let select_mode_closed = was_select_mode && (!t.is_select_mode() || close_overlay);
+            let pending_follow_id = t.pending_follow_id();
             if !close_overlay
                 && active_key.is_some_and(|key| key.animation_tick.is_some())
                 && t.is_scrolled_to_bottom()
             {
                 tui.frame_requester()
                     .schedule_frame_in(std::time::Duration::from_millis(50));
+            }
+            if pending_follow_id != pending_follow_before
+                && let (Some(id), Some(key)) = (pending_follow_id, select_exit_key)
+            {
+                self.backtrack.pending_select_exit_key = Some((id, key));
+            }
+            let completed_exit_key = completed_copy.and_then(|completed_id| {
+                self.backtrack
+                    .finish_pending_select_exit_key(completed_id, select_mode_closed)
+            });
+            if select_mode_closed {
+                self.backtrack.select_exit_key = select_exit_key.or(completed_exit_key);
+                if select_exit_key.is_some() {
+                    self.backtrack.pending_select_exit_key = None;
+                }
             }
             if close_overlay {
                 self.close_transcript_overlay(tui);
@@ -451,40 +495,16 @@ impl App {
     /// Handle Enter in overlay backtrack preview: confirm selection and reset state.
     fn overlay_confirm_backtrack(&mut self, tui: &mut tui::Tui) {
         let nth_user_message = self.backtrack.nth_user_message;
-        let selection = self.backtrack_selection(nth_user_message);
+        let Some(selection) = self.backtrack_selection(nth_user_message) else {
+            return;
+        };
         self.close_transcript_overlay(tui);
-        if let Some(selection) = selection {
-            self.apply_backtrack_rollback(selection);
-            tui.frame_requester().schedule_frame();
-        }
-    }
-
-    /// Handle Esc in overlay backtrack preview: step selection if armed, else forward.
-    fn overlay_step_backtrack(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
-        if self.backtrack.base_id.is_some() {
-            self.step_backtrack_and_highlight(tui);
-        } else {
-            self.overlay_forward_event(tui, event)?;
-        }
-        Ok(())
-    }
-
-    /// Handle Right in overlay backtrack preview: step selection forward if armed, else forward.
-    fn overlay_step_backtrack_forward(
-        &mut self,
-        tui: &mut tui::Tui,
-        event: TuiEvent,
-    ) -> Result<()> {
-        if self.backtrack.base_id.is_some() {
-            self.step_forward_backtrack_and_highlight(tui);
-        } else {
-            self.overlay_forward_event(tui, event)?;
-        }
-        Ok(())
+        self.apply_backtrack_selection(selection);
+        tui.frame_requester().schedule_frame();
     }
 
     /// Confirm a primed backtrack from the main view (no overlay visible).
-    /// Computes the prefill from the selected user message for rollback.
+    /// Computes the prompt state from the selected user message.
     pub(crate) fn confirm_backtrack_from_main(&mut self) -> Option<BacktrackSelection> {
         let selection = self.backtrack_selection(self.backtrack.nth_user_message);
         self.reset_backtrack_state();
@@ -493,71 +513,14 @@ impl App {
 
     /// Clear all backtrack-related state and composer hints.
     pub(crate) fn reset_backtrack_state(&mut self) {
+        self.backtrack.origin = None;
         self.backtrack.primed = false;
+        self.backtrack.overlay_preview_active = false;
         self.backtrack.base_id = None;
         self.backtrack.nth_user_message = usize::MAX;
+        self.transcript_view.set_highlight(/*index*/ None);
         // In case a hint is somehow still visible (e.g., race with overlay open/close).
         self.chat_widget.clear_esc_backtrack_hint();
-    }
-
-    pub(crate) fn apply_backtrack_selection(
-        &mut self,
-        tui: &mut tui::Tui,
-        selection: BacktrackSelection,
-    ) {
-        self.apply_backtrack_rollback(selection);
-        tui.frame_requester().schedule_frame();
-    }
-
-    pub(crate) fn handle_backtrack_rollback_succeeded(&mut self, num_turns: u32) {
-        if self.backtrack.pending_rollback.is_some() {
-            self.finish_pending_backtrack();
-        } else {
-            self.app_event_tx
-                .send(AppEvent::ApplyThreadRollback { num_turns });
-        }
-    }
-
-    pub(crate) fn handle_backtrack_rollback_failed(&mut self) {
-        self.backtrack.pending_rollback = None;
-    }
-
-    /// Apply rollback semantics for a confirmed rollback where this TUI does
-    /// not have an in-flight backtrack request (`pending_rollback` is `None`).
-    ///
-    /// Returns `true` when local transcript state changed.
-    pub(crate) fn apply_non_pending_thread_rollback(&mut self, num_turns: u32) -> bool {
-        if !trim_transcript_cells_drop_last_n_user_turns(&mut self.transcript_cells, num_turns) {
-            return false;
-        }
-        self.chat_widget
-            .truncate_agent_copy_history_to_user_turn_count(user_count(&self.transcript_cells));
-        self.sync_overlay_after_transcript_trim();
-        self.backtrack_render_pending = true;
-        true
-    }
-
-    /// Finish a pending rollback by applying the local trim and scheduling a scrollback refresh.
-    ///
-    /// We ignore events that do not correspond to the currently active thread to avoid applying
-    /// stale updates after a session switch.
-    fn finish_pending_backtrack(&mut self) {
-        let Some(pending) = self.backtrack.pending_rollback.take() else {
-            return;
-        };
-        if pending.thread_id != self.chat_widget.thread_id() {
-            // Ignore rollbacks targeting a prior thread.
-            return;
-        }
-        if trim_transcript_cells_to_nth_user(
-            &mut self.transcript_cells,
-            pending.selection.nth_user_message,
-        ) {
-            self.chat_widget
-                .truncate_agent_copy_history_to_user_turn_count(user_count(&self.transcript_cells));
-            self.sync_overlay_after_transcript_trim();
-            self.backtrack_render_pending = true;
-        }
     }
 
     fn backtrack_selection(&self, nth_user_message: usize) -> Option<BacktrackSelection> {
@@ -566,95 +529,183 @@ impl App {
             return None;
         }
 
-        let (prefill, text_elements, local_image_paths, remote_image_urls) =
-            nth_user_position(&self.transcript_cells, nth_user_message)
-                .and_then(|idx| self.transcript_cells.get(idx))
-                .and_then(|cell| cell.as_any().downcast_ref::<UserHistoryCell>())
-                .map(|cell| {
-                    (
-                        cell.message.clone(),
-                        cell.text_elements.clone(),
-                        cell.local_image_paths.clone(),
-                        cell.remote_image_urls.clone(),
-                    )
-                })
-                .unwrap_or_else(|| (String::new(), Vec::new(), Vec::new(), Vec::new()));
+        let selected = nth_user_position(&self.transcript_cells, nth_user_message)
+            .and_then(|idx| self.transcript_cells.get(idx))
+            .and_then(|cell| cell.as_any().downcast_ref::<UserHistoryCell>())?;
+        let local_images = selected
+            .local_image_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| LocalImageAttachment {
+                placeholder: local_image_label_text(index + 1),
+                path: path.clone(),
+            })
+            .collect();
 
         Some(BacktrackSelection {
+            thread_id: base_id,
             nth_user_message,
-            prefill,
-            text_elements,
-            local_image_paths,
-            remote_image_urls,
+            prompt: UserMessage {
+                text: selected.message.clone(),
+                local_images,
+                remote_image_urls: selected.remote_image_urls.clone(),
+                text_elements: selected.text_elements.clone(),
+                mention_bindings: Vec::new(),
+            },
         })
     }
-
-    /// Keep transcript-related UI state aligned after `transcript_cells` was trimmed.
-    ///
-    /// This does three things:
-    /// 1. If transcript overlay is open, replace its committed cells so removed turns disappear.
-    /// 2. If backtrack preview is active, clamp/recompute the highlighted user selection.
-    /// 3. Drop deferred transcript lines buffered while overlay was open to avoid flushing lines
-    ///    for cells that were just removed by the trim.
-    fn sync_overlay_after_transcript_trim(&mut self) {
-        if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-            t.replace_cells(self.transcript_cells.clone());
-        }
-        if self.backtrack.overlay_preview_active {
-            let total_users = user_count(&self.transcript_cells);
-            let next_selection = if total_users == 0 {
-                usize::MAX
-            } else {
-                self.backtrack
-                    .nth_user_message
-                    .min(total_users.saturating_sub(1))
-            };
-            self.apply_backtrack_selection_internal(next_selection);
-        }
-        // While overlay is open, we buffer rendered history lines and flush them on close.
-        // If rollback trimmed cells meanwhile, those buffered lines can reference removed turns.
-        self.deferred_history_lines.clear();
-    }
 }
 
-fn trim_transcript_cells_to_nth_user(
-    transcript_cells: &mut Vec<Arc<dyn crate::history_cell::HistoryCell>>,
+/// Find the persisted turn that contains a selected transcript prompt.
+///
+/// Replay hides review prompts and other display-empty inputs, so the selected ordinal must be
+/// resolved against the same visible projection before restoring its canonical mention bindings.
+/// `start_item` anchors a partially loaded transcript within authoritative history; earlier
+/// user inputs still establish whether the selected input was a mid-turn steer.
+///
+/// A turn can contain multiple user messages when it was steered. Only its initial prompt can be
+/// reopened independently because app-server cannot revert in the middle of a turn.
+pub(crate) fn backtrack_revert_before_turn_id(
+    turns: &[Turn],
+    start_item: Option<&(String, String)>,
     nth_user_message: usize,
-) -> bool {
-    if nth_user_message == usize::MAX {
-        return false;
+    prompt: &mut UserMessage,
+) -> Result<String> {
+    let (start_turn, start_item) = match start_item {
+        Some((turn_id, item_id)) => turns
+            .iter()
+            .position(|turn| turn.id == *turn_id)
+            .and_then(|index| {
+                turns[index]
+                    .items
+                    .iter()
+                    .position(|item| item.id() == item_id)
+                    .map(|item| (index, item))
+            })
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("the loaded history boundary no longer exists")
+            })?,
+        None => (0, 0),
+    };
+    let mut visible_user_messages_seen = 0_usize;
+    let mut review_mode = false;
+    for (turn_index, turn) in turns.iter().enumerate().skip(start_turn) {
+        let hidden_nested_review_turn = turn_index > start_turn
+            && turns.get(turn_index - 1).is_some_and(|previous| {
+                let previous_items = if turn_index - 1 == start_turn {
+                    &previous.items[start_item..]
+                } else {
+                    &previous.items
+                };
+                is_hidden_nested_review_turn(previous, turn)
+                    && previous_items.iter().any(|item| {
+                        matches!(&item.payload, ThreadItemPayload::EnteredReviewMode { .. })
+                    })
+                    && previous_items.iter().any(|item| {
+                        matches!(&item.payload, ThreadItemPayload::ExitedReviewMode { .. })
+                    })
+            });
+        let first_item = if turn_index == start_turn {
+            start_item
+        } else {
+            0
+        };
+        // Clipped items affect whether an input is a steer, but were never displayed and
+        // therefore must not change the transcript's review visibility or prompt ordinals.
+        let mut user_messages_in_turn = turn
+            .item_payloads()
+            .take(first_item)
+            .filter(|item| matches!(item, ThreadItemPayload::UserMessage { .. }))
+            .count();
+        for item in turn.item_payloads().skip(first_item) {
+            let content = match item {
+                ThreadItemPayload::EnteredReviewMode { .. } => {
+                    review_mode = true;
+                    continue;
+                }
+                ThreadItemPayload::ExitedReviewMode { .. } => {
+                    review_mode = false;
+                    continue;
+                }
+                ThreadItemPayload::UserMessage { content, .. } => content,
+                _ => continue,
+            };
+            let is_steer = user_messages_in_turn > 0;
+            user_messages_in_turn = user_messages_in_turn.saturating_add(/*rhs*/ 1);
+            if review_mode {
+                continue;
+            }
+
+            let display = ChatWidget::user_message_display_from_inputs(content);
+            if hidden_nested_review_turn {
+                continue;
+            }
+            if sanitize_user_text((&display.message).into())
+                .trim()
+                .is_empty()
+                && display.text_elements.is_empty()
+                && display.local_images.is_empty()
+                && display.remote_image_urls.is_empty()
+            {
+                continue;
+            }
+            if visible_user_messages_seen != nth_user_message {
+                visible_user_messages_seen =
+                    visible_user_messages_seen.saturating_add(/*rhs*/ 1);
+                continue;
+            }
+
+            if is_steer {
+                bail!("the selected prompt is a steer and cannot be edited independently");
+            }
+            if matches!(turn.status, TurnStatus::InProgress) {
+                bail!("the selected prompt belongs to a turn that is still in progress");
+            }
+
+            let selected_local_images = prompt.local_images.iter().map(|image| &image.path);
+            if prompt.text != display.message
+                || prompt.text_elements != display.text_elements
+                || prompt.remote_image_urls != display.remote_image_urls
+                || !selected_local_images.eq(display.local_images.iter())
+            {
+                bail!("the selected transcript prompt no longer matches the persisted thread");
+            }
+            prompt.mention_bindings = mention_bindings_from_user_inputs(content, &display.message);
+
+            return Ok(turn.id.clone());
+        }
     }
 
-    if let Some(cut_idx) = nth_user_position(transcript_cells, nth_user_message) {
-        let original_len = transcript_cells.len();
-        transcript_cells.truncate(cut_idx);
-        return transcript_cells.len() != original_len;
-    }
-    false
+    bail!("the selected prompt was not found in the persisted thread")
 }
 
-pub(crate) fn trim_transcript_cells_drop_last_n_user_turns(
-    transcript_cells: &mut Vec<Arc<dyn crate::history_cell::HistoryCell>>,
-    num_turns: u32,
-) -> bool {
-    if num_turns == 0 {
+/// Returns whether a turn is the reconstructed inline-review child with duplicated prompt inputs.
+pub(crate) fn is_hidden_nested_review_turn(previous: &Turn, turn: &Turn) -> bool {
+    if previous.status != TurnStatus::Completed
+        || turn.status != TurnStatus::Interrupted
+        || turn.completed_at.is_some()
+        || !previous
+            .item_payloads()
+            .any(|item| matches!(item, ThreadItemPayload::EnteredReviewMode { .. }))
+        || !previous
+            .item_payloads()
+            .any(|item| matches!(item, ThreadItemPayload::ExitedReviewMode { .. }))
+    {
         return false;
     }
 
-    let user_positions: Vec<usize> = user_positions_iter(transcript_cells).collect();
-    let Some(&first_user_idx) = user_positions.first() else {
-        return false;
-    };
-
-    let turns_from_end = usize::try_from(num_turns).unwrap_or(usize::MAX);
-    let cut_idx = if turns_from_end >= user_positions.len() {
-        first_user_idx
-    } else {
-        user_positions[user_positions.len() - turns_from_end]
-    };
-    let original_len = transcript_cells.len();
-    transcript_cells.truncate(cut_idx);
-    transcript_cells.len() != original_len
+    let mut user_messages = turn.item_payloads().filter_map(|item| match item {
+        ThreadItemPayload::UserMessage { content, .. } => Some(content),
+        _ => None,
+    });
+    matches!(
+        (
+            user_messages.next(),
+            user_messages.next(),
+            user_messages.next(),
+        ),
+        (Some(first), Some(second), None) if first == second
+    )
 }
 
 pub(crate) fn user_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize {
@@ -665,7 +716,7 @@ fn has_backtrack_target(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> 
     user_count(cells) > 0
 }
 
-fn nth_user_position(
+pub(crate) fn nth_user_position(
     cells: &[Arc<dyn crate::history_cell::HistoryCell>],
     nth: usize,
 ) -> Option<usize> {
@@ -678,7 +729,6 @@ fn user_positions_iter(
     cells: &[Arc<dyn crate::history_cell::HistoryCell>],
 ) -> impl Iterator<Item = usize> + '_ {
     let session_start_type = TypeId::of::<SessionInfoCell>();
-    let user_type = TypeId::of::<UserHistoryCell>();
     let type_of = |cell: &Arc<dyn crate::history_cell::HistoryCell>| cell.as_any().type_id();
 
     let start = cells
@@ -690,7 +740,10 @@ fn user_positions_iter(
         .iter()
         .enumerate()
         .skip(start)
-        .filter_map(move |(idx, cell)| (type_of(cell) == user_type).then_some(idx))
+        .filter_map(|(idx, cell)| {
+            let user = cell.as_any().downcast_ref::<UserHistoryCell>()?;
+            user.has_visible_content().then_some(idx)
+        })
 }
 
 #[cfg(test)]
@@ -724,10 +777,14 @@ fn agent_group_positions_iter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bottom_pane::MentionBinding;
     use crate::history_cell::AgentMessageCell;
     use crate::history_cell::HistoryCell;
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::UserInput;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -743,192 +800,388 @@ mod tests {
     }
 
     #[test]
-    fn trim_transcript_for_first_user_drops_user_and_newer_cells() {
-        let mut cells: Vec<Arc<dyn HistoryCell>> = vec![
-            Arc::new(UserHistoryCell {
-                message: "first user".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-                remote_image_urls: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("assistant")],
-                /*is_first_line*/ true,
-            )) as Arc<dyn HistoryCell>,
-        ];
-        trim_transcript_cells_to_nth_user(&mut cells, /*nth_user_message*/ 0);
+    fn pending_select_exit_key_ends_on_completion_or_release() {
+        let key = crate::key_hint::KeyBinding::from_event(KeyCode::Enter.into());
+        let mut state = BacktrackState {
+            pending_select_exit_key: Some((7, key)),
+            ..BacktrackState::default()
+        };
 
-        assert!(cells.is_empty());
+        assert_eq!(
+            state.finish_pending_select_exit_key(
+                /*completed_id*/ 7, /*select_mode_closed*/ false,
+            ),
+            None
+        );
+        assert_eq!(state.pending_select_exit_key, None);
+        state.pending_select_exit_key = Some((8, key));
+        state.observe_pending_select_exit_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(state.pending_select_exit_key, None);
+        state.pending_select_exit_key = Some((9, key));
+        assert_eq!(
+            state.finish_pending_select_exit_key(
+                /*completed_id*/ 9, /*select_mode_closed*/ true,
+            ),
+            Some(key)
+        );
+        assert_eq!(state.pending_select_exit_key, None);
+    }
+
+    fn turn(turn_id: &str, status: TurnStatus, user_messages: usize) -> Turn {
+        Turn {
+            id: turn_id.to_string(),
+            root_turn_id: None,
+            items: (0..user_messages)
+                .map(|index| ThreadItemPayload::UserMessage {
+                    id: format!("user-{index}"),
+                    client_id: None,
+                    content: vec![UserInput::Text {
+                        text: format!("{turn_id}-prompt-{index}"),
+                        text_elements: Vec::new(),
+                    }],
+                })
+                .map(ThreadItem::untimed)
+                .collect(),
+            items_view: codex_app_server_protocol::TurnItemsView::Full,
+            status,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        }
+    }
+
+    fn prompt(text: &str) -> UserMessage {
+        UserMessage {
+            text: text.to_string(),
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: Vec::new(),
+            mention_bindings: Vec::new(),
+        }
     }
 
     #[test]
-    fn trim_transcript_preserves_cells_before_selected_user() {
-        let mut cells: Vec<Arc<dyn HistoryCell>> = vec![
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("intro")],
-                /*is_first_line*/ true,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(UserHistoryCell {
-                message: "first".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-                remote_image_urls: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("after")],
-                /*is_first_line*/ false,
-            )) as Arc<dyn HistoryCell>,
+    fn backtrack_revert_before_turn_id_resolves_first_and_later_prompts() {
+        let mut hidden = turn("hidden", TurnStatus::Completed, /*user_messages*/ 1);
+        let ThreadItemPayload::UserMessage { content, .. } = &mut hidden.items[0].payload else {
+            unreachable!()
+        };
+        *content = vec![UserInput::Text {
+            text: "\u{0007}".into(),
+            text_elements: Vec::new(),
+        }];
+        let turns = vec![
+            hidden,
+            turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
+            turn(
+                "turn-compaction",
+                TurnStatus::Completed,
+                /*user_messages*/ 0,
+            ),
+            turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1),
         ];
-        trim_transcript_cells_to_nth_user(&mut cells, /*nth_user_message*/ 0);
 
-        assert_eq!(cells.len(), 1);
-        let agent = cells[0]
-            .as_any()
-            .downcast_ref::<AgentMessageCell>()
-            .expect("agent cell");
-        let agent_lines = agent.display_lines(u16::MAX);
-        assert_eq!(agent_lines.len(), 1);
-        let intro_text: String = agent_lines[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(intro_text, "• intro");
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 0,
+                &mut prompt("turn-1-prompt-0"),
+            )
+            .expect("first prompt should resolve"),
+            "turn-1".to_string()
+        );
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 1,
+                &mut prompt("turn-2-prompt-0"),
+            )
+            .expect("later prompt should resolve"),
+            "turn-2".to_string()
+        );
     }
 
     #[test]
-    fn trim_transcript_for_later_user_keeps_prior_history() {
-        let mut cells: Vec<Arc<dyn HistoryCell>> = vec![
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("intro")],
-                /*is_first_line*/ true,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(UserHistoryCell {
-                message: "first".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-                remote_image_urls: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("between")],
-                /*is_first_line*/ false,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(UserHistoryCell {
-                message: "second".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-                remote_image_urls: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("tail")],
-                /*is_first_line*/ false,
-            )) as Arc<dyn HistoryCell>,
-        ];
-        trim_transcript_cells_to_nth_user(&mut cells, /*nth_user_message*/ 1);
+    fn backtrack_revert_before_turn_id_rejects_mid_turn_steers() {
+        let turns = vec![turn(
+            "turn-1",
+            TurnStatus::Completed,
+            /*user_messages*/ 2,
+        )];
 
-        assert_eq!(cells.len(), 3);
-        let agent_intro = cells[0]
-            .as_any()
-            .downcast_ref::<AgentMessageCell>()
-            .expect("intro agent");
-        let intro_lines = agent_intro.display_lines(u16::MAX);
-        let intro_text: String = intro_lines[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(intro_text, "• intro");
+        let error = backtrack_revert_before_turn_id(
+            &turns,
+            /*start_item*/ None,
+            /*nth_user_message*/ 1,
+            &mut prompt("turn-1-prompt-1"),
+        )
+        .expect_err("a steer cannot be edited independently");
 
-        let user_first = cells[1]
-            .as_any()
-            .downcast_ref::<UserHistoryCell>()
-            .expect("first user");
-        assert_eq!(user_first.message, "first");
-
-        let agent_between = cells[2]
-            .as_any()
-            .downcast_ref::<AgentMessageCell>()
-            .expect("between agent");
-        let between_lines = agent_between.display_lines(u16::MAX);
-        let between_text: String = between_lines[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(between_text, "  between");
+        assert_eq!(
+            error.to_string(),
+            "the selected prompt is a steer and cannot be edited independently"
+        );
     }
 
     #[test]
-    fn trim_drop_last_n_user_turns_applies_rollback_semantics() {
-        let mut cells: Vec<Arc<dyn HistoryCell>> = vec![
-            Arc::new(UserHistoryCell {
-                message: "first".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-                remote_image_urls: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("after first")],
-                /*is_first_line*/ false,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(UserHistoryCell {
-                message: "second".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-                remote_image_urls: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("after second")],
-                /*is_first_line*/ false,
-            )) as Arc<dyn HistoryCell>,
-        ];
-
-        let changed =
-            trim_transcript_cells_drop_last_n_user_turns(&mut cells, /*num_turns*/ 1);
-
-        assert!(changed);
-        assert_eq!(cells.len(), 2);
-        let first_user = cells[0]
-            .as_any()
-            .downcast_ref::<UserHistoryCell>()
-            .expect("first user");
-        assert_eq!(first_user.message, "first");
+    fn backtrack_revert_partial_history_does_not_make_a_steer_editable() {
+        let turns = vec![turn(
+            "turn-1",
+            TurnStatus::Completed,
+            /*user_messages*/ 2,
+        )];
+        let start_item = (turns[0].id.clone(), turns[0].items[1].id().to_string());
+        let error = backtrack_revert_before_turn_id(
+            &turns,
+            Some(&start_item),
+            /*nth_user_message*/ 0,
+            &mut prompt("turn-1-prompt-1"),
+        )
+        .expect_err("the loaded page starts mid-turn");
+        assert_eq!(
+            error.to_string(),
+            "the selected prompt is a steer and cannot be edited independently"
+        );
     }
 
     #[test]
-    fn trim_drop_last_n_user_turns_allows_overflow() {
-        let mut cells: Vec<Arc<dyn HistoryCell>> = vec![
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("intro")],
-                /*is_first_line*/ true,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(UserHistoryCell {
-                message: "first".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-                remote_image_urls: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("after")],
-                /*is_first_line*/ false,
-            )) as Arc<dyn HistoryCell>,
+    fn backtrack_revert_before_turn_id_rejects_in_progress_and_missing_prompts() {
+        let turns = vec![turn(
+            "turn-1",
+            TurnStatus::InProgress,
+            /*user_messages*/ 1,
+        )];
+
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 0,
+                &mut prompt("turn-1-prompt-0"),
+            )
+            .expect_err("in-progress prompt cannot be edited")
+            .to_string(),
+            "the selected prompt belongs to a turn that is still in progress"
+        );
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 1,
+                &mut prompt("missing prompt"),
+            )
+            .expect_err("missing prompt cannot be edited")
+            .to_string(),
+            "the selected prompt was not found in the persisted thread"
+        );
+
+        let completed_turns = vec![turn(
+            "turn-1",
+            TurnStatus::Completed,
+            /*user_messages*/ 1,
+        )];
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &completed_turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 0,
+                &mut prompt("different prompt"),
+            )
+            .expect_err("a stale transcript prompt cannot be edited")
+            .to_string(),
+            "the selected transcript prompt no longer matches the persisted thread"
+        );
+    }
+
+    #[test]
+    fn backtrack_revert_before_turn_id_skips_hidden_review_prompts() {
+        let mut review_turn = turn(
+            "turn-review",
+            TurnStatus::Completed,
+            /*user_messages*/ 1,
+        );
+        review_turn.items.insert(
+            /*index*/ 0,
+            ThreadItem::untimed(ThreadItemPayload::EnteredReviewMode {
+                id: "review-start".to_string(),
+                review: "changes against main".to_string(),
+            }),
+        );
+        review_turn
+            .items
+            .push(ThreadItem::untimed(ThreadItemPayload::ExitedReviewMode {
+                id: "review-end".to_string(),
+                review: "review complete".to_string(),
+            }));
+        let turns = vec![
+            turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
+            review_turn,
+            turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1),
         ];
 
-        let changed = trim_transcript_cells_drop_last_n_user_turns(&mut cells, u32::MAX);
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 1,
+                &mut prompt("turn-2-prompt-0"),
+            )
+            .expect("the visible prompt after review should resolve"),
+            "turn-2".to_string()
+        );
+        // This loaded page starts after the review marker, so its review prompt is visible.
+        let start_item = (turns[1].id.clone(), turns[1].items[1].id().to_string());
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                Some(&start_item),
+                /*nth_user_message*/ 1,
+                &mut prompt("turn-2-prompt-0"),
+            )
+            .expect("ordinal must match the clipped transcript"),
+            "turn-2"
+        );
+    }
 
-        assert!(changed);
-        assert_eq!(cells.len(), 1);
-        let intro = cells[0]
-            .as_any()
-            .downcast_ref::<AgentMessageCell>()
-            .expect("intro agent");
-        let intro_lines = intro.display_lines(u16::MAX);
-        let intro_text: String = intro_lines[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(intro_text, "• intro");
+    #[test]
+    fn backtrack_revert_before_turn_id_skips_hidden_nested_review_prompts() {
+        let review_hint = "current changes";
+        let review_prompt =
+            "Review the current code changes (staged, unstaged, and untracked files).";
+        let review_turn = Turn {
+            items: vec![
+                ThreadItem::untimed(ThreadItemPayload::EnteredReviewMode {
+                    id: "review-start".to_string(),
+                    review: review_hint.to_string(),
+                }),
+                ThreadItem::untimed(ThreadItemPayload::ExitedReviewMode {
+                    id: "review-end".to_string(),
+                    review: "review complete".to_string(),
+                }),
+            ],
+            ..turn(
+                "turn-review",
+                TurnStatus::Completed,
+                /*user_messages*/ 0,
+            )
+        };
+        let review_child_turn = Turn {
+            items: (0..2)
+                .map(|index| ThreadItemPayload::UserMessage {
+                    id: format!("review-prompt-{index}"),
+                    client_id: None,
+                    content: vec![UserInput::Text {
+                        text: review_prompt.to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                })
+                .map(ThreadItem::untimed)
+                .collect(),
+            ..turn(
+                "turn-review-child",
+                TurnStatus::Interrupted,
+                /*user_messages*/ 0,
+            )
+        };
+        let interrupted_steered_turn = Turn {
+            items: review_child_turn.items.clone(),
+            completed_at: Some(1),
+            ..turn(
+                "turn-interrupted-steer",
+                TurnStatus::Interrupted,
+                /*user_messages*/ 0,
+            )
+        };
+        assert!(!is_hidden_nested_review_turn(
+            &review_turn,
+            &interrupted_steered_turn,
+        ));
+        let turns = vec![
+            review_turn,
+            review_child_turn,
+            turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1),
+        ];
+
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 0,
+                &mut prompt("turn-2-prompt-0"),
+            )
+            .expect("the visible prompt after a nested review should resolve"),
+            "turn-2".to_string()
+        );
+    }
+
+    #[test]
+    fn backtrack_revert_before_turn_id_restores_canonical_mention_bindings() {
+        let mut selected_turn = turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1);
+        selected_turn.items = vec![ThreadItem::untimed(ThreadItemPayload::UserMessage {
+            id: "selected-prompt".to_string(),
+            client_id: None,
+            content: vec![
+                UserInput::Text {
+                    text: "use $skill @sample $google-calendar".to_string(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::Skill {
+                    name: "skill".to_string(),
+                    path: PathBuf::from("/tmp/skills/skill/SKILL.md"),
+                },
+                UserInput::Mention {
+                    name: "Sample Plugin".to_string(),
+                    path: "plugin://sample@test".to_string(),
+                },
+                UserInput::Mention {
+                    name: "Google Calendar".to_string(),
+                    path: "app://google_calendar".to_string(),
+                },
+            ],
+        })];
+        let turns = vec![
+            turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
+            selected_turn,
+        ];
+        let mut selected_prompt = prompt("use $skill @sample $google-calendar");
+
+        assert_eq!(
+            backtrack_revert_before_turn_id(
+                &turns,
+                /*start_item*/ None,
+                /*nth_user_message*/ 1,
+                &mut selected_prompt,
+            )
+            .expect("the selected prompt should resolve"),
+            "turn-2".to_string()
+        );
+        assert_eq!(
+            selected_prompt.mention_bindings,
+            vec![
+                MentionBinding {
+                    sigil: '$',
+                    mention: "skill".to_string(),
+                    path: "/tmp/skills/skill/SKILL.md".to_string(),
+                },
+                MentionBinding {
+                    sigil: '@',
+                    mention: "sample".to_string(),
+                    path: "plugin://sample@test".to_string(),
+                },
+                MentionBinding {
+                    sigil: '$',
+                    mention: "google-calendar".to_string(),
+                    path: "app://google_calendar".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -967,6 +1220,7 @@ mod tests {
         assert!(!has_backtrack_target(&cells));
 
         cells.push(Arc::new(UserHistoryCell {
+            presentation: Default::default(),
             message: "hello".to_string(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),

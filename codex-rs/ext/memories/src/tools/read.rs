@@ -38,13 +38,16 @@ pub(super) struct ReadTool<B> {
     pub(super) metrics_client: Option<MetricsClient>,
 }
 
-#[async_trait::async_trait]
-impl<B> ToolExecutor<ToolCall> for ReadTool<B>
+impl<'call, B> ToolExecutor<ToolCall<'call>> for ReadTool<B>
 where
     B: MemoriesBackend,
 {
     fn tool_name(&self) -> ToolName {
         memory_tool_name(READ_TOOL_NAME)
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
     fn spec(&self) -> ToolSpec {
@@ -54,9 +57,21 @@ where
         )
     }
 
-    async fn handle(
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        Box::pin(self.handle_call(call))
+    }
+}
+
+impl<B> ReadTool<B>
+where
+    B: MemoriesBackend,
+{
+    async fn handle_call(
         &self,
-        call: ToolCall,
+        call: ToolCall<'_>,
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
     {
         let backend = self.backend.clone();

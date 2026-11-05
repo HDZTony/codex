@@ -1,19 +1,19 @@
 use super::AppSummary;
 use super::HookEventName;
-use super::HookHandlerType;
 use super::HookSource;
 use super::HookTrustStatus;
+use crate::JsonSchema;
+use crate::TS;
 use codex_protocol::protocol::SkillDependencies as CoreSkillDependencies;
 use codex_protocol::protocol::SkillInterface as CoreSkillInterface;
 use codex_protocol::protocol::SkillMetadata as CoreSkillMetadata;
 use codex_protocol::protocol::SkillScope as CoreSkillScope;
 use codex_protocol::protocol::SkillToolDependency as CoreSkillToolDependency;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
+use codex_utils_path_uri::LegacyAppPathString;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -47,13 +47,16 @@ pub struct SkillsExtraRootsSetParams {
 #[ts(export_to = "v2/")]
 pub struct SkillsExtraRootsSetResponse {}
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct HooksListParams {
-    /// When empty, defaults to the current session working directory.
+    /// Working directories to inspect when no thread is specified. An empty list uses the session cwd.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cwds: Vec<PathBuf>,
+    /// List a loaded thread's hooks, including its selected environments. Omit `cwds` in this mode.
+    #[ts(optional = nullable)]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -135,6 +138,9 @@ pub struct PluginListParams {
     /// the default remote catalog when enabled by feature flag.
     #[ts(optional = nullable)]
     pub marketplace_kinds: Option<Vec<PluginListMarketplaceKind>>,
+    /// Whether the client requests a fresh remote plugin catalog fetch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_refetch: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -165,6 +171,9 @@ pub enum PluginListMarketplaceKind {
     #[serde(rename = "shared-with-me")]
     #[ts(rename = "shared-with-me")]
     SharedWithMe,
+    #[serde(rename = "created-by-me-remote")]
+    #[ts(rename = "created-by-me-remote")]
+    CreatedByMeRemote,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -185,6 +194,50 @@ pub struct PluginInstalledResponse {
     pub marketplaces: Vec<PluginMarketplaceEntry>,
     #[serde(default)]
     pub marketplace_load_errors: Vec<MarketplaceLoadErrorInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PluginReconcileParams {
+    /// Optional client-provided reason recorded with the reconciliation attempt.
+    #[ts(optional = nullable)]
+    pub reason: Option<String>,
+}
+
+/// Bundle and installed-state changes observed by this pass, not a runtime-readiness
+/// acknowledgement or a cumulative diff since the client's last request. Other metadata-only
+/// changes are not listed.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PluginReconcileResponse {
+    /// Plugins affected by bundle changes, enablement changes, or removals.
+    /// Installed-state changes compare against the previous cached snapshot, including
+    /// cached reinstalls. Removal hints survive cache cleanup failures; unchanged plugins are omitted.
+    pub changed_plugins: Vec<PluginReconcileChangedPlugin>,
+    /// Backend remote plugin IDs whose bundle or identity update failed.
+    pub failed_remote_plugin_ids: Vec<String>,
+    /// Subset of failures for which the requested bundle could not be materialized.
+    /// A previously cached version may still be available.
+    pub failed_materialization_remote_plugin_ids: Vec<String>,
+}
+
+/// Runtime categories affected by this change, not just capabilities currently present.
+/// Flags describe declarations before runtime policy filtering. Updates OR the old and new
+/// bundle flags; enablement changes and cached reinstalls use the cached bundle; removals retain
+/// the old bundle's flags.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PluginReconcileChangedPlugin {
+    /// Local plugin ID (`name@marketplace`), matching `PluginSummary.id`.
+    pub id: String,
+    pub has_mcps: bool,
+    pub has_apps: bool,
+    pub has_hooks: bool,
+    /// Whether either bundle declares skill roots; not a validated inventory of enabled skills.
+    pub has_skills: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -248,6 +301,8 @@ pub struct PluginShareSaveParams {
 pub struct PluginShareSaveResponse {
     pub remote_plugin_id: String,
     pub share_url: String,
+    #[serde(default)]
+    pub can_publish_to_workspace: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -342,6 +397,9 @@ pub enum PluginShareUpdateDiscoverability {
     #[serde(rename = "PRIVATE")]
     #[ts(rename = "PRIVATE")]
     Private,
+    #[serde(rename = "LISTED")]
+    #[ts(rename = "LISTED")]
+    Listed,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -423,9 +481,11 @@ pub struct SkillMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub dependencies: Option<SkillDependencies>,
-    pub path: AbsolutePathBuf,
+    pub path: LegacyAppPathString,
     pub scope: SkillScope,
     pub enabled: bool,
+    /// Owning plugin ID, matching `PluginSummary.id`, when known.
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -440,6 +500,10 @@ pub struct SkillInterface {
     pub icon_small: Option<AbsolutePathBuf>,
     #[ts(optional)]
     pub icon_large: Option<AbsolutePathBuf>,
+    /// Remote small icon URL from the plugin catalog.
+    pub icon_small_url: Option<String>,
+    /// Remote large icon URL from the plugin catalog.
+    pub icon_large_url: Option<String>,
     #[ts(optional)]
     pub brand_color: Option<String>,
     #[ts(optional)]
@@ -502,20 +566,42 @@ pub struct HooksListEntry {
     pub errors: Vec<HookErrorInfo>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "handlerType", rename_all = "camelCase")]
+#[ts(tag = "handlerType", export_to = "v2/")]
+pub enum HookHandlerMetadata {
+    Command {
+        command: String,
+        #[serde(default)]
+        r#async: bool,
+    },
+    McpTool {
+        server: String,
+        tool: String,
+    },
+    Prompt {},
+    Agent {},
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct HookMetadata {
     pub key: String,
     pub event_name: HookEventName,
-    pub handler_type: HookHandlerType,
+    #[serde(flatten)]
+    pub handler: HookHandlerMetadata,
     pub matcher: Option<String>,
-    pub command: Option<String>,
     pub timeout_sec: u64,
     pub status_message: Option<String>,
+    /// Configured `additionalContext` spill threshold.
+    /// `null` uses 2,500 tokens; `0` disables spilling.
+    pub additional_context_limit: Option<usize>,
     pub source_path: AbsolutePathBuf,
     pub source: HookSource,
     pub plugin_id: Option<String>,
+    /// The owning execution environment, if this hook came from its requirements.
+    pub environment_id: Option<String>,
     pub display_order: i64,
     pub enabled: bool,
     pub is_managed: bool,
@@ -566,6 +652,17 @@ pub enum PluginInstallPolicy {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[ts(export_to = "v2/")]
+pub enum PluginInstallPolicySource {
+    #[serde(rename = "WORKSPACE_SETTING")]
+    #[ts(rename = "WORKSPACE_SETTING")]
+    WorkspaceSetting,
+    #[serde(rename = "IMPLICIT_CANONICAL_APP")]
+    #[ts(rename = "IMPLICIT_CANONICAL_APP")]
+    ImplicitCanonicalApp,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[ts(export_to = "v2/")]
 pub enum PluginAuthPolicy {
     #[serde(rename = "ON_INSTALL")]
     #[ts(rename = "ON_INSTALL")]
@@ -590,6 +687,17 @@ pub enum PluginAvailability {
     DisabledByAdmin,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/", rename_all = "snake_case")]
+pub enum PluginDisabledReason {
+    DisabledByAdmin,
+    PlanNotEligible,
+    RequiredAppUnavailable,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -597,6 +705,9 @@ pub struct PluginSummary {
     pub id: String,
     /// Backend remote plugin identifier when available.
     pub remote_plugin_id: Option<String>,
+    /// Version advertised by the remote marketplace backend when available.
+    #[serde(default)]
+    pub version: Option<String>,
     /// Version of the locally materialized plugin package when available.
     #[serde(default)]
     pub local_version: Option<String>,
@@ -605,12 +716,25 @@ pub struct PluginSummary {
     pub share_context: Option<PluginShareContext>,
     pub source: PluginSource,
     pub installed: bool,
+    /// Unix timestamp in seconds when the remote plugin was installed, when available.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub installed_at: Option<i64>,
     pub enabled: bool,
     pub install_policy: PluginInstallPolicy,
+    pub install_policy_source: Option<PluginInstallPolicySource>,
+    #[serde(default)]
+    pub must_show_installation_interstitial: Option<bool>,
     pub auth_policy: PluginAuthPolicy,
     /// Availability state for installing and using the plugin.
     #[serde(default)]
     pub availability: PluginAvailability,
+    /// Why the remote plugin is unavailable, when provided by plugin-service.
+    #[serde(default)]
+    pub disabled_reason: Option<PluginDisabledReason>,
+    /// Raw plugin-service plan identifiers eligible to install the plugin.
+    #[serde(default)]
+    pub eligible_plan_types: Option<Vec<String>>,
     pub interface: Option<PluginInterface>,
     #[serde(default)]
     pub keywords: Vec<String>,
@@ -629,6 +753,8 @@ pub struct PluginShareContext {
     pub creator_account_user_id: Option<String>,
     pub creator_name: Option<String>,
     pub share_principals: Option<Vec<PluginSharePrincipal>>,
+    #[serde(default)]
+    pub can_publish_to_workspace: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -638,11 +764,88 @@ pub struct PluginDetail {
     pub marketplace_name: String,
     pub marketplace_path: Option<AbsolutePathBuf>,
     pub summary: PluginSummary,
+    pub share_url: Option<String>,
     pub description: Option<String>,
     pub skills: Vec<SkillSummary>,
+    /// The declared onboarding skill, when the plugin and visible skill are enabled.
+    #[serde(default)]
+    pub onboarding_skill: Option<SkillSummary>,
     pub hooks: Vec<PluginHookSummary>,
     pub apps: Vec<AppSummary>,
+    pub app_templates: Vec<AppTemplateSummary>,
     pub mcp_servers: Vec<String>,
+    pub scheduled_tasks: Option<Vec<ScheduledTaskSummary>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ScheduledTaskSummary {
+    pub key: String,
+    pub name: String,
+    pub prompt: String,
+    pub schedule: ScheduledTaskSchedule,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type")]
+#[ts(export_to = "v2/")]
+pub enum ScheduledTaskSchedule {
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Hourly {
+        interval_hours: u32,
+        days: Option<Vec<ScheduledTaskWeekday>>,
+    },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Daily { time: String },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Weekdays { time: String },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Weekly {
+        days: Vec<ScheduledTaskWeekday>,
+        time: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[ts(export_to = "v2/")]
+pub enum ScheduledTaskWeekday {
+    Mo,
+    Tu,
+    We,
+    Th,
+    Fr,
+    Sa,
+    Su,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[ts(export_to = "v2/")]
+pub enum AppTemplateUnavailableReason {
+    NotConfiguredForWorkspace,
+    NoActiveWorkspace,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AppTemplateSummary {
+    pub template_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub canonical_connector_id: Option<String>,
+    pub logo_url: Option<String>,
+    pub logo_url_dark: Option<String>,
+    pub materialized_app_ids: Vec<String>,
+    pub reason: Option<AppTemplateUnavailableReason>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -661,7 +864,7 @@ pub struct SkillSummary {
     pub description: String,
     pub short_description: Option<String>,
     pub interface: Option<SkillInterface>,
-    pub path: Option<AbsolutePathBuf>,
+    pub path: Option<LegacyAppPathString>,
     pub enabled: bool,
 }
 
@@ -688,8 +891,12 @@ pub struct PluginInterface {
     pub composer_icon_url: Option<String>,
     /// Local logo path, resolved from the installed plugin package.
     pub logo: Option<AbsolutePathBuf>,
+    /// Local dark-mode logo path, resolved from the installed plugin package.
+    pub logo_dark: Option<AbsolutePathBuf>,
     /// Remote logo URL from the plugin catalog.
     pub logo_url: Option<String>,
+    /// Remote dark-mode logo URL from the plugin catalog.
+    pub logo_url_dark: Option<String>,
     /// Local screenshot paths, resolved from the installed plugin package.
     pub screenshots: Vec<AbsolutePathBuf>,
     /// Remote screenshot URLs from the plugin catalog.
@@ -711,6 +918,15 @@ pub enum PluginSource {
         path: Option<String>,
         ref_name: Option<String>,
         sha: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Npm {
+        package: String,
+        /// Optional npm version or version range.
+        version: Option<String>,
+        /// Optional HTTPS registry URL. Authentication stays in the user's npm config.
+        registry: Option<String>,
     },
     /// The plugin is available in the remote catalog. Download metadata is
     /// kept server-side and is not exposed through the app-server API.
@@ -745,6 +961,9 @@ pub struct PluginInstallParams {
     pub marketplace_path: Option<AbsolutePathBuf>,
     #[ts(optional = nullable)]
     pub remote_marketplace_name: Option<String>,
+    /// Client-generated identifier used to correlate one installation attempt.
+    #[ts(optional = nullable)]
+    pub install_attempt_id: Option<String>,
     pub plugin_name: String,
 }
 
@@ -776,9 +995,10 @@ impl From<CoreSkillMetadata> for SkillMetadata {
             short_description: value.short_description,
             interface: value.interface.map(SkillInterface::from),
             dependencies: value.dependencies.map(SkillDependencies::from),
-            path: value.path,
+            path: value.path.into(),
             scope: value.scope.into(),
             enabled: true,
+            plugin_id: None,
         }
     }
 }
@@ -792,6 +1012,8 @@ impl From<CoreSkillInterface> for SkillInterface {
             default_prompt: value.default_prompt,
             icon_small: value.icon_small,
             icon_large: value.icon_large,
+            icon_small_url: None,
+            icon_large_url: None,
         }
     }
 }

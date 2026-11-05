@@ -1,4 +1,4 @@
-use codex_app_server_protocol::AppInfo;
+use codex_connectors::AppInfo;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -93,6 +93,7 @@ pub fn filter_request_plugin_install_discoverable_tools_for_client(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoverablePluginInfo {
     pub id: String,
+    pub remote_plugin_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub has_skills: bool,
