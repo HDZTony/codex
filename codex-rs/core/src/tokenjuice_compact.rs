@@ -184,6 +184,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_item_small_output_passes_through() {
+        let dir = tempdir().unwrap();
+        let mut cfg = TokenjuiceConfig::default();
+        cfg.min_bytes_to_compress = 2048;
+        install_from_config(&cfg, dir.path(), None, 5.0);
+        let original = "hello";
+        let item = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("c1".into()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text(original.into()),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let out = compact_response_item(item, "shell").await;
+        match out {
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(output.text_content(), Some(original));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn small_output_passes_through() {
         let dir = tempdir().unwrap();
         let mut cfg = TokenjuiceConfig::default();

@@ -168,8 +168,11 @@ members = [
     "codex-experimental-api-macros",
     "plugin",
     "model-provider",
-    "wormhole-agentd",
 ]
+# wormhole-agentd is its own workspace. Codex pins blake3 =1.8.2 through
+# starlark, while Wormhole's iroh needs blake3 ^1.8.3. libsqlite3-sys also
+# cannot be linked twice. Keep the daemon out of this resolve.
+exclude = ["wormhole-agentd"]
 resolver = "2"
 
 [workspace.package]

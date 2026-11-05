@@ -1,32 +1,31 @@
+[workspace]
+
 [package]
 name = "wormhole-agentd"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "wormhole-agentd"
 path = "src/main.rs"
 
-[lints]
-workspace = true
-
 [dependencies]
 agent-core = { path = "../../../../crates/agent-core" }
 compute-core = { path = "../../../../crates/compute-core" }
-anyhow = { workspace = true }
-axum = { workspace = true, default-features = false, features = [
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = [
     "http1",
     "json",
     "query",
     "tokio",
 ] }
-base64 = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-tokio = { workspace = true, features = [
+base64 = "0.22.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = [
     "fs",
     "io-util",
     "macros",
@@ -34,4 +33,4 @@ tokio = { workspace = true, features = [
     "process",
     "rt-multi-thread",
 ] }
-uuid = { workspace = true, features = ["serde", "v7"] }
+uuid = { version = "1", features = ["serde", "v7"] }

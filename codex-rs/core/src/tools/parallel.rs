@@ -126,6 +126,7 @@ impl ToolCallRuntime {
         );
         async move {
             let result = future.await;
+            let tool_name = error_call.tool_name.to_string();
             let mut recorded_call =
                 recorded_call.filter(|(_, recording)| recording.strong_count() > 0);
             let mut response = match result {
@@ -150,7 +151,6 @@ impl ToolCallRuntime {
             }
             // Nested Code Mode calls return JSON to the cell. The model sees
             // that text only when it is part of this parent tool item.
-            let tool_name = error_call.tool_name.to_string();
             response.item = crate::tokenjuice_compact::compact_response_item(
                 response.item,
                 &tool_name,

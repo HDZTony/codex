@@ -1,6 +1,8 @@
 # wormhole-agentd
 
 `wormhole-agentd` is the Wormhole fork integration daemon for Codex.
+It is a separate Cargo workspace from `codex-rs` so Wormhole's iroh/blake3
+and SQLite crates are not unified with Codex.
 
 It exposes the local HTTP contract expected by Wormhole Desktop:
 
