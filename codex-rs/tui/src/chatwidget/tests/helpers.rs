@@ -926,6 +926,7 @@ pub(super) fn replay_agent_message(
 ) {
     chat.replay_thread_item(
         AppServerThreadItemPayload::AgentMessage {
+            moderation: None,
             id: item_id.to_string(),
             text: text.into(),
             phase: Some(MessagePhase::FinalAnswer),
@@ -1082,6 +1083,7 @@ pub(super) fn complete_assistant_message(
             chat.thread_id.map(|id| id.to_string()).unwrap_or_default(),
             "turn-1".to_string(),
             AppServerThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: item_id.to_string(),
                 text: text.to_string(),
                 phase,
@@ -1099,6 +1101,8 @@ pub(super) fn complete_assistant_message(
 pub(super) fn pending_steer(text: &str) -> PendingSteer {
     PendingSteer {
         client_id: "test-submission".to_string(),
+        admitted_turn_id: None,
+        optimistically_rendered: false,
         user_message: UserMessage::from(text),
         history_record: UserMessageHistoryRecord::UserMessageText,
         source: UserMessageSource::Prompt,

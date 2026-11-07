@@ -3,11 +3,14 @@
 
 use crate::AppServerEvent;
 use crate::RequestResult;
+use crate::TypedRequestError;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
+use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnStartParams;
 use std::io;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -16,6 +19,13 @@ use tokio::sync::oneshot;
 /// Unsupported operations must return an explicit error; they must not claim success.
 pub enum CloudOperation {
     Request(Box<ClientRequest>),
+    /// Host project metadata stays on the private transport, outside the app-server wire.
+    StartProjectThread {
+        request_id: RequestId,
+        params: Box<codex_app_server_protocol::ThreadStartParams>,
+        project: codex_cloud_client::ProjectEnvironment,
+    },
+    SubmitUserMessage(Box<TurnStartParams>),
     Notify(ClientNotification),
     Resolve {
         request_id: RequestId,
@@ -26,6 +36,15 @@ pub enum CloudOperation {
         error: JSONRPCErrorError,
     },
     Shutdown,
+}
+
+/// One server-decided admission, not completion. A duplicate carries identity
+/// only; read history or observe the reply stream before inferring its status.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum CloudUserMessageReceipt {
+    Started(Turn),
+    Steered(Turn),
+    Duplicate { turn_id: Option<String> },
 }
 
 /// An operation and its single response. Dropping a caller does not undo admission;
@@ -111,6 +130,32 @@ impl CloudClient {
 }
 
 impl CloudRequestHandle {
+    pub(crate) async fn start_project_thread(
+        &self,
+        request_id: RequestId,
+        params: codex_app_server_protocol::ThreadStartParams,
+        project: codex_cloud_client::ProjectEnvironment,
+    ) -> io::Result<RequestResult> {
+        self.send(CloudOperation::StartProjectThread {
+            request_id,
+            params: Box::new(params),
+            project,
+        })
+        .await
+    }
+
+    /// Submit once with a stable message ID and saved thread settings. The server
+    /// starts or steers; an error can mean admission is unknown. Never auto-resend.
+    pub async fn submit_user_message(
+        &self,
+        params: TurnStartParams,
+    ) -> Result<CloudUserMessageReceipt, TypedRequestError> {
+        let response = self
+            .send(CloudOperation::SubmitUserMessage(Box::new(params)))
+            .await;
+        crate::decode_typed_response("cloud/submitUserMessage", response)
+    }
+
     async fn send(&self, operation: CloudOperation) -> io::Result<RequestResult> {
         let (response, result) = oneshot::channel();
         self.commands

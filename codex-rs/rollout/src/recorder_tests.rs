@@ -66,6 +66,7 @@ fn paginated_session_meta_item(thread_id: ThreadId, cwd: &Path) -> RolloutItem {
 
 fn agent_message_item(message: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        moderation: None,
         message: message.to_string(),
         phase: None,
         memory_citation: None,
@@ -726,6 +727,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     recorder
         .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
             AgentMessageEvent {
+                moderation: None,
                 message: "buffered-event".to_string(),
                 phase: None,
                 memory_citation: None,
@@ -993,6 +995,7 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
     recorder
         .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
             AgentMessageEvent {
+                moderation: None,
                 message: "buffered-before-persist".to_string(),
                 phase: None,
                 memory_citation: None,
@@ -1046,6 +1049,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
     };
     state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
         AgentMessageEvent {
+            moderation: None,
             message: "queued-after-writer-error".to_string(),
             phase: None,
             memory_citation: None,
@@ -2019,10 +2023,8 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
                 .expect("absolute latest cwd"),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy: SandboxPolicy::new_read_only_policy(),
-            permission_profile: None,
+            permission_profile: codex_protocol::models::PermissionProfile::read_only(),
             active_permission_profile: None,
-            file_system_sandbox_policy: None,
             model: "test-model".to_string(),
             comp_hash: None,
             collaboration_mode: None,

@@ -90,6 +90,7 @@ impl App {
                     | AppEvent::InsertHistoryCell(_)
                     | AppEvent::CommitRealtimeTranscriptHistory
                     | AppEvent::ParkSideCompanion { .. }
+                    | AppEvent::SideCreated { .. }
                     | AppEvent::SideReplayFinished(_)
                     | AppEvent::ResetTranscriptForThreadSwitch
                     | AppEvent::ResetTranscriptForThreadSwitchPreservingScreen
@@ -160,6 +161,19 @@ impl App {
 
         // Keep the picker check and model update in one event without recursively polling this
         // large dispatcher on the TUI thread's stack.
+        let event = match event {
+            AppEvent::ScopedModelPicker { backend, thread_id, event } => {
+                if backend != app_server.backend_id()
+                    || thread_id != self.chat_widget.thread_id()
+                    || self.chat_widget.model_catalog().provider_may_have_changed()
+                {
+                    return Ok(AppRunControl::Continue);
+                }
+                *event
+            }
+            event => event,
+        };
+
         let (event, sparkle_model) = match event {
             AppEvent::AstraSelectedFromModelPicker {
                 thread_id,
@@ -207,7 +221,8 @@ impl App {
             }
             AppEvent::CloseMisalignmentReview => self.chat_widget.show_misalignment_policy_precaution(),
             AppEvent::SkillsListLoaded { ref cwd, .. }
-                if cwds_differ(cwd, self.config.cwd.as_path()) =>
+                if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud
+                    || cwds_differ(cwd, self.config.cwd.as_path()) =>
             {
                 self.skill_load_warnings.startup_complete = true;
             }
@@ -1012,21 +1027,24 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
             }
-            AppEvent::SidePanePressAfterReplay { thread_id, area, mut press, draft_cursor } => {
+            AppEvent::SidePanePressAfterReplay { peer, thread_id, area, mut press, draft_cursor } => {
                 if self.pending_thread_switch_resets == 0
                     && self.current_displayed_thread_id() == Some(thread_id)
                     && self.conversation_focus_available(tui)
                 {
-                    // The native mouse handler draws at this reserved size before hit testing.
                     let size = tui.prepare_draw_size()?;
-                    if side_pane::layout(self, tui, size.into()).is_some_and(|panes| panes.focused == area) {
+                    if side_pane::layout(self, tui, size.into()).is_some_and(|panes| panes.passive_thread == peer) {
                         if let Some(cursor) = draft_cursor {
-                            // Focus can expand or scroll the editor. Replay at the same text position.
+                            // The editor can reflow during the slide. Keep the original text position.
                             self.chat_widget.set_composer_cursor(cursor);
-                            self.refresh_owned_transcript(tui)?;
+                        }
+                        self.refresh_owned_transcript(tui)?;
+                        if draft_cursor.is_some() {
                             let position = tui.terminal.last_known_cursor_pos;
                             press.column = position.x;
                             press.row = position.y;
+                        } else if !self.conversation_frame.side_pane().is_some_and(|panes| panes.focused == area) {
+                            return Ok(AppRunControl::Continue);
                         }
                         self.handle_owned_transcript_event(tui, app_server, &TuiEvent::Mouse(press))?;
                     }
@@ -1035,7 +1053,17 @@ impl App {
             AppEvent::ResetTranscriptForThreadSwitchPreservingScreen => {
                 self.reset_transcript_state_after_clear();
                 tui.clear_pending_history_lines();
-                tui.defer_thread_switch_clear();
+                let switched_tab = self.conversation_frame.chat_strip.is_some()
+                    && self.active_side_parent_thread_id().is_some()
+                    && self.conversation_frame.sidebar_input.is_some_and(|(_, painted_chat, _)| {
+                        painted_chat != self.current_displayed_thread_id()
+                    });
+                if self.conversation_frame.chooser_area().is_none()
+                    && self.chooser_focus().is_none()
+                    && !switched_tab
+                {
+                    tui.defer_thread_switch_clear();
+                }
                 self.pending_thread_switch_resets -= 1;
             }
             AppEvent::CommitRealtimeTranscriptHistory => {
@@ -1065,6 +1093,7 @@ impl App {
                 self.finish_initial_history_replay_buffer(tui);
             }
             AppEvent::ConsolidateAgentMessage {
+                interrupted_item,
                 source,
                 copy_source,
                 cwd,
@@ -1072,14 +1101,35 @@ impl App {
                 scrollback_reflow,
                 deferred_history_cell,
             } => {
+                let mut cell = history_cell::AgentMarkdownCell::new_with_inline_visualizations(source, &cwd, inline_visualization_context).with_copy_source(copy_source);
+                cell.interrupted_item = interrupted_item;
                 self.handle_consolidate_agent_message(
                     tui,
-                    history_cell::AgentMarkdownCell::new_with_inline_visualizations(source, &cwd, inline_visualization_context).with_copy_source(copy_source),
+                    cell,
                     scrollback_reflow,
                     deferred_history_cell,
                 )?;
                 self.chat_widget.note_stream_consolidation_completed();
                 self.insert_pending_usage_output_after_stream_shutdown(tui);
+            }
+            AppEvent::CorrectFlushedAgentMessage { item, cell } => {
+                let belongs_to_item = |cell: &Arc<dyn HistoryCell>| {
+                    cell.as_any().downcast_ref::<history_cell::AgentMarkdownCell>().is_some_and(|cell| cell.interrupted_item.as_ref() == Some(&item))
+                };
+                if let Some(index) = self.transcript_cells.iter().position(belongs_to_item) {
+                    // Keep the reply where it first appeared, with intervening tools in order.
+                    if self.transcript_cells.extract_if(index + 1.., |cell| belongs_to_item(cell)).count() > 0 {
+                        self.native_history.retain(&self.transcript_cells);
+                        self.transcript_view.restart_search();
+                        self.transcript_view.history_loaded(&self.transcript_cells, 0..0);
+                        if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
+                            overlay.replace_cells(self.transcript_cells.clone());
+                        }
+                    }
+                    self.replace_agent_message(tui, index..index + 1, cell, crate::app_event::ConsolidationScrollbackReflow::Required)?;
+                } else {
+                    self.insert_history_cell(tui, Box::new(cell));
+                }
             }
             AppEvent::ConsolidateProposedPlan(source) => {
                 let end = self.transcript_cells.len();
@@ -1242,6 +1292,9 @@ impl App {
             AppEvent::ImagesPrepared(id) => {
                 self.chat_widget.on_images_prepared(id);
             }
+            // The Cloud preview does not have a skills catalog.
+            AppEvent::CodexOp(AppCommand::ListSkills { .. })
+                if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud => {}
             AppEvent::CodexOp(AppCommand::ListSkills { cwds, force_reload: true })
                 if self.awaiting_side_replay(tui)
                     && let Some(thread_id) = self.active_thread_id
@@ -2381,7 +2434,7 @@ impl App {
                         .await;
                 }
             }
-            AppEvent::AstraSelectedFromModelPicker { .. } => unreachable!("picker event unwrapped"),
+            AppEvent::ScopedModelPicker { .. } | AppEvent::AstraSelectedFromModelPicker { .. } => unreachable!("picker event unwrapped"),
             AppEvent::BackgroundVoiceError { thread_id, message } => {
                 if self.chat_widget.thread_id() == Some(thread_id) {
                     self.chat_widget.add_error_message(message);
@@ -3323,10 +3376,17 @@ impl App {
             AppEvent::StartSide {
                 parent_thread_id,
                 user_message,
+                mode,
             } => {
-                return self
-                    .handle_start_side(tui, app_server, parent_thread_id, user_message)
-                    .await;
+                return Box::pin(self.handle_start_side(tui, app_server, parent_thread_id, user_message, mode)).await;
+            }
+            AppEvent::SideCreated {
+                backend_id: _,
+                parent,
+                request,
+                result,
+            } => {
+                Box::pin(self.finish_side_creation(tui, app_server, parent, request, result)).await;
             }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();

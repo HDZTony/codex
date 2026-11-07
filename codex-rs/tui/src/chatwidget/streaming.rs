@@ -41,7 +41,6 @@ impl ChatWidget {
             return;
         }
         self.status_state.reasoning_item_id = Some(id);
-        self.status_state.reasoning_recovered_after_refresh = false;
         self.reasoning_buffer.clear();
         self.reasoning_summary_parts.clear();
         self.restore_reasoning_status_header();
@@ -95,6 +94,14 @@ impl ChatWidget {
         if let Some(mut controller) = self.stream_controller.take() {
             let needs_scrollback_reflow = controller.needs_scrollback_reflow();
             self.clear_active_stream_tail();
+            let interrupted_item = self
+                .transcript
+                .active_streamed_agent_message
+                .take()
+                .filter(|_| completed_message.is_none());
+            if let Some(item) = &interrupted_item {
+                self.transcript.last_flushed_agent_message = Some(item.clone());
+            }
             let (cell, streamed_source) = controller.finalize();
             let completed_display = completed_message.map(|source| {
                 parse_assistant_markdown(source, self.config.cwd.as_path()).visible_markdown
@@ -127,13 +134,6 @@ impl ChatWidget {
                 };
             // Consolidate the run of streaming AgentMessageCells into a single AgentMarkdownCell
             // that can re-render from source on resize.
-            if completed_message.is_none() {
-                self.transcript.last_flushed_agent_message = self
-                    .transcript
-                    .active_streamed_agent_message
-                    .take()
-                    .zip(streamed_source.clone());
-            }
             let copy_source = completed_message.map(str::to_owned).or(streamed_source);
             let source = copy_source.as_deref().map(|source| {
                 parse_assistant_markdown(source, self.config.cwd.as_path()).visible_markdown
@@ -147,6 +147,7 @@ impl ChatWidget {
                 });
                 self.note_stream_consolidation_queued();
                 self.app_event_tx.send(AppEvent::ConsolidateAgentMessage {
+                    interrupted_item,
                     source,
                     copy_source,
                     cwd: self.config.cwd.to_path_buf(),
@@ -280,21 +281,10 @@ impl ChatWidget {
         (stream, display)
     }
 
-    fn completed_agent_message_was_flushed(&self, message: &str) -> bool {
-        self.transcript
-            .last_completed_agent_message
-            .as_ref()
-            .zip(self.transcript.last_flushed_agent_message.as_ref())
-            .is_some_and(|(completed, (flushed, streamed))| {
-                completed == flushed && streamed_message_matches_completed(streamed, message)
-            })
-    }
-
     pub(super) fn finalize_completed_assistant_message(&mut self, message: Option<&str>) {
         if self.stream_controller.is_none()
             && let Some(message) = message
             && !message.is_empty()
-            && !self.completed_agent_message_was_flushed(message)
         {
             let displayed =
                 parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown;
@@ -408,6 +398,26 @@ impl ChatWidget {
         }
     }
 
+    pub(super) fn replace_reasoning_parts(
+        &mut self,
+        mut summary: Vec<String>,
+        content: Vec<String>,
+    ) {
+        if self.config.show_raw_agent_reasoning {
+            summary.extend(content);
+        }
+        // Empty completions follow some streamed items. Preserve their deltas.
+        if summary.iter().all(String::is_empty) {
+            return;
+        }
+        self.reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
+        for part in summary {
+            self.on_reasoning_section_break();
+            self.on_agent_reasoning_delta(part);
+        }
+    }
+
     pub(super) fn on_agent_reasoning_delta(&mut self, delta: String) {
         // Accumulate the current reasoning block for history and activity text.
         self.reasoning_buffer.push_str(&delta);
@@ -486,7 +496,6 @@ impl ChatWidget {
         // Keep the last useful summary through tools and later empty items.
         self.status_state.reasoning_item_id = None;
         self.status_state.reasoning_resume_turn_id = None;
-        self.status_state.reasoning_recovered_after_refresh = false;
         self.reasoning_summary_parts.clear();
         self.request_redraw();
     }
@@ -534,10 +543,19 @@ impl ChatWidget {
         }
         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
         let questions = item.questions.as_deref().unwrap_or_default();
-        if (from_replay || !questions.is_empty())
+        let interrupted = self
+            .transcript
+            .last_flushed_agent_message
+            .take()
+            .filter(|item| Some(item) == self.transcript.last_completed_agent_message.as_ref());
+        if interrupted.is_some() {
+            // Commit any resumed stream fragment before replacing all fragments with
+            // the authoritative message. Markdown references can span interruptions.
+            self.flush_answer_stream_with_separator();
+        }
+        if (from_replay || !questions.is_empty() || interrupted.is_some())
             && self.stream_controller.is_none()
             && !parsed.visible_markdown.is_empty()
-            && !self.completed_agent_message_was_flushed(&message)
         {
             self.prepare_assistant_message();
             self.mark_safety_buffering_agent_message_started();
@@ -548,18 +566,25 @@ impl ChatWidget {
                     thread_id,
                 )
             });
-            self.add_to_history(history_cell::AgentMarkdownCell::from_parsed_message(
+            let cell = history_cell::AgentMarkdownCell::from_parsed_message(
                 parsed.visible_markdown.clone(),
                 message.clone(),
                 self.config.cwd.as_path(),
                 context,
                 questions,
-            ));
+            );
+            if let Some(item) = interrupted {
+                self.app_event_tx
+                    .send(AppEvent::CorrectFlushedAgentMessage { item, cell });
+            } else {
+                self.add_to_history(cell);
+            }
             self.handle_stream_finished();
             self.request_redraw();
         } else {
             self.finalize_completed_assistant_message(Some(&message));
         }
+        self.transcript.last_flushed_agent_message = None;
         if !parsed.visible_markdown.is_empty() {
             self.transcript
                 .record_agent_markdown(parsed.visible_markdown.clone(), message);

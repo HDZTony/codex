@@ -856,6 +856,9 @@ impl App {
             self.select_agent_thread(tui, app_server, root_thread_id)
                 .await?;
         }
+        if self.current_displayed_thread_id() == Some(root_thread_id) {
+            self.remember_attached_host_project(app_server);
+        }
         let read_only = self.chat_widget.is_external_writer_view();
         if !read_only {
             self.replay_agents_overview_requests(app_server, root_thread_id)
@@ -886,11 +889,13 @@ impl App {
     pub(super) async fn restore_session_draft(
         &mut self,
         thread_id: ThreadId,
-        input: ThreadInputState,
+        mut input: ThreadInputState,
         pending_settings: Option<codex_app_server_protocol::ThreadSettingsUpdatedNotification>,
     ) {
         let preserve_in_flight_turn = !self.chat_widget.is_external_writer_view()
             && self.active_turn_id_for_thread(thread_id).await.is_some();
+        self.reconcile_saved_session_input(thread_id, &mut input)
+            .await;
         self.chat_widget.restore_thread_input_state(
             Some(input),
             ThreadInputStateRestoreMode {

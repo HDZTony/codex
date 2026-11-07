@@ -24,6 +24,7 @@ mod enterprise_login;
 mod gateway_oauth;
 mod gcp_setup;
 mod rate_limit_resets;
+mod security_setup;
 mod workspace_routing;
 mod workspace_switching;
 
@@ -117,7 +118,8 @@ pub(crate) struct AccountRequestProcessor {
     workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
     workspace_routing_shutdown: CancellationToken,
     gateway_login: Arc<std::sync::Mutex<Option<gateway_oauth::ActiveGatewayLogin>>>,
-    gateway_client: Arc<std::sync::Mutex<Option<Arc<codex_login::GatewayAuthManager>>>>,
+    gateway_clients:
+        Arc<std::sync::Mutex<HashMap<String, Arc<codex_model_provider::GatewayAuthManager>>>>,
     _gateway_notifications: Arc<tokio_util::task::AbortOnDropHandle<()>>,
     pub(super) enterprise_login: Arc<enterprise_login::EnterpriseLoginState>,
 }
@@ -151,7 +153,7 @@ impl AccountRequestProcessor {
             model_catalog,
             active_login: Arc::new(Mutex::new(None)),
             gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
-            gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+            gateway_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workspace_routing: Arc::new(Mutex::new(None)),
             workspace_routing_fetches: Arc::new(Mutex::new(HashMap::new())),
             workspace_routing_shutdown: CancellationToken::new(),
@@ -322,7 +324,6 @@ impl AccountRequestProcessor {
                     .maybe_start_remote_plugin_caches_refresh(
                         &plugins_config,
                         auth,
-                        /*prefetch_recommendations*/ true,
                         Some(on_effective_plugins_changed),
                     );
             }
@@ -1553,7 +1554,10 @@ pub(crate) async fn logout_configured_account(
 ) -> Result<Config, JSONRPCErrorError> {
     // Another process may have changed the persisted workspace. Reload both
     // account authority and its policy before selecting a grant to remove.
-    auth_manager.reload().await;
+    auth_manager
+        .reload_with_cached_auth()
+        .await
+        .map_err(|err| internal_error(format!("logout failed: {err}")))?;
     config_manager.update_managed_config_loader(Arc::clone(auth_manager), fallback_config);
     let config = config_manager
         .load_latest_config(/*fallback_cwd*/ None)

@@ -15,27 +15,19 @@ impl ChatWidget {
         parts: Option<(Vec<String>, Vec<String>)>,
     ) {
         let turn_id = started.turn_id;
-        let id = started.item.id().to_string();
-        self.realtime_conversation
-            .agent_items
-            .entry((turn_id, id.clone()))
-            .or_insert(realtime::RealtimeAgentItemOrigin::Typed);
+        let ThreadItemPayload::Reasoning {
+            id,
+            summary,
+            content,
+        } = started.item.payload
+        else {
+            return;
+        };
+        self.remember_typed_reasoning_item(turn_id, &id);
         self.on_reasoning_item_started(id);
-        self.status_state.reasoning_recovered_after_refresh = true;
+        self.replace_reasoning_parts(summary, content);
         if let Some((summary, content)) = parts {
-            let reasoning_parts = summary.into_iter().chain(
-                self.config
-                    .show_raw_agent_reasoning
-                    .then_some(content)
-                    .into_iter()
-                    .flatten(),
-            );
-            for (index, delta) in reasoning_parts.enumerate() {
-                if index > 0 {
-                    self.on_reasoning_section_break();
-                }
-                self.on_agent_reasoning_delta(delta);
-            }
+            self.replace_reasoning_parts(summary, content);
         }
     }
 
@@ -314,6 +306,7 @@ impl ChatWidget {
                 if self.complete_realtime_delegated_agent_item(
                     &turn_id,
                     &ThreadItemPayload::AgentMessage {
+                        moderation: None,
                         id: id.clone(),
                         text: text.clone(),
                         phase: phase.clone(),
@@ -327,6 +320,7 @@ impl ChatWidget {
                 }
                 self.on_agent_message_item_completed(
                     AgentMessageItem {
+                        moderation: None,
                         id,
                         content: vec![AgentMessageContent::Text { text }],
                         phase,
@@ -360,32 +354,10 @@ impl ChatWidget {
                 summary,
                 content,
             } => {
-                let recover_completion = self.status_state.reasoning_recovered_after_refresh
-                    && (!summary.is_empty()
-                        || (self.config.show_raw_agent_reasoning && !content.is_empty()));
-                if from_replay || recover_completion {
-                    if from_replay {
-                        self.on_reasoning_item_started(id);
-                    } else {
-                        // A refreshed snapshot can omit the active item and its earlier deltas.
-                        // Reconcile with the complete item before committing the transcript.
-                        self.reasoning_buffer.clear();
-                        self.reasoning_summary_parts.clear();
-                    }
-                    let reasoning_parts = summary.into_iter().chain(
-                        self.config
-                            .show_raw_agent_reasoning
-                            .then_some(content)
-                            .into_iter()
-                            .flatten(),
-                    );
-                    for (index, delta) in reasoning_parts.enumerate() {
-                        if index > 0 {
-                            self.on_reasoning_section_break();
-                        }
-                        self.on_agent_reasoning_delta(delta);
-                    }
+                if from_replay {
+                    self.on_reasoning_item_started(id);
                 }
+                self.replace_reasoning_parts(summary, content);
                 self.on_agent_reasoning_final();
             }
             item @ ThreadItemPayload::CommandExecution {
@@ -456,10 +428,9 @@ impl ChatWidget {
                         &output,
                     )
                 {
-                    self.add_to_history(history_cell::PrefixedWrappedHistoryCell::new(
-                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
-                        "• ".dim(),
-                        "  ",
+                    self.add_to_history(history_cell::DelegatedMessageCell::new(
+                        &source_thread_id,
+                        prompt,
                     ));
                 }
             }

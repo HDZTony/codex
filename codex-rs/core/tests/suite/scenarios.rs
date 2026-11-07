@@ -148,6 +148,9 @@ mod context_management_tools;
 #[path = "scenarios_code_mode_settled_helpers_tests.rs"]
 mod code_mode_settled_helpers;
 
+#[path = "scenarios_command_sessions_tests.rs"]
+mod command_sessions;
+
 #[path = "scenarios_strict_3p_cache.rs"]
 mod strict_3p_cache;
 
@@ -174,6 +177,9 @@ mod guardian_sender_context;
 
 #[path = "scenarios_guardian_direct_review.rs"]
 mod guardian_direct_review;
+
+#[path = "scenarios_guardian_direct_mcp.rs"]
+mod guardian_direct_mcp;
 
 #[path = "scenarios_guardian_extra_policy.rs"]
 mod guardian_extra_policy;
@@ -351,7 +357,7 @@ fn plugin(name: &str) -> UserInput {
     }
 }
 
-fn configure_scenario_catalog(config: &mut Config) {
+pub(super) fn configure_scenario_catalog(config: &mut Config) {
     // Keep the fixture independent of the checkout's project configuration.
     let stack = &config.config_layer_stack;
     config.config_layer_stack = ConfigLayerStack::new(
@@ -676,6 +682,22 @@ async fn additional_context_tool_outputs(tool_outputs: bool) -> Result<()> {
             &ContextSnapshotOptions::default().rewrite_known_segments(),
         )
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cached_stdio_stays_dormant_in_a_new_chat_until_first_use() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(Ok(()), "requires a Windows test_stdio_server binary");
+    let requests = super::mcp_tool_cache::cached_stdio_first_use_scenario().await?;
+    let entries = requests.iter().map(SnapshotEntry::body).collect::<Vec<_>>();
+    insta::assert_snapshot!(context_snapshot::format_context_snapshot(
+        "A new chat uses a cached MCP catalog for unrelated work, then calls echo. The live server updates the tool definitions and marks cwd as app-only.",
+        &entries,
+        &ContextSnapshotOptions::default()
+            .rewrite_known_segments()
+            .include_request_settings(),
+    ));
     Ok(())
 }
 
@@ -2150,12 +2172,17 @@ async fn skill_read_recovers_omitted_installation_and_reads_selected_environment
     Ok(())
 }
 
-#[test_case::test_case(false; "native_tools")]
-#[test_case::test_case(true; "host_tools")]
+#[test_case::test_case(false, ReasoningEffort::Low; "native_tools")]
+#[test_case::test_case(true, ReasoningEffort::Low; "host_tools")]
+#[test_case::test_case(true, ReasoningEffort::Ultra; "host_tools_ultra")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_agent_catalog_parameters(disable_native_tools: bool) -> Result<()> {
+async fn multi_agent_catalog_parameters(
+    disable_native_tools: bool,
+    reasoning_effort: ReasoningEffort,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let proactive = reasoning_effort == ReasoningEffort::Ultra;
     let server = start_mock_server().await;
     let test = test_codex()
         .with_config(move |config| {
@@ -2163,7 +2190,8 @@ async fn multi_agent_catalog_parameters(disable_native_tools: bool) -> Result<()
             config.multi_agent_v2.disable_native_tools = disable_native_tools;
             config.workspace_roots = vec![config.cwd.clone()];
         })
-        .with_model_info_override("gpt-6-astra", |model| {
+        .with_model_info_override("gpt-6-astra", move |model| {
+            model.default_reasoning_level = Some(reasoning_effort);
             model.model_messages.as_mut().expect("model messages").tools = Some(
                 serde_json::from_value(json!({"multi_agent": {"list_agents": {
                     "parameters": json!({
@@ -2209,10 +2237,15 @@ async fn multi_agent_catalog_parameters(disable_native_tools: bool) -> Result<()
         test.codex.multi_agent_version(),
         Some(codex_protocol::protocol::MultiAgentVersion::V2)
     );
-    let (name, description) = if disable_native_tools {
+    let (name, description) = if proactive {
+        (
+            "multi_agent_native_tools_hidden_proactive",
+            "Ultra reasoning provides proactive guidance when native tools are disabled.",
+        )
+    } else if disable_native_tools {
         (
             "multi_agent_native_tools_hidden",
-            "Native tools are unavailable while the V2 runtime and its instructions remain enabled.",
+            "Native tools and native usage guidance are unavailable.",
         )
     } else {
         (
@@ -2349,11 +2382,11 @@ text(`MCP: ${ping.structuredContent?.echo ?? "missing"}`);"#,
 async fn astra_reads_code_mode_call_timing() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let test = super::code_mode::OutputHost::ServerGrpc
-        .test_codex()
+    let test = test_codex()
         .with_model("gpt-6-astra")
         .with_config(|config| {
             configure_scenario_catalog(config);
+            config.features.enable(Feature::CodeMode).unwrap();
             // Use the selected cwd as the workspace root on local and remote executors.
             config.workspace_roots = vec![config.cwd.clone()];
             config.code_mode.experimental_show_cell_overhead = true;
@@ -3298,6 +3331,106 @@ async fn prediction_fork_preserves_context_above_compaction_threshold() -> Resul
         "The parent finishes above the compaction threshold. Its prediction fork retains the parent's context and reminder, but neither compacts nor adds another reminder after a tool call.",
         &requests,
         &ContextSnapshotOptions::default().include_request_settings(),
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_side_chat_preserves_model_context_on_cold_resume() -> Result<()> {
+    use codex_context_fragments::SideConversationPolicy;
+    use codex_history::InitialHistory;
+    use codex_history::ResumedHistory;
+    use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_thread_store::ForkBoundary;
+    use codex_thread_store::LoadThreadHistoryParams;
+    use codex_thread_store::PrepareForkParams;
+
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let mock = mount_sse_sequence(
+        &server,
+        [
+            ("parent", "The migration is scheduled for Thursday."),
+            ("side", "Stage a rollback before migration."),
+            ("resumed", "Keep the rollback script close."),
+        ]
+        .into_iter()
+        .map(|(id, reply)| sse(vec![ev_assistant_message(id, reply), ev_completed(id)]))
+        .collect(),
+    )
+    .await;
+    let mut test = test_codex()
+        .with_model("gpt-6-astra")
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_config(|config| {
+            configure_scenario_catalog(config);
+            config.workspace_roots = vec![config.cwd.clone()];
+            config.developer_instructions = Some("Use plain language.".to_string());
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_text_turn("Plan a database migration.").await?;
+    test.codex.flush_rollout().await?;
+
+    let prepared = test
+        .thread_store
+        .prepare_fork(PrepareForkParams {
+            thread_id: test.session_configured.thread_id,
+            boundary: ForkBoundary::Latest,
+        })
+        .await?;
+    let mut options = test.start_thread_options().await;
+    options.attached_thread = true;
+    options.config.developer_instructions = Some(
+        SideConversationPolicy::Attached
+            .instructions(options.config.developer_instructions.as_deref()),
+    );
+    let mut resume_options = StartThreadOptions::new(options.config.clone());
+    resume_options.environments = options.environments.clone();
+    let child = test
+        .thread_manager
+        .fork_prepared_thread(options, prepared)
+        .await?;
+    child
+        .thread
+        .inject_response_items(SideConversationPolicy::Attached.fork_items())
+        .await?;
+    test.codex.shutdown_and_wait().await?;
+    test.codex = child.thread;
+    test.submit_text_turn("What is the safest rollback plan?")
+        .await?;
+
+    // Unload the child and resume from disk with the same policy as the TUI.
+    test.codex.shutdown_and_wait().await?;
+    test.thread_manager.remove_thread(&child.thread_id).await;
+    let saved = test
+        .thread_store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child.thread_id,
+            include_archived: false,
+        })
+        .await?;
+    resume_options.initial_history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: saved.revision,
+        conversation_id: saved.thread_id,
+        history: Arc::new(saved.items),
+        rollout_path: test.codex.rollout_path(),
+    });
+    resume_options.client_mcp_extensions = test.codex.client_mcp_extensions();
+    test.codex = test
+        .thread_manager
+        .start_thread(resume_options)
+        .await?
+        .thread;
+    test.submit_text_turn("What did you recommend before I closed the chat?")
+        .await?;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    insta::assert_snapshot!(context_snapshot::format_request_history_snapshot(
+        "A side chat receives the parent turn as reference, adds its own turn, and resumes from disk with the policy and prior answer intact.",
+        &requests,
+        &ContextSnapshotOptions::default(),
     ));
     Ok(())
 }

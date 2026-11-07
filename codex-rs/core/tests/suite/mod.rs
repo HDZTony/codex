@@ -39,6 +39,8 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
 mod abort_lifecycle;
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;
+#[path = "actor_access_program_tests.rs"]
+mod actor_access_program;
 mod additional_context;
 #[path = "agent_control_tests.rs"]
 mod agent_control;
@@ -197,6 +199,8 @@ mod request_permissions_tool;
 mod request_plugin_install;
 mod request_user_input;
 mod request_user_input_async;
+#[path = "required_access_program_tests.rs"]
+mod required_access_program;
 mod responses_api_proxy_headers;
 mod responses_lite;
 #[cfg(target_os = "linux")]

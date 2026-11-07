@@ -114,6 +114,10 @@ impl ChatWidget {
                         self.on_replayed_task_started(notification.turn.started_at);
                     } else {
                         self.on_task_started();
+                        if self.turn_lifecycle.admitted_turn_id == self.turn_lifecycle.last_turn_id
+                        {
+                            self.turn_lifecycle.admitted_turn_id = None;
+                        }
                     }
                 }
             }
@@ -447,6 +451,13 @@ impl ChatWidget {
         notification: TurnCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        if replay_kind.is_none()
+            && notification.turn.status != TurnStatus::InProgress
+            && self.turn_lifecycle.admitted_turn_id.as_deref()
+                == Some(notification.turn.id.as_str())
+        {
+            self.turn_lifecycle.admitted_turn_id = None;
+        }
         // User-message dedupe only suppresses the app-server echo of a prompt
         // this TUI already rendered locally. Once that turn ends, another
         // client can submit the same text and it still needs its own user cell.
@@ -506,7 +517,7 @@ impl ChatWidget {
                 } else {
                     TurnAbortReason::Interrupted
                 };
-                self.on_interrupted_turn(reason);
+                self.on_interrupted_server_turn(reason, &notification.turn.id);
             }
             TurnStatus::Failed => {
                 if replay_kind.is_none() {
@@ -579,24 +590,50 @@ impl ChatWidget {
             {
                 self.remember_realtime_delegated_reasoning_turn(&notification.turn_id);
             }
-            ThreadItemPayload::AgentMessage { id, .. } if replay_kind.is_none() => {
-                self.is_realtime_delegated_agent_item(&notification.turn_id, &id);
+            ThreadItemPayload::AgentMessage {
+                id,
+                text,
+                questions,
+                ..
+            } => {
+                let delegated = replay_kind.is_none()
+                    && self.is_realtime_delegated_agent_item(&notification.turn_id, &id);
+                // Some streams carry their first text on item/started. Async questions
+                // render with their choices on completion.
+                if delegated
+                    || self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
+                    || questions.is_some()
+                    || text.is_empty()
+                {
+                    return;
+                }
+                let key = (notification.turn_id, id);
+                // A tool can interrupt this item and cause a second start before completion.
+                if self.transcript.active_streamed_agent_message.as_ref() != Some(&key)
+                    && self.transcript.last_flushed_agent_message.as_ref() != Some(&key)
+                {
+                    self.transcript.active_streamed_agent_message = Some(key);
+                    self.on_agent_message_delta(text);
+                }
             }
-            ThreadItemPayload::Reasoning { id, .. } => {
+            ThreadItemPayload::Reasoning {
+                id,
+                summary,
+                content,
+            } => {
                 if replay_kind.is_none()
                     && !self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
                 {
                     // A later voice handoff can steer this turn without making an
                     // already-started typed reasoning item private.
-                    self.realtime_conversation
-                        .agent_items
-                        .entry((notification.turn_id.clone(), id.clone()))
-                        .or_insert(realtime::RealtimeAgentItemOrigin::Typed);
+                    self.remember_typed_reasoning_item(notification.turn_id.clone(), &id);
                 }
                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages))
                     && !self.is_realtime_delegated_reasoning_item(&notification.turn_id, &id)
+                    && self.status_state.reasoning_item_id.as_ref() != Some(&id)
                 {
                     self.on_reasoning_item_started(id);
+                    self.replace_reasoning_parts(summary, content);
                 }
             }
             ThreadItemPayload::ContextCompaction { id }

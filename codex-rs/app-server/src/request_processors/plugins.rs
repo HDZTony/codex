@@ -736,16 +736,27 @@ impl PluginRequestProcessor {
         if include_shared_with_me && config.features.enabled(Feature::PluginSharing) {
             remote_sources.push(RemoteMarketplaceSource::SharedWithMe);
         }
+        let featured =
+            plugins_manager.featured_plugin_ids_for_config(&context.global_config, auth.as_ref());
+        tokio::pin!(featured);
+        let mut featured_result = None;
         if !remote_sources.is_empty() {
-            match codex_core_plugins::remote::fetch_remote_marketplaces(
+            let marketplaces = codex_core_plugins::remote::fetch_remote_marketplaces(
                 &remote_plugin_service_config,
                 auth.as_ref(),
                 &remote_sources,
                 /*catalog_cache_root*/ Some(config.codex_home.as_path()),
                 remote_catalog_cache_mode,
-            )
-            .await
-            {
+            );
+            tokio::pin!(marketplaces);
+            let outcome = tokio::select! {
+                outcome = &mut marketplaces => outcome,
+                ids = &mut featured, if use_remote_global_catalog => {
+                    featured_result = Some(ids);
+                    marketplaces.await
+                }
+            };
+            match outcome {
                 Ok(outcome) => {
                     remote_catalog_cache_refresh_scopes = outcome.catalog_cache_refresh_scopes;
                     for remote_marketplace in outcome
@@ -804,10 +815,11 @@ impl PluginRequestProcessor {
             marketplace.name == OPENAI_CURATED_MARKETPLACE_NAME
                 || marketplace.name == REMOTE_GLOBAL_MARKETPLACE_NAME
         }) {
-            match plugins_manager
-                .featured_plugin_ids_for_config(&context.global_config, auth.as_ref())
-                .await
-            {
+            let result = match featured_result {
+                Some(result) => result,
+                None => featured.await,
+            };
+            match result {
                 Ok(featured_plugin_ids) => featured_plugin_ids,
                 Err(err) => {
                     warn!(
@@ -1113,6 +1125,7 @@ impl PluginRequestProcessor {
                     None => None,
                 };
                 let app_summaries = load_plugin_app_summaries(
+                    &self.thread_manager,
                     &config,
                     auth.as_ref(),
                     &outcome.plugin.apps,
@@ -1219,6 +1232,7 @@ impl PluginRequestProcessor {
                     .map(plugin_app_category_by_id_from_value)
                     .unwrap_or_default();
                 let app_summaries = load_plugin_app_summaries(
+                    &self.thread_manager,
                     &config,
                     auth.as_ref(),
                     &plugin_apps,
@@ -1738,37 +1752,42 @@ impl PluginRequestProcessor {
         }
 
         let is_chatgpt_auth = auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth);
-        let apps_needing_auth = if let Some(app_ids_needing_auth) =
-            installation.app_ids_needing_auth
-        {
-            if app_ids_needing_auth.is_empty()
-                || !config.features.apps_enabled_for_auth(is_chatgpt_auth)
-            {
-                Vec::new()
-            } else {
-                let plugin_apps = app_ids_needing_auth
-                    .into_iter()
-                    .map(codex_plugin::AppConnectorId)
-                    .collect::<Vec<_>>();
-                let app_category_by_id = remote_detail
-                    .app_manifest
-                    .as_ref()
-                    .map(plugin_app_category_by_id_from_value)
-                    .unwrap_or_default();
-                load_plugin_app_summaries(&config, auth.as_ref(), &plugin_apps, &app_category_by_id)
+        let apps_needing_auth =
+            if let Some(app_ids_needing_auth) = installation.app_ids_needing_auth {
+                if app_ids_needing_auth.is_empty()
+                    || !config.features.apps_enabled_for_auth(is_chatgpt_auth)
+                {
+                    Vec::new()
+                } else {
+                    let plugin_apps = app_ids_needing_auth
+                        .into_iter()
+                        .map(codex_plugin::AppConnectorId)
+                        .collect::<Vec<_>>();
+                    let app_category_by_id = remote_detail
+                        .app_manifest
+                        .as_ref()
+                        .map(plugin_app_category_by_id_from_value)
+                        .unwrap_or_default();
+                    load_plugin_app_summaries(
+                        &self.thread_manager,
+                        &config,
+                        auth.as_ref(),
+                        &plugin_apps,
+                        &app_category_by_id,
+                    )
                     .await
-            }
-        } else {
-            let plugin_app_declarations =
-                load_plugin_apps(result.installed_path.as_path(), &result.plugin_id).await;
-            self.plugin_apps_needing_auth_for_install(
-                &config,
-                auth.as_ref(),
-                &result.plugin_id.as_key(),
-                &plugin_app_declarations,
-            )
-            .await
-        };
+                }
+            } else {
+                let plugin_app_declarations =
+                    load_plugin_apps(result.installed_path.as_path(), &result.plugin_id).await;
+                self.plugin_apps_needing_auth_for_install(
+                    &config,
+                    auth.as_ref(),
+                    &result.plugin_id.as_key(),
+                    &plugin_app_declarations,
+                )
+                .await
+            };
 
         Ok(PluginInstallResponse {
             auth_policy: remote_detail.summary.auth_policy,
@@ -1839,7 +1858,13 @@ impl PluginRequestProcessor {
             .collect();
         let environment_manager = self.thread_manager.environment_manager();
         let (app_summaries, accessible_connectors_result) = tokio::join!(
-            load_plugin_app_summaries(config, auth, &plugin_apps, &app_category_by_id),
+            load_plugin_app_summaries(
+                &self.thread_manager,
+                config,
+                auth,
+                &plugin_apps,
+                &app_category_by_id
+            ),
             connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
                 config,
                 /*force_refetch*/ true,
@@ -1856,8 +1881,7 @@ impl PluginRequestProcessor {
                     "failed to load accessible apps after plugin install: {err:#}"
                 );
                 (
-                    connectors::list_cached_accessible_connectors_from_mcp_tools(config)
-                        .await
+                    connectors::list_cached_accessible_connectors_from_mcp_tools(config, auth)
                         .unwrap_or_default(),
                     false,
                 )
@@ -2159,6 +2183,7 @@ impl PluginRequestProcessor {
 }
 
 async fn load_plugin_app_summaries(
+    thread_manager: &ThreadManager,
     config: &Config,
     auth: Option<&CodexAuth>,
     plugin_apps: &[codex_plugin::AppConnectorId],
@@ -2185,9 +2210,17 @@ async fn load_plugin_app_summaries(
             )
             .fresh_records(&app_ids, /*include_tools*/ false),
         );
+        let runtime = thread_manager.runtime_auth_for_config(config);
         for app_ids in app_ids.chunks(APP_READ_MAX_IDS) {
+            let runtime = match &runtime {
+                Ok(runtime) => runtime.as_ref(),
+                Err(error) => {
+                    warn!("failed to initialize app metadata authentication: {error}");
+                    break;
+                }
+            };
             match connectors::read_connector_metadata(
-                config, auth, app_ids, /*include_tools*/ false,
+                config, auth, runtime, app_ids, /*include_tools*/ false,
             )
             .await
             {
